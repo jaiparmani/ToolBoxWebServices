@@ -25,7 +25,7 @@ SECRET_KEY = "django-insecure-koy(4=7x7@pga=qbfp*ar$l%(!%z*3c=g%v(zeik8k$r71^qv3
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = ['jaiparmani.pythonanywhere.com']
+ALLOWED_HOSTS = ['jaiparmani.pythonanywhere.com','127.0.0.1','localhost']
 
 
 # Application definition
@@ -37,10 +37,14 @@ INSTALLED_APPS = [
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
+    "rest_framework",
+    "corsheaders",
+    "tools",
 ]
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
+    "corsheaders.middleware.CorsMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
@@ -128,3 +132,18 @@ MEDIA_ROOT = '/home/jaiparmani/toolboxweb/media'
 MEDIA_URL = '/media/'
 STATIC_ROOT = '/home/jaiparmani/toolboxweb/static'
 STATIC_URL = '/static/'
+
+# REST Framework configuration
+REST_FRAMEWORK = {
+    # Basic configuration without authentication requirements
+}
+
+# CORS settings
+CORS_ALLOWED_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+    "https://jaiparmani.pythonanywhere.com",
+]
+
