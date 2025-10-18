@@ -25,7 +25,7 @@ SECRET_KEY = "django-insecure-koy(4=7x7@pga=qbfp*ar$l%(!%z*3c=g%v(zeik8k$r71^qv3
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = ['jaiparmani.pythonanywhere.com','127.0.0.1','localhost']
+ALLOWED_HOSTS = ['jaiparmani.pythonanywhere.com','127.0.0.1','localhost', 'roaring-phoenix-c2dfd0.netlify.app']
 
 
 # Application definition
