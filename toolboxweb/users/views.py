@@ -1,0 +1,235 @@
+from django.shortcuts import render
+from django.contrib.auth.models import User
+from rest_framework import viewsets, status, generics
+from rest_framework.decorators import action
+from rest_framework.permissions import IsAuthenticated, AllowAny
+from rest_framework.response import Response
+from rest_framework.views import APIView
+from rest_framework.decorators import api_view, permission_classes
+from django.core.exceptions import PermissionDenied
+from django.contrib.auth import update_session_auth_hash, authenticate, login, logout
+from django.views.decorators.csrf import csrf_exempt, get_token
+from django.utils.decorators import method_decorator
+from django.http import JsonResponse
+from .serializers import (
+    UserRegistrationSerializer,
+    UserProfileSerializer,
+    PasswordChangeSerializer
+)
+
+# Create your views here.
+
+
+class UserViewSet(viewsets.ModelViewSet):
+    """
+    ViewSet for user management with different serializers for different actions
+    """
+    queryset = User.objects.all()
+
+    def get_serializer_class(self):
+        """
+        Return the appropriate serializer class based on the action
+        """
+        if self.action == 'create':
+            return UserRegistrationSerializer
+        return UserProfileSerializer
+
+    def get_permissions(self):
+        """
+        Return the appropriate permission classes based on the action
+        """
+        if self.action == 'create':
+            # Allow anyone to register
+            permission_classes = [AllowAny]
+        else:
+            # Require authentication for other operations
+            permission_classes = [IsAuthenticated]
+        return [permission() for permission in permission_classes]
+
+    def get_queryset(self):
+        """
+        Override queryset to show only current user data for non-admin users
+        """
+        queryset = User.objects.all()
+        user = self.request.user
+
+        # If user is not authenticated, return empty queryset
+        if not user.is_authenticated:
+            return User.objects.none()
+
+        # If user is admin (superuser), return all users
+        if user.is_superuser:
+            return queryset
+
+        # For regular users, only return their own data
+        return queryset.filter(id=user.id)
+
+    def perform_create(self, serializer):
+        """
+        Handle user creation
+        """
+        serializer.save()
+
+    def list(self, request, *args, **kwargs):
+        """
+        Override list method to handle permissions properly
+        """
+        queryset = self.filter_queryset(self.get_queryset())
+
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
+
+    def retrieve(self, request, *args, **kwargs):
+        """
+        Override retrieve method to handle permissions properly
+        """
+        instance = self.get_object()
+
+        # Check if user can access this data
+        if not request.user.is_superuser and instance.id != request.user.id:
+            raise PermissionDenied("You can only view your own profile.")
+
+        serializer = self.get_serializer(instance)
+        return Response(serializer.data)
+
+
+class UserProfileView(generics.RetrieveUpdateAPIView):
+    """
+    View for retrieving and updating current user's profile
+    """
+    serializer_class = UserProfileSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_object(self):
+        """
+        Return the current user object
+        """
+        return self.request.user
+
+    def get_queryset(self):
+        """
+        Return queryset containing only the current user
+        """
+        return User.objects.filter(id=self.request.user.id)
+
+    def update(self, request, *args, **kwargs):
+        """
+        Handle profile updates with proper validation
+        """
+        partial = kwargs.pop('partial', False)
+        instance = self.get_object()
+        serializer = self.get_serializer(instance, data=request.data, partial=partial)
+        serializer.is_valid(raise_exception=True)
+        self.perform_update(serializer)
+
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+class PasswordChangeView(APIView):
+    """
+    View for handling password change requests
+    """
+    permission_classes = [IsAuthenticated]
+
+    @method_decorator(csrf_exempt)
+    def post(self, request):
+        """
+        Handle POST request for password change
+        """
+        user = request.user
+        serializer = PasswordChangeSerializer(data=request.data, context={'request': request})
+
+        if serializer.is_valid():
+            # Set the new password
+            user.set_password(serializer.validated_data['new_password'])
+            user.save()
+
+            # Update session to prevent logout
+            update_session_auth_hash(request, user)
+
+            return Response(
+                {"detail": "Password changed successfully."},
+                status=status.HTTP_200_OK
+            )
+
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+@csrf_exempt
+def LoginView(request):
+    """
+    Function-based view for handling user login requests with CSRF exemption
+    """
+    username = request.data.get('username')
+    password = request.data.get('password')
+
+    # Validate required fields
+    if not username or not password:
+        return Response(
+            {'detail': 'Username and password are required.'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    # Authenticate user
+    user = authenticate(request, username=username, password=password)
+
+    if user is not None:
+        # Check if user is active
+        if not user.is_active:
+            return Response(
+                {'detail': 'This account is inactive.'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+
+        # Log the user in (creates session)
+        login(request, user)
+
+        return Response({
+            'detail': 'Login successful.',
+            'user': {
+                'id': user.id,
+                'username': user.username,
+                'email': user.email,
+                'first_name': user.first_name,
+                'last_name': user.last_name
+            }
+        }, status=status.HTTP_200_OK)
+
+    else:
+        return Response(
+            {'detail': 'Invalid username or password.'},
+            status=status.HTTP_401_UNAUTHORIZED
+        )
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+@csrf_exempt
+def LogoutView(request):
+    """
+    Function-based view for handling user logout requests with CSRF exemption
+    """
+    # Log the user out (clears session)
+    # delete sessionid cookie
+
+    logout(request)
+    response = JsonResponse({"message": "Logged out"})
+    response.delete_cookie('sessionid')
+    return response
+
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def get_csrf_token(request):
+    """
+    Get CSRF token for API clients
+    """
+    token = get_token(request)
+    return JsonResponse({'csrftoken': token})

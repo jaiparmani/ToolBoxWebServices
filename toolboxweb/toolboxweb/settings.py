@@ -41,6 +41,7 @@ INSTALLED_APPS = [
     "corsheaders",
     "tools",
     "expenses",
+    "users",
 ]
 
 MIDDLEWARE = [
@@ -136,7 +137,24 @@ STATIC_URL = '/static/'
 
 # REST Framework configuration
 REST_FRAMEWORK = {
-    # Basic configuration without authentication requirements
+    'DEFAULT_PERMISSION_CLASSES': [
+        'rest_framework.permissions.IsAuthenticated',
+    ],
+    'DEFAULT_AUTHENTICATION_CLASSES': [
+        'rest_framework.authentication.SessionAuthentication',
+        'rest_framework.authentication.BasicAuthentication',
+        'rest_framework.authentication.TokenAuthentication',
+    ],
+    'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
+    'PAGE_SIZE': 20,
+    'DEFAULT_THROTTLE_CLASSES': [
+        'rest_framework.throttling.AnonRateThrottle',
+        'rest_framework.throttling.UserRateThrottle'
+    ],
+    'DEFAULT_THROTTLE_RATES': {
+        'anon': '100/hour',
+        'user': '1000/hour'
+    }
 }
 
 # CORS settings
@@ -148,4 +166,35 @@ CORS_ALLOWED_ORIGINS = [
     "https://jaiparmani.pythonanywhere.com",
     "https://roaring-phoenix-c2dfd0.netlify.app",
 ]
+
+CORS_ALLOW_CREDENTIALS = True
+
+# CSRF settings for production
+CSRF_TRUSTED_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "https://jaiparmani.pythonanywhere.com",
+    "https://roaring-phoenix-c2dfd0.netlify.app",
+]
+
+# Security settings
+SECURE_BROWSER_XSS_FILTER = True
+SECURE_CONTENT_TYPE_NOSNIFF = True
+X_FRAME_OPTIONS = 'DENY'
+
+# Session settings for API usage
+SESSION_COOKIE_HTTPONLY = True
+SESSION_COOKIE_SAMESITE = 'Lax'  # Changed from None for better compatibility
+CSRF_COOKIE_SAMESITE = 'Lax'
+SESSION_COOKIE_SECURE = False  # Set to False for development (HTTP)
+CSRF_COOKIE_SECURE = False    # Set to False for development (HTTP)
+
+# HSTS settings (for production with SSL)
+if not DEBUG:
+    SECURE_HSTS_SECONDS = 31536000  # 1 year
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+    SECURE_HSTS_PRELOAD = True
+    SECURE_SSL_REDIRECT = True
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
 

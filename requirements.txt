@@ -11,3 +11,6 @@ django-cors-headers==4.4.0
 
 # Database (if needed)
 # psycopg2-binary==2.9.10  # Uncomment if using PostgreSQL
+
+# Testing and HTTP requests
+requests==2.31.0
