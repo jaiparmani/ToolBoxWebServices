@@ -1,11 +1,12 @@
 from rest_framework import viewsets, status, filters
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import AllowAny
 from rest_framework.pagination import PageNumberPagination
 from django_filters.rest_framework import DjangoFilterBackend
 from django.db.models import Sum, Count, Q
 from django.utils import timezone
+from django.core.exceptions import ObjectDoesNotExist
 from datetime import datetime, timedelta
 import django_filters
 
@@ -56,7 +57,7 @@ class ExpenseCategoryViewSet(viewsets.ModelViewSet):
     """ViewSet for ExpenseCategory CRUD operations"""
     queryset = ExpenseCategory.objects.filter(is_active=True)
     serializer_class = ExpenseCategorySerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [AllowAny]
     pagination_class = StandardResultsSetPagination
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
     ordering_fields = ['name', 'transaction_type', 'created_at']
@@ -78,24 +79,42 @@ class ExpenseCategoryViewSet(viewsets.ModelViewSet):
 class ExpenseTagViewSet(viewsets.ModelViewSet):
     """ViewSet for ExpenseTag CRUD operations"""
     serializer_class = ExpenseTagSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [AllowAny]
     pagination_class = StandardResultsSetPagination
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
     ordering_fields = ['name', 'created_at']
     ordering = ['name']
 
     def get_queryset(self):
-        """Only return tags for the current user"""
-        return ExpenseTag.objects.filter(user=self.request.user)
+        """Only return tags for the specified user"""
+        userid = self.request.GET.get('userid')
+        if not userid:
+            return ExpenseTag.objects.none()
+
+        try:
+            user_id = int(userid)
+            return ExpenseTag.objects.filter(user_id=user_id, user__is_active=True)
+        except ValueError:
+            return ExpenseTag.objects.none()
 
     def perform_create(self, serializer):
-        """Associate tag with current user"""
-        serializer.save(user=self.request.user)
+        """Associate tag with specified user"""
+        userid = self.request.GET.get('userid')
+        if not userid:
+            raise PermissionDenied("userid parameter is required.")
+
+        try:
+            user_id = int(userid)
+            from django.contrib.auth.models import User
+            user = User.objects.get(id=user_id, is_active=True)
+            serializer.save(user=user)
+        except (ValueError, ObjectDoesNotExist):
+            raise PermissionDenied("Invalid userid parameter.")
 
 
 class ExpenseViewSet(viewsets.ModelViewSet):
     """ViewSet for Expense CRUD operations with filtering and pagination"""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [AllowAny]
     pagination_class = StandardResultsSetPagination
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter, filters.SearchFilter]
     filterset_class = ExpenseFilter
@@ -104,8 +123,16 @@ class ExpenseViewSet(viewsets.ModelViewSet):
     search_fields = ['description', 'location', 'payment_method']
 
     def get_queryset(self):
-        """Only return expenses for the current user"""
-        return Expense.objects.filter(user=self.request.user)
+        """Only return expenses for the specified user"""
+        userid = self.request.GET.get('userid')
+        if not userid:
+            return Expense.objects.none()
+
+        try:
+            user_id = int(userid)
+            return Expense.objects.filter(user_id=user_id, user__is_active=True)
+        except ValueError:
+            return Expense.objects.none()
 
     def get_serializer_class(self):
         """Return appropriate serializer based on action"""
@@ -117,13 +144,33 @@ class ExpenseViewSet(viewsets.ModelViewSet):
             return ExpenseSerializer
 
     def perform_create(self, serializer):
-        """Associate expense with current user"""
-        serializer.save(user=self.request.user)
+        """Associate expense with specified user"""
+        userid = self.request.GET.get('userid')
+        if not userid:
+            raise PermissionDenied("userid parameter is required.")
+
+        try:
+            user_id = int(userid)
+            from django.contrib.auth.models import User
+            user = User.objects.get(id=user_id, is_active=True)
+            serializer.save(user=user)
+        except (ValueError, ObjectDoesNotExist):
+            raise PermissionDenied("Invalid userid parameter.")
 
     @action(detail=False, methods=['get'])
     def summary(self, request):
         """Get expense summary statistics"""
-        user = request.user
+        userid = request.GET.get('userid')
+        if not userid:
+            return Response({'error': 'userid parameter is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            user_id = int(userid)
+            from django.contrib.auth.models import User
+            user = User.objects.get(id=user_id, is_active=True)
+        except (ValueError, ObjectDoesNotExist):
+            return Response({'error': 'Invalid userid parameter'}, status=status.HTTP_400_BAD_REQUEST)
+
         queryset = self.get_queryset()
 
         # Date range filter
@@ -184,7 +231,16 @@ class ExpenseViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get'])
     def monthly_report(self, request):
         """Get monthly expense report"""
-        user = request.user
+        userid = request.GET.get('userid')
+        if not userid:
+            return Response({'error': 'userid parameter is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            user_id = int(userid)
+            from django.contrib.auth.models import User
+            user = User.objects.get(id=user_id, is_active=True)
+        except (ValueError, ObjectDoesNotExist):
+            return Response({'error': 'Invalid userid parameter'}, status=status.HTTP_400_BAD_REQUEST)
         year = request.query_params.get('year', timezone.now().year)
         month = request.query_params.get('month', timezone.now().month)
 
@@ -230,8 +286,16 @@ class ExpenseViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        tags = ExpenseTag.objects.filter(id__in=tag_ids, user=request.user)
-        expense.tags.add(*tags)
+        userid = request.GET.get('userid')
+        if not userid:
+            return Response({'error': 'userid parameter is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            user_id = int(userid)
+            tags = ExpenseTag.objects.filter(id__in=tag_ids, user_id=user_id, user__is_active=True)
+            expense.tags.add(*tags)
+        except ValueError:
+            return Response({'error': 'Invalid userid parameter'}, status=status.HTTP_400_BAD_REQUEST)
 
         serializer = self.get_serializer(expense)
         return Response(serializer.data)
@@ -248,8 +312,16 @@ class ExpenseViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        tags = ExpenseTag.objects.filter(id__in=tag_ids, user=request.user)
-        expense.tags.remove(*tags)
+        userid = request.GET.get('userid')
+        if not userid:
+            return Response({'error': 'userid parameter is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            user_id = int(userid)
+            tags = ExpenseTag.objects.filter(id__in=tag_ids, user_id=user_id, user__is_active=True)
+            expense.tags.remove(*tags)
+        except ValueError:
+            return Response({'error': 'Invalid userid parameter'}, status=status.HTTP_400_BAD_REQUEST)
 
         serializer = self.get_serializer(expense)
         return Response(serializer.data)

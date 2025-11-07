@@ -366,7 +366,7 @@ const useUserAPI = () => {
 
   const getSessionId = () => {
     // Get session ID from your auth state/storage
-    return localStorage.getItem('sessionId');
+    return localStorage.getItem('sessionid');
   };
 
   const register = useCallback(async (userData) => {

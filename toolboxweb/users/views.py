@@ -2,13 +2,12 @@ from django.shortcuts import render
 from django.contrib.auth.models import User
 from rest_framework import viewsets, status, generics
 from rest_framework.decorators import action
-from rest_framework.permissions import IsAuthenticated, AllowAny
+from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.decorators import api_view, permission_classes
 from django.core.exceptions import PermissionDenied
-from django.contrib.auth import update_session_auth_hash, authenticate, login, logout
-from django.views.decorators.csrf import csrf_exempt, get_token
+from django.views.decorators.csrf import get_token
 from django.utils.decorators import method_decorator
 from django.http import JsonResponse
 from .serializers import (
@@ -42,27 +41,28 @@ class UserViewSet(viewsets.ModelViewSet):
             # Allow anyone to register
             permission_classes = [AllowAny]
         else:
-            # Require authentication for other operations
-            permission_classes = [IsAuthenticated]
+            # No authentication required - userid handled in middleware
+            permission_classes = [AllowAny]
         return [permission() for permission in permission_classes]
 
     def get_queryset(self):
         """
-        Override queryset to show only current user data for non-admin users
+        Override queryset to show only current user data based on userid parameter
         """
         queryset = User.objects.all()
-        user = self.request.user
 
-        # If user is not authenticated, return empty queryset
-        if not user.is_authenticated:
+        # Get userid from query parameters
+        userid = self.request.GET.get('userid')
+        if not userid:
             return User.objects.none()
 
-        # If user is admin (superuser), return all users
-        if user.is_superuser:
-            return queryset
+        try:
+            user_id = int(userid)
+        except ValueError:
+            return User.objects.none()
 
-        # For regular users, only return their own data
-        return queryset.filter(id=user.id)
+        # Only return the user's own data
+        return queryset.filter(id=user_id, is_active=True)
 
     def perform_create(self, serializer):
         """
@@ -90,8 +90,18 @@ class UserViewSet(viewsets.ModelViewSet):
         """
         instance = self.get_object()
 
+        # Get userid from query parameters
+        userid = request.GET.get('userid')
+        if not userid:
+            raise PermissionDenied("userid parameter is required.")
+
+        try:
+            user_id = int(userid)
+        except ValueError:
+            raise PermissionDenied("Invalid userid parameter.")
+
         # Check if user can access this data
-        if not request.user.is_superuser and instance.id != request.user.id:
+        if instance.id != user_id:
             raise PermissionDenied("You can only view your own profile.")
 
         serializer = self.get_serializer(instance)
@@ -103,19 +113,35 @@ class UserProfileView(generics.RetrieveUpdateAPIView):
     View for retrieving and updating current user's profile
     """
     serializer_class = UserProfileSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [AllowAny]
 
     def get_object(self):
         """
-        Return the current user object
+        Return the current user object based on userid parameter
         """
-        return self.request.user
+        userid = self.request.GET.get('userid')
+        if not userid:
+            raise PermissionDenied("userid parameter is required.")
+
+        try:
+            user_id = int(userid)
+            return User.objects.get(id=user_id, is_active=True)
+        except (ValueError, ObjectDoesNotExist):
+            raise PermissionDenied("Invalid userid parameter.")
 
     def get_queryset(self):
         """
-        Return queryset containing only the current user
+        Return queryset containing only the specified user
         """
-        return User.objects.filter(id=self.request.user.id)
+        userid = self.request.GET.get('userid')
+        if not userid:
+            return User.objects.none()
+
+        try:
+            user_id = int(userid)
+            return User.objects.filter(id=user_id, is_active=True)
+        except ValueError:
+            return User.objects.none()
 
     def update(self, request, *args, **kwargs):
         """
@@ -134,23 +160,28 @@ class PasswordChangeView(APIView):
     """
     View for handling password change requests
     """
-    permission_classes = [IsAuthenticated]
+    permission_classes = [AllowAny]
 
-    @method_decorator(csrf_exempt)
     def post(self, request):
         """
         Handle POST request for password change
         """
-        user = request.user
-        serializer = PasswordChangeSerializer(data=request.data, context={'request': request})
+        userid = request.GET.get('userid')
+        if not userid:
+            return Response({'error': 'userid parameter is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            user_id = int(userid)
+            user = User.objects.get(id=user_id, is_active=True)
+        except (ValueError, ObjectDoesNotExist):
+            return Response({'error': 'Invalid userid parameter'}, status=status.HTTP_400_BAD_REQUEST)
+
+        serializer = PasswordChangeSerializer(data=request.data, context={'request': request, 'user': user})
 
         if serializer.is_valid():
             # Set the new password
             user.set_password(serializer.validated_data['new_password'])
             user.save()
-
-            # Update session to prevent logout
-            update_session_auth_hash(request, user)
 
             return Response(
                 {"detail": "Password changed successfully."},
@@ -162,34 +193,22 @@ class PasswordChangeView(APIView):
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
-@csrf_exempt
-def LoginView(request):
+def login_view(request):
     """
-    Function-based view for handling user login requests with CSRF exemption
+    Login view that validates userid via middleware.
+    Since middleware already validates the userid parameter,
+    we just need to return success if we reach this point.
     """
-    username = request.data.get('username')
-    password = request.data.get('password')
+    userid = request.GET.get('userid')
+    if not userid:
+        return Response({'error': 'userid parameter is required'}, status=status.HTTP_400_BAD_REQUEST)
 
-    # Validate required fields
-    if not username or not password:
-        return Response(
-            {'detail': 'Username and password are required.'},
-            status=status.HTTP_400_BAD_REQUEST
-        )
-
-    # Authenticate user
-    user = authenticate(request, username=username, password=password)
-
-    if user is not None:
-        # Check if user is active
-        if not user.is_active:
-            return Response(
-                {'detail': 'This account is inactive.'},
-                status=status.HTTP_401_UNAUTHORIZED
-            )
-
-        # Log the user in (creates session)
-        login(request, user)
+    try:
+        user_id = int(userid)
+        # Middleware has already validated this user exists
+        user = request.validated_user
+        if not user:
+            return Response({'error': 'Invalid userid'}, status=status.HTTP_400_BAD_REQUEST)
 
         return Response({
             'detail': 'Login successful.',
@@ -202,27 +221,8 @@ def LoginView(request):
             }
         }, status=status.HTTP_200_OK)
 
-    else:
-        return Response(
-            {'detail': 'Invalid username or password.'},
-            status=status.HTTP_401_UNAUTHORIZED
-        )
-
-
-@api_view(['POST'])
-@permission_classes([IsAuthenticated])
-@csrf_exempt
-def LogoutView(request):
-    """
-    Function-based view for handling user logout requests with CSRF exemption
-    """
-    # Log the user out (clears session)
-    # delete sessionid cookie
-
-    logout(request)
-    response = JsonResponse({"message": "Logged out"})
-    response.delete_cookie('sessionid')
-    return response
+    except (ValueError, ObjectDoesNotExist):
+        return Response({'error': 'Invalid userid parameter'}, status=status.HTTP_400_BAD_REQUEST)
 
 
 @api_view(['GET'])
