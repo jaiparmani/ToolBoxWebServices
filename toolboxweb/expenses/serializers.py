@@ -25,6 +25,22 @@ class ExpenseTagSerializer(serializers.ModelSerializer):
     """Serializer for ExpenseTag CRUD operations"""
     user = serializers.HiddenField(default=serializers.CurrentUserDefault())
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Remove user from required fields since it's set programmatically
+        if 'user' in self.fields:
+            self.fields['user'].required = False
+
+    def create(self, validated_data):
+        """Create tag with proper user assignment"""
+        request = self.context.get('request')
+        if request:
+            user = getattr(request, 'validated_user', request.user)
+            if not user or user.is_anonymous:
+                raise serializers.ValidationError("User authentication required.")
+            validated_data['user'] = user
+        return super().create(validated_data)
+
     class Meta:
         model = ExpenseTag
         fields = ['id', 'name', 'color', 'user', 'created_at']
@@ -32,8 +48,15 @@ class ExpenseTagSerializer(serializers.ModelSerializer):
 
     def validate_name(self, value):
         """Ensure tag name is unique for the user"""
-        user = self.context['request'].user
-        if ExpenseTag.objects.filter(name=value, user=user).exists():
+        request = self.context.get('request')
+        if request:
+            user = request.validated_user or request.user
+            if not user or user.is_anonymous:
+                raise serializers.ValidationError("User authentication required.")
+        else:
+            user = None
+
+        if user and ExpenseTag.objects.filter(name=value, user=user).exists():
             if self.instance and self.instance.name == value:
                 return value
             raise serializers.ValidationError("You already have a tag with this name.")
