@@ -20,7 +20,8 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = User
-        fields = ('username', 'email', 'first_name', 'last_name', 'password', 'password_confirm')
+        fields = ('id', 'username', 'email', 'first_name', 'last_name', 'password', 'password_confirm', 'date_joined')
+        read_only_fields = ('id', 'date_joined')
 
     def validate_username(self, value):
         """
