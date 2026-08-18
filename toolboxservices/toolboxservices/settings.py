@@ -25,27 +25,28 @@ SECRET_KEY = "django-insecure-v+hd2#b=+@b0--x$rn*l+2nw%*pvgp@cu+9u8h1b$d$t$imfq(
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = ['toolbox.pythonanywhere.com']
+ALLOWED_HOSTS = ['toolbox.pythonanywhere.com', '127.0.0.1', 'localhost', 'roaring-phoenix-c2dfd0.netlify.app', 'jaiparmani.github.io']
 
 
 # Application definition
 
 INSTALLED_APPS = [
-    "django.contrib.admin",
     "django.contrib.auth",
     "django.contrib.contenttypes",
-    "django.contrib.sessions",
-    "django.contrib.messages",
     "django.contrib.staticfiles",
+    "rest_framework",
+    "corsheaders",
+    "tools",
+    "expenses",
+    "users",
+    "health",
 ]
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
-    "django.contrib.sessions.middleware.SessionMiddleware",
+    "corsheaders.middleware.CorsMiddleware",
     "django.middleware.common.CommonMiddleware",
-    "django.middleware.csrf.CsrfViewMiddleware",
-    "django.contrib.auth.middleware.AuthenticationMiddleware",
-    "django.contrib.messages.middleware.MessageMiddleware",
+    "toolboxservices.middleware.UserIdValidationMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
 
@@ -128,3 +129,63 @@ MEDIA_ROOT = '/home/toolbox/toolboxservices/media'
 MEDIA_URL = '/media/'
 STATIC_ROOT = '/home/toolbox/toolboxservices/static'
 STATIC_URL = '/static/'
+
+# REST Framework configuration
+REST_FRAMEWORK = {
+    'DEFAULT_PERMISSION_CLASSES': [
+        'rest_framework.permissions.AllowAny',
+    ],
+    'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
+    'PAGE_SIZE': 20,
+    'DEFAULT_THROTTLE_CLASSES': [
+        'rest_framework.throttling.AnonRateThrottle',
+        'rest_framework.throttling.UserRateThrottle'
+    ],
+    'DEFAULT_THROTTLE_RATES': {
+        'anon': '100/hour',
+        'user': '1000/hour'
+    },
+    'DEFAULT_RENDERER_CLASSES': [
+        'rest_framework.renderers.JSONRenderer',
+    ],
+}
+
+# CORS settings
+CORS_ALLOWED_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+    "https://toolbox.pythonanywhere.com",
+    "https://roaring-phoenix-c2dfd0.netlify.app",
+    "https://jaiparmani.github.io",
+]
+
+CORS_ALLOW_CREDENTIALS = True
+
+# CSRF settings for production
+CSRF_TRUSTED_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "https://toolbox.pythonanywhere.com",
+    "https://roaring-phoenix-c2dfd0.netlify.app",
+    "https://jaiparmani.github.io",
+]
+
+# Security settings
+SECURE_BROWSER_XSS_FILTER = True
+SECURE_CONTENT_TYPE_NOSNIFF = True
+X_FRAME_OPTIONS = 'DENY'
+
+# CSRF settings for development
+CSRF_COOKIE_SAMESITE = 'Lax'
+CSRF_COOKIE_SECURE = False    # Set to False for development (HTTP)
+
+# HSTS settings (for production with SSL)
+if not DEBUG:
+    SECURE_HSTS_SECONDS = 31536000  # 1 year
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+    SECURE_HSTS_PRELOAD = True
+    SECURE_SSL_REDIRECT = True
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
