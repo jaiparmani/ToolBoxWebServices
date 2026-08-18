@@ -25,7 +25,7 @@ SECRET_KEY = "django-insecure-koy(4=7x7@pga=qbfp*ar$l%(!%z*3c=g%v(zeik8k$r71^qv3
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = ['jaiparmani.pythonanywhere.com','127.0.0.1','localhost', 'roaring-phoenix-c2dfd0.netlify.app']
+ALLOWED_HOSTS = ['jaiparmani.pythonanywhere.com','127.0.0.1','localhost', 'roaring-phoenix-c2dfd0.netlify.app', 'jaiparmani.github.io']
 
 
 # Application definition
@@ -158,6 +158,7 @@ CORS_ALLOWED_ORIGINS = [
     "http://127.0.0.1:8000",
     "https://jaiparmani.pythonanywhere.com",
     "https://roaring-phoenix-c2dfd0.netlify.app",
+    "https://jaiparmani.github.io",
 ]
 
 CORS_ALLOW_CREDENTIALS = True
@@ -168,6 +169,7 @@ CSRF_TRUSTED_ORIGINS = [
     "http://127.0.0.1:3000",
     "https://jaiparmani.pythonanywhere.com",
     "https://roaring-phoenix-c2dfd0.netlify.app",
+    "https://jaiparmani.github.io",
 ]
 
 # Security settings
