@@ -16,7 +16,21 @@ jobs:
           node-version: 20
 
       - run: npm install playwright
-      - run: npx playwright install --with-deps chromium
+
+      # apt's mirrors have repeatedly hung fetching noble-security/noble-updates
+      # InRelease on GitHub-hosted runners, stalling this step for 6+ hours
+      # (the default job timeout) with no error - so cap each attempt and retry.
+      - name: Install Playwright's chromium (retries flaky apt mirrors)
+        run: |
+          for i in 1 2 3; do
+            if timeout 120 npx playwright install --with-deps chromium; then
+              exit 0
+            fi
+            echo "Attempt $i failed or timed out after 120s; retrying..."
+            sleep 5
+          done
+          echo "All attempts to install chromium failed."
+          exit 1
 
       - name: Pull latest code and reload webapp
         run: node deploy.js
