@@ -29,36 +29,18 @@ async function paApi(path, options = {}) {
   return res.status === 204 ? null : res.json();
 }
 
-// Wrap a paApi() call with a couple of retries - PA/its CDN occasionally
-// returns a 2xx with an HTML page instead of JSON (bot-check page or a
-// transient hiccup), which is worth a retry rather than failing outright.
-async function paApiWithRetry(path, options = {}, attempts = 3) {
-  let lastErr;
-  for (let i = 0; i < attempts; i++) {
-    try {
-      return await paApi(path, options);
-    } catch (err) {
-      lastErr = err;
-      console.log(`paApi ${path} attempt ${i + 1}/${attempts} failed: ${err.message}`);
-      if (i < attempts - 1) await new Promise((r) => setTimeout(r, 3000));
-    }
-  }
-  throw lastErr;
-}
-
-// PA's REST API can create a console record, but it doesn't actually start
-// the underlying process until something loads the console page in a
-// browser (an undocumented quirk - see https://help.pythonanywhere.com/pages/API/,
-// which only says "does not actually start the process. Only connecting to
-// the console in a browser will do that"). We tried driving the console's
-// terminal purely through Playwright keystrokes/DOM-reads too, but its
-// output never showed up via innerText - PA's terminal here renders to a
-// canvas, not text DOM nodes, so there's nothing to read back that way. The
-// REST API's send_input/get_latest_output *do* return real text (confirmed
-// working end-to-end once), so Playwright's only job is to log in and open
-// the console page long enough to wake the process; the actual command and
-// its output go through the API.
-async function wakeConsole(consoleUrl) {
+// The REST API's consoles/ POST (create-a-console) started consistently
+// returning a 200 with PA's marketing homepage HTML instead of JSON -
+// almost certainly some rate-limit/redirect tripped by how many
+// logins/API calls this pipeline has made in a short window today.
+// Browser-based console creation (clicking "Bash" on the consoles page,
+// like a human) kept working throughout, though - and separately, its
+// terminal renders to canvas, so there's no DOM text to read output back
+// from. So: create/start the console via the browser (proven reliable),
+// then drive send_input/get_latest_output/delete through the REST API for
+// that existing console id (also proven reliable) - avoiding the one API
+// call that's currently broken while still getting real, readable output.
+async function startConsoleViaBrowser() {
   const browser = await chromium.launch({ headless: true });
   const page = await browser.newPage();
 
@@ -75,47 +57,56 @@ async function wakeConsole(consoleUrl) {
       page.click('button[type="submit"]'),
     ]);
 
-    await page.goto(`https://www.pythonanywhere.com${consoleUrl}`, {
+    await page.goto(`https://www.pythonanywhere.com/user/${PA_USERNAME}/consoles/`, {
       waitUntil: "networkidle",
     });
 
+    const bashLink = page.locator("a", { hasText: /^\s*Bash\s*$/ }).first();
+    await bashLink.waitFor({ state: "visible", timeout: 15000 });
+    await bashLink.click();
+
+    for (let i = 0; i < 15 && !/\/consoles\/\d+/.test(page.url()); i++) {
+      await page.waitForTimeout(1000);
+    }
+
+    const match = page.url().match(/\/consoles\/(\d+)/);
+    if (!match) {
+      throw new Error(`Console page URL never showed a console id: ${page.url()}`);
+    }
+
     // give the console's websocket a moment to actually spin up the process
     await page.waitForTimeout(5000);
+
+    return match[1];
+  } catch (err) {
+    await page.screenshot({ path: "git-pull-error.png", fullPage: true });
+    throw err;
   } finally {
     await browser.close();
   }
 }
 
 async function gitPull() {
-  console.log(`Opening console in ${PA_WORKING_DIR}...`);
-  const console_ = await paApiWithRetry("consoles/", {
-    method: "POST",
-    body: JSON.stringify({
-      executable: "bash",
-      arguments: "",
-      working_directory: PA_WORKING_DIR,
-    }),
-  });
+  console.log(`Starting console via browser for ${PA_WORKING_DIR}...`);
+  const consoleId = await startConsoleViaBrowser();
+  console.log(`Console ${consoleId} started.`);
 
   try {
-    console.log(`Console ${console_.id} created, waking it...`);
-    await wakeConsole(console_.console_url || `/user/${PA_USERNAME}/consoles/${console_.id}/`);
-
-    await paApi(`consoles/${console_.id}/send_input/`, {
+    await paApi(`consoles/${consoleId}/send_input/`, {
       method: "POST",
-      body: JSON.stringify({ input: "git pull\n" }),
+      body: JSON.stringify({ input: `cd ${PA_WORKING_DIR} && git pull\n` }),
     });
 
     let output = "";
     for (let i = 0; i < 5; i++) {
       await new Promise((r) => setTimeout(r, 3000));
-      const chunk = await paApi(`consoles/${console_.id}/get_latest_output/`);
+      const chunk = await paApi(`consoles/${consoleId}/get_latest_output/`);
       output += chunk.output;
     }
 
     console.log("git pull output:\n" + output);
   } finally {
-    await paApi(`consoles/${console_.id}/`, { method: "DELETE" });
+    await paApi(`consoles/${consoleId}/`, { method: "DELETE" });
   }
 }
 
