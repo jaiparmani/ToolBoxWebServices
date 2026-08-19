@@ -18,13 +18,32 @@ async function paApi(path, options = {}) {
     },
   });
 
-  if (!res.ok) {
+  const contentType = res.headers.get("content-type") || "";
+  if (!res.ok || !contentType.includes("application/json")) {
+    const bodySnippet = (await res.text()).slice(0, 300);
     throw new Error(
-      `PA API ${options.method || "GET"} ${path} failed: ${res.status} ${await res.text()}`
+      `PA API ${options.method || "GET"} ${path} failed: ${res.status} (content-type: ${contentType || "none"}) ${bodySnippet}`
     );
   }
 
   return res.status === 204 ? null : res.json();
+}
+
+// Wrap a paApi() call with a couple of retries - PA/its CDN occasionally
+// returns a 2xx with an HTML page instead of JSON (bot-check page or a
+// transient hiccup), which is worth a retry rather than failing outright.
+async function paApiWithRetry(path, options = {}, attempts = 3) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await paApi(path, options);
+    } catch (err) {
+      lastErr = err;
+      console.log(`paApi ${path} attempt ${i + 1}/${attempts} failed: ${err.message}`);
+      if (i < attempts - 1) await new Promise((r) => setTimeout(r, 3000));
+    }
+  }
+  throw lastErr;
 }
 
 // PA's REST API can create a console record, but it doesn't actually start
@@ -69,7 +88,7 @@ async function wakeConsole(consoleUrl) {
 
 async function gitPull() {
   console.log(`Opening console in ${PA_WORKING_DIR}...`);
-  const console_ = await paApi("consoles/", {
+  const console_ = await paApiWithRetry("consoles/", {
     method: "POST",
     body: JSON.stringify({
       executable: "bash",
