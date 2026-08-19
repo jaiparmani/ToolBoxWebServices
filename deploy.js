@@ -57,13 +57,41 @@ async function startConsoleViaBrowser() {
       page.click('button[type="submit"]'),
     ]);
 
+    console.log(`[gitPull] Logged in. Page title: "${await page.title()}"`);
+
     await page.goto(`https://www.pythonanywhere.com/user/${PA_USERNAME}/consoles/`, {
       waitUntil: "networkidle",
     });
 
-    const bashLink = page.locator("a", { hasText: /^\s*Bash\s*$/ }).first();
-    await bashLink.waitFor({ state: "visible", timeout: 15000 });
-    await bashLink.click();
+    console.log(`[gitPull] On consoles page. URL: ${page.url()}, title: "${await page.title()}"`);
+
+    // getByRole("link", { name: "Bash", exact: true }) is what actually
+    // worked here previously - keep looser fallbacks in case PA's markup
+    // shifts again.
+    const bashCandidates = [
+      page.getByRole("link", { name: "Bash", exact: true }),
+      page.locator("a", { hasText: /^\s*Bash\s*$/ }),
+      page.locator("a:has-text('Bash')"),
+    ];
+
+    let clicked = false;
+    for (const candidate of bashCandidates) {
+      const locator = candidate.first();
+      try {
+        await locator.waitFor({ state: "visible", timeout: 8000 });
+        await locator.click();
+        clicked = true;
+        break;
+      } catch (err) {
+        console.log(`[gitPull] Bash selector attempt failed: ${err.message}`);
+      }
+    }
+
+    if (!clicked) {
+      console.log("[gitPull] Could not find a 'Bash' start-console link. Dumping page text for debugging:");
+      console.log((await page.innerText("body")).slice(0, 3000));
+      throw new Error("Could not locate the 'Bash' start-console control on the consoles page.");
+    }
 
     for (let i = 0; i < 15 && !/\/consoles\/\d+/.test(page.url()); i++) {
       await page.waitForTimeout(1000);
