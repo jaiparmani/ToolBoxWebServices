@@ -10,6 +10,7 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/5.0/ref/settings/
 """
 
+import os
 from pathlib import Path
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
@@ -40,6 +41,7 @@ INSTALLED_APPS = [
     "expenses",
     "users",
     "health",
+    "insights",
 ]
 
 MIDDLEWARE = [
@@ -137,14 +139,15 @@ REST_FRAMEWORK = {
     ],
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
     'PAGE_SIZE': 20,
-    'DEFAULT_THROTTLE_CLASSES': [
-        'rest_framework.throttling.AnonRateThrottle',
-        'rest_framework.throttling.UserRateThrottle'
-    ],
-    'DEFAULT_THROTTLE_RATES': {
-        'anon': '100/hour',
-        'user': '1000/hour'
-    },
+    # Rate limiting disabled for now
+    # 'DEFAULT_THROTTLE_CLASSES': [
+    #     'rest_framework.throttling.AnonRateThrottle',
+    #     'rest_framework.throttling.UserRateThrottle'
+    # ],
+    # 'DEFAULT_THROTTLE_RATES': {
+    #     'anon': '100/hour',
+    #     'user': '1000/hour'
+    # },
     'DEFAULT_RENDERER_CLASSES': [
         'rest_framework.renderers.JSONRenderer',
     ],
@@ -190,3 +193,19 @@ if not DEBUG:
     SESSION_COOKIE_SECURE = True
     CSRF_COOKIE_SECURE = True
 
+
+
+# Claude API (used by the insights app)
+# Set ANTHROPIC_API_KEY in the environment - never commit the key.
+#   export ANTHROPIC_API_KEY="sk-ant-..."
+# On PythonAnywhere put the export in ~/.bashrc and in the WSGI file.
+ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
+
+# claude-opus-5 is the current flagship. Thinking is on by default on this
+# model, and max_tokens caps thinking + response together - hence the headroom.
+ANTHROPIC_MODEL = os.environ.get('ANTHROPIC_MODEL', 'claude-opus-5')
+
+# low | medium | high | xhigh | max. medium is plenty for summarising a month
+# of metrics; raise it if the reviews feel shallow.
+ANTHROPIC_EFFORT = os.environ.get('ANTHROPIC_EFFORT', 'medium')
+ANTHROPIC_MAX_TOKENS = int(os.environ.get('ANTHROPIC_MAX_TOKENS', '8000'))

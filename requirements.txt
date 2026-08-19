@@ -17,3 +17,6 @@ Pillow==12.3.0
 
 # Testing and HTTP requests
 requests==2.31.0
+
+# Claude API (insights app)
+anthropic>=0.116.0
