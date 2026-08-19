@@ -21,12 +21,12 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # See https://docs.djangoproject.com/en/5.0/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = "django-insecure-koy(4=7x7@pga=qbfp*ar$l%(!%z*3c=g%v(zeik8k$r71^qv3"
+SECRET_KEY = "django-insecure-v+hd2#b=+@b0--x$rn*l+2nw%*pvgp@cu+9u8h1b$d$t$imfq("
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = ['jaiparmani.pythonanywhere.com','127.0.0.1','localhost', 'roaring-phoenix-c2dfd0.netlify.app', 'jaiparmani.github.io']
+ALLOWED_HOSTS = ['toolbox.pythonanywhere.com', '127.0.0.1', 'localhost', 'roaring-phoenix-c2dfd0.netlify.app', 'jaiparmani.github.io']
 
 
 # Application definition
@@ -127,9 +127,9 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 # default static files settings for PythonAnywhere.
 # see https://help.pythonanywhere.com/pages/DjangoStaticFiles for more info
-MEDIA_ROOT = '/home/jaiparmani/toolboxweb/media'
+MEDIA_ROOT = '/home/toolbox/toolboxservices/media'
 MEDIA_URL = '/media/'
-STATIC_ROOT = '/home/jaiparmani/toolboxweb/static'
+STATIC_ROOT = '/home/toolbox/toolboxservices/static'
 STATIC_URL = '/static/'
 
 # REST Framework configuration
@@ -139,15 +139,14 @@ REST_FRAMEWORK = {
     ],
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
     'PAGE_SIZE': 20,
-    # Rate limiting disabled for now
-    # 'DEFAULT_THROTTLE_CLASSES': [
-    #     'rest_framework.throttling.AnonRateThrottle',
-    #     'rest_framework.throttling.UserRateThrottle'
-    # ],
-    # 'DEFAULT_THROTTLE_RATES': {
-    #     'anon': '100/hour',
-    #     'user': '1000/hour'
-    # },
+    'DEFAULT_THROTTLE_CLASSES': [
+        'rest_framework.throttling.AnonRateThrottle',
+        'rest_framework.throttling.UserRateThrottle'
+    ],
+    'DEFAULT_THROTTLE_RATES': {
+        'anon': '100/hour',
+        'user': '1000/hour'
+    },
     'DEFAULT_RENDERER_CLASSES': [
         'rest_framework.renderers.JSONRenderer',
     ],
@@ -159,7 +158,7 @@ CORS_ALLOWED_ORIGINS = [
     "http://127.0.0.1:3000",
     "http://localhost:8000",
     "http://127.0.0.1:8000",
-    "https://jaiparmani.pythonanywhere.com",
+    "https://toolbox.pythonanywhere.com",
     "https://roaring-phoenix-c2dfd0.netlify.app",
     "https://jaiparmani.github.io",
 ]
@@ -170,7 +169,7 @@ CORS_ALLOW_CREDENTIALS = True
 CSRF_TRUSTED_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
-    "https://jaiparmani.pythonanywhere.com",
+    "https://toolbox.pythonanywhere.com",
     "https://roaring-phoenix-c2dfd0.netlify.app",
     "https://jaiparmani.github.io",
 ]
