@@ -1,4 +1,7 @@
+const { chromium } = require("playwright");
+
 const PA_USERNAME = process.env.PA_USERNAME;
+const PA_PASSWORD = process.env.PA_PASSWORD;
 const PA_API_TOKEN = process.env.PA_API_TOKEN;
 const PA_WORKING_DIR = process.env.PA_WORKING_DIR || "/home/toolbox/ToolBoxWebServices";
 const PA_DOMAIN = process.env.PA_DOMAIN || "jaiparmani.pythonanywhere.com";
@@ -24,10 +27,40 @@ async function paApi(path, options = {}) {
   return res.status === 204 ? null : res.json();
 }
 
+// PA only actually starts a console's process once something loads it in a
+// browser (the API create call just allocates the record) - see
+// https://help.pythonanywhere.com/pages/API/. So we log in with Playwright
+// just long enough to open the console page and wake the process, then do
+// the rest (send_input / get_latest_output / delete) over the plain API.
+async function wakeConsole(consoleUrl) {
+  const browser = await chromium.launch({ headless: true });
+  const page = await browser.newPage();
+
+  try {
+    await page.goto("https://www.pythonanywhere.com/login/", {
+      waitUntil: "networkidle",
+    });
+
+    await page.fill('input[name="auth-username"]', PA_USERNAME);
+    await page.fill('input[name="auth-password"]', PA_PASSWORD);
+
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: "networkidle" }),
+      page.click('button[type="submit"]'),
+    ]);
+
+    await page.goto(`https://www.pythonanywhere.com${consoleUrl}`, {
+      waitUntil: "networkidle",
+    });
+
+    // give the console's websocket a moment to actually spin up the process
+    await page.waitForTimeout(5000);
+  } finally {
+    await browser.close();
+  }
+}
+
 async function gitPull() {
-  console.log(
-    `PA_USERNAME present: ${!!PA_USERNAME}, PA_API_TOKEN present: ${!!PA_API_TOKEN}, length: ${(PA_API_TOKEN || "").length}`
-  );
   console.log(`Opening console in ${PA_WORKING_DIR}...`);
   const console_ = await paApi("consoles/", {
     method: "POST",
@@ -39,6 +72,8 @@ async function gitPull() {
   });
 
   try {
+    await wakeConsole(console_.console_url || `/user/${PA_USERNAME}/consoles/${console_.id}/`);
+
     await paApi(`consoles/${console_.id}/send_input/`, {
       method: "POST",
       body: JSON.stringify({ input: "git pull\n" }),

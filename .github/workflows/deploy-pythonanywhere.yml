@@ -15,8 +15,12 @@ jobs:
         with:
           node-version: 20
 
+      - run: npm install playwright
+      - run: npx playwright install --with-deps chromium
+
       - name: Pull latest code and reload webapp
         run: node deploy.js
         env:
           PA_USERNAME: ${{ secrets.PA_USERNAME }}
+          PA_PASSWORD: ${{ secrets.PA_PASSWORD }}
           PA_API_TOKEN: ${{ secrets.PA_API_TOKEN }}
