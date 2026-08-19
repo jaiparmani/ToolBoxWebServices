@@ -18,6 +18,8 @@ async function paApi(path, options = {}) {
     },
   });
 
+  if (res.status === 204) return null;
+
   const contentType = res.headers.get("content-type") || "";
   if (!res.ok || !contentType.includes("application/json")) {
     const bodySnippet = (await res.text()).slice(0, 300);
@@ -26,7 +28,7 @@ async function paApi(path, options = {}) {
     );
   }
 
-  return res.status === 204 ? null : res.json();
+  return res.json();
 }
 
 // The REST API's consoles/ POST (create-a-console) started consistently
@@ -65,26 +67,36 @@ async function startConsoleViaBrowser() {
 
     console.log(`[gitPull] On consoles page. URL: ${page.url()}, title: "${await page.title()}"`);
 
-    // getByRole("link", { name: "Bash", exact: true }) is what actually
-    // worked here previously - keep looser fallbacks in case PA's markup
-    // shifts again.
+    // The "start a new console" Bash link's text is "$ Bash" (shell-prompt
+    // style), not plain "Bash" - a plain "Bash" match instead lands on a
+    // "Recent Consoles" entry like "Bash console 47845718" (reusing an old,
+    // long-lived console instead of starting a fresh one, which we
+    // previously hit). Try the "$ Bash" form first, then looser fallbacks,
+    // but always reject any match containing a digit (a console id) so we
+    // never accidentally reattach to a Recent Consoles entry.
     const bashCandidates = [
-      page.getByRole("link", { name: "Bash", exact: true }),
-      page.locator("a", { hasText: /^\s*Bash\s*$/ }),
+      page.getByRole("link", { name: "$ Bash" }),
+      page.locator("a", { hasText: /^\$?\s*Bash\s*$/ }),
       page.locator("a:has-text('Bash')"),
     ];
 
     let clicked = false;
     for (const candidate of bashCandidates) {
-      const locator = candidate.first();
-      try {
-        await locator.waitFor({ state: "visible", timeout: 8000 });
-        await locator.click();
-        clicked = true;
-        break;
-      } catch (err) {
-        console.log(`[gitPull] Bash selector attempt failed: ${err.message}`);
+      const count = await candidate.count();
+      for (let i = 0; i < count; i++) {
+        const locator = candidate.nth(i);
+        try {
+          const text = (await locator.innerText()).trim();
+          if (/\d/.test(text)) continue; // skip Recent Consoles entries
+          await locator.waitFor({ state: "visible", timeout: 8000 });
+          await locator.click();
+          clicked = true;
+          break;
+        } catch (err) {
+          console.log(`[gitPull] Bash selector attempt failed: ${err.message}`);
+        }
       }
+      if (clicked) break;
     }
 
     if (!clicked) {
