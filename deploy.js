@@ -72,6 +72,7 @@ async function gitPull() {
   });
 
   try {
+    console.log(`Console ${console_.id} created, waking it...`);
     await wakeConsole(console_.console_url || `/user/${PA_USERNAME}/consoles/${console_.id}/`);
 
     await paApi(`consoles/${console_.id}/send_input/`, {
