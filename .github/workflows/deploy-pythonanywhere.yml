@@ -23,4 +23,13 @@ jobs:
         env:
           PA_USERNAME: ${{ secrets.PA_USERNAME }}
           PA_PASSWORD: ${{ secrets.PA_PASSWORD }}
-          PA_API_TOKEN: ${{ secrets.PA_API_TOKEN }}
+
+      - name: Upload failure screenshots
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-error-screenshots
+          path: |
+            git-pull-error.png
+            reload-error.png
+          if-no-files-found: ignore
