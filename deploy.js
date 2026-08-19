@@ -31,6 +31,20 @@ async function paApi(path, options = {}) {
   return res.json();
 }
 
+// PA's free tier only allows 2 open consoles at a time, and past runs have
+// left orphaned ones behind (crashed before cleanup, or reused a stale one).
+// Kill everything open before starting a fresh console so we never hit that
+// cap.
+async function killExistingConsoles() {
+  const consoles = await paApi("consoles/");
+  for (const c of consoles) {
+    console.log(`Killing existing console ${c.id} (${c.executable})...`);
+    await paApi(`consoles/${c.id}/`, { method: "DELETE" }).catch((err) => {
+      console.log(`Failed to delete console ${c.id}: ${err.message}`);
+    });
+  }
+}
+
 // The REST API's consoles/ POST (create-a-console) started consistently
 // returning a 200 with PA's marketing homepage HTML instead of JSON -
 // almost certainly some rate-limit/redirect tripped by how many
@@ -127,6 +141,8 @@ async function startConsoleViaBrowser() {
 }
 
 async function gitPull() {
+  await killExistingConsoles();
+
   console.log(`Starting console via browser for ${PA_WORKING_DIR}...`);
   const consoleId = await startConsoleViaBrowser();
   console.log(`Console ${consoleId} started.`);
