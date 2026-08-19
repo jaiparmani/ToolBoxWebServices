@@ -2,8 +2,8 @@ const { chromium } = require("playwright");
 
 const PA_USERNAME = process.env.PA_USERNAME;
 const PA_PASSWORD = process.env.PA_PASSWORD;
-const PA_WORKING_DIR = process.env.PA_WORKING_DIR || "/home/toolbox";
-const PA_DOMAIN = process.env.PA_DOMAIN || "jaiparmani.pythonanywhere.com";
+const PA_WORKING_DIR = process.env.PA_WORKING_DIR || "/home/toolbox/toolboxservices";
+const PA_DOMAIN = process.env.PA_DOMAIN || "toolbox.pythonanywhere.com";
 
 // PythonAnywhere's REST API can create a console record, but it doesn't
 // actually start the underlying process until something loads the console
