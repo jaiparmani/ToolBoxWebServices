@@ -25,6 +25,9 @@ async function paApi(path, options = {}) {
 }
 
 async function gitPull() {
+  console.log(
+    `PA_USERNAME present: ${!!PA_USERNAME}, PA_API_TOKEN present: ${!!PA_API_TOKEN}, length: ${(PA_API_TOKEN || "").length}`
+  );
   console.log(`Opening console in ${PA_WORKING_DIR}...`);
   const console_ = await paApi("consoles/", {
     method: "POST",
