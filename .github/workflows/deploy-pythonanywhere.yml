@@ -6,38 +6,8 @@ on:
 
 jobs:
   deploy:
-    runs-on: ubuntu-latest
-    # apt's mirrors have repeatedly hung fetching noble-security/noble-updates
-    # InRelease when installing chromium's OS deps on the plain ubuntu-latest
-    # runner - even a retry loop kept hitting the same wall. Microsoft's
-    # official Playwright image already has chromium and every OS dep baked
-    # in, so there's no apt-get at runtime at all. Keep this tag in sync with
-    # the playwright npm version installed below.
-    container:
-      image: mcr.microsoft.com/playwright:v1.62.1-noble
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
-      - run: npm install playwright@1.62.1
-
-      - name: Pull latest code and reload webapp
-        run: node deploy.js
-        env:
-          PA_USERNAME: ${{ secrets.PA_USERNAME }}
-          PA_PASSWORD: ${{ secrets.PA_PASSWORD }}
-          PA_API_TOKEN: ${{ secrets.PA_API_TOKEN }}
-
-      - name: Upload failure screenshots
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: deploy-error-screenshots
-          path: |
-            git-pull-error.png
-            reload-error.png
-          if-no-files-found: ignore
+    uses: jaiparmani/pa-utilities/.github/workflows/deploy-pythonanywhere.yml@main
+    with:
+      pa_working_dir: /home/toolbox/toolboxservices
+      pa_domain: toolbox.pythonanywhere.com
+    secrets: inherit
