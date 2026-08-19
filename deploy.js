@@ -2,110 +2,48 @@ const { chromium } = require("playwright");
 
 const PA_USERNAME = process.env.PA_USERNAME;
 const PA_PASSWORD = process.env.PA_PASSWORD;
+const PA_API_TOKEN = process.env.PA_API_TOKEN;
 const PA_WORKING_DIR = process.env.PA_WORKING_DIR || "/home/toolbox/toolboxservices";
 const PA_DOMAIN = process.env.PA_DOMAIN || "toolbox.pythonanywhere.com";
 
-// PythonAnywhere's REST API can create a console record, but it doesn't
-// actually start the underlying process until something loads the console
-// page in a browser (an undocumented quirk - see
-// https://help.pythonanywhere.com/pages/API/, which only says "does not
-// actually start the process. Only connecting to the console in a browser
-// will do that"). Its webapp reload API endpoint also started returning a
-// 500 for reasons we couldn't diagnose. Rather than fight either of those,
-// this drives PA's own web UI end-to-end with Playwright, exactly the way a
-// human (and the existing renew.js script) would.
-//
-// IMPORTANT CAVEAT: written without a real logged-in PA session to verify
-// selectors against, so the "start a new console" control and the xterm.js
-// terminal selectors below are best-effort guesses with defensive
-// fallbacks. Every major step logs page state (URL, title, body text
-// snippets) so a failure in real CI is debuggable from the logs and the
-// error screenshot rather than being a silent black box.
+const API_BASE = `https://www.pythonanywhere.com/api/v0/user/${PA_USERNAME}/`;
 
-// Try a list of candidate locators in order; click the first one that
-// actually matches something on the page. Returns true if something was
-// clicked.
-async function clickFirstMatch(page, locatorFns, description) {
-  for (const makeLocator of locatorFns) {
-    try {
-      const locator = makeLocator();
-      const count = await locator.count();
-      if (count > 0) {
-        console.log(
-          `[gitPull] Found ${description} (${count} match${count === 1 ? "" : "es"}); clicking the first one.`
-        );
-        await locator.first().click({ timeout: 10000 });
-        return true;
-      }
-    } catch (err) {
-      console.log(`[gitPull] Selector attempt for ${description} failed: ${err.message}`);
-    }
+async function paApi(path, options = {}) {
+  const res = await fetch(`${API_BASE}${path}`, {
+    ...options,
+    headers: {
+      Authorization: `Token ${PA_API_TOKEN}`,
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+  if (!res.ok) {
+    throw new Error(
+      `PA API ${options.method || "GET"} ${path} failed: ${res.status} ${await res.text()}`
+    );
   }
-  return false;
+
+  return res.status === 204 ? null : res.json();
 }
 
-// The console terminal may render directly on the page or inside an
-// iframe, and PA may use xterm.js (modern) or an older term.js-style
-// container. Search the main page and all frames for anything plausible.
-async function findTerminalHandle(page) {
-  const containerSelectors = [
-    ".xterm",
-    ".xterm-screen",
-    "#terminal",
-    ".terminal",
-    "[id^='terminal-']",
-    "[id^='id_terminal']",
-    "[class*='terminal']",
-  ];
-
-  for (const frame of [page, ...page.frames()]) {
-    for (const sel of containerSelectors) {
-      try {
-        const locator = frame.locator(sel);
-        if ((await locator.count()) > 0) {
-          return { frame, locator: locator.first(), selector: sel };
-        }
-      } catch (err) {
-        // Frame may be detached/cross-origin/mid-navigation - keep trying.
-      }
-    }
-  }
-  return null;
-}
-
-// Read back whatever text xterm.js (or a fallback terminal container) has
-// rendered, trying a few plausible selectors.
-async function readTerminalText(frame) {
-  const textSelectors = [
-    ".xterm-rows",
-    ".xterm-screen",
-    ".xterm",
-    "#terminal",
-    ".terminal",
-    "[id^='terminal-']",
-    "[id^='id_terminal']",
-  ];
-  for (const sel of textSelectors) {
-    try {
-      const locator = frame.locator(sel);
-      if ((await locator.count()) > 0) {
-        const text = await locator.first().innerText();
-        if (text && text.trim().length > 0) return text;
-      }
-    } catch (err) {
-      // keep trying other selectors
-    }
-  }
-  return "";
-}
-
-async function gitPull() {
+// PA's REST API can create a console record, but it doesn't actually start
+// the underlying process until something loads the console page in a
+// browser (an undocumented quirk - see https://help.pythonanywhere.com/pages/API/,
+// which only says "does not actually start the process. Only connecting to
+// the console in a browser will do that"). We tried driving the console's
+// terminal purely through Playwright keystrokes/DOM-reads too, but its
+// output never showed up via innerText - PA's terminal here renders to a
+// canvas, not text DOM nodes, so there's nothing to read back that way. The
+// REST API's send_input/get_latest_output *do* return real text (confirmed
+// working end-to-end once), so Playwright's only job is to log in and open
+// the console page long enough to wake the process; the actual command and
+// its output go through the API.
+async function wakeConsole(consoleUrl) {
   const browser = await chromium.launch({ headless: true });
   const page = await browser.newPage();
-  let activePage = page;
 
   try {
-    // 1. Log in (identical pattern to renew.js).
     await page.goto("https://www.pythonanywhere.com/login/", {
       waitUntil: "networkidle",
     });
@@ -118,141 +56,59 @@ async function gitPull() {
       page.click('button[type="submit"]'),
     ]);
 
-    console.log(`[gitPull] Logged in. Page title: "${await page.title()}"`);
+    await page.goto(`https://www.pythonanywhere.com${consoleUrl}`, {
+      waitUntil: "networkidle",
+    });
 
-    // 2. Go to the consoles page.
-    const consolesUrl = `https://www.pythonanywhere.com/user/${PA_USERNAME}/consoles/`;
-    await page.goto(consolesUrl, { waitUntil: "networkidle" });
-    console.log(`[gitPull] On consoles page. URL: ${page.url()}, title: "${await page.title()}"`);
-
-    // 3. Start a new Bash console. PA may either navigate the current page
-    // to the new console, or open it in a new tab - watch for both.
-    const popupPromise = page
-      .context()
-      .waitForEvent("page", { timeout: 8000 })
-      .catch(() => null);
-
-    const startedBash = await clickFirstMatch(
-      page,
-      [
-        () => page.getByRole("link", { name: "Bash", exact: true }),
-        () => page.locator("a", { hasText: /^\s*Bash\s*$/ }),
-        () => page.locator("#id_new_console_form a:has-text('Bash')"),
-        () => page.locator(".new-console-list a:has-text('Bash')"),
-        () => page.locator("a[href*='bash']"),
-        () => page.locator("text=Bash"),
-      ],
-      '"Bash" start-console control'
-    );
-
-    if (!startedBash) {
-      console.log("[gitPull] Could not find a 'Bash' start-console control. Dumping page text for debugging:");
-      console.log((await page.innerText("body")).slice(0, 3000));
-      throw new Error("Could not locate the 'Bash' start-console control on the consoles page.");
-    }
-
-    const popup = await popupPromise;
-    if (popup) {
-      console.log("[gitPull] Bash console opened in a new tab/window; switching to it.");
-      await popup.waitForLoadState("networkidle").catch((err) => {
-        console.log(`[gitPull] New tab didn't reach networkidle cleanly: ${err.message}`);
-      });
-      activePage = popup;
-    } else {
-      // Same-tab flow: starting the console either triggers a full
-      // navigation, or updates the page via AJAX and redirects shortly
-      // after. Give it a generous window to settle either way.
-      try {
-        await page.waitForNavigation({ waitUntil: "networkidle", timeout: 20000 });
-      } catch (err) {
-        console.log(
-          `[gitPull] No full navigation detected after clicking Bash (${err.message}); continuing - console may render in place.`
-        );
-      }
-      for (let i = 0; i < 5 && !/\/consoles\/\d+/.test(page.url()); i++) {
-        await page.waitForTimeout(1000);
-      }
-      activePage = page;
-    }
-
-    console.log(`[gitPull] After starting console. URL: ${activePage.url()}, title: "${await activePage.title()}"`);
-
-    // 4. Find the terminal and wait for it to become interactive.
-    let terminal = null;
-    for (let attempt = 0; attempt < 10 && !terminal; attempt++) {
-      terminal = await findTerminalHandle(activePage);
-      if (!terminal) await activePage.waitForTimeout(1000);
-    }
-
-    if (!terminal) {
-      console.log("[gitPull] Could not locate a terminal element. Dumping page text for debugging:");
-      console.log((await activePage.innerText("body")).slice(0, 3000));
-      throw new Error("Could not find the console terminal element on the page.");
-    }
-
-    console.log(`[gitPull] Terminal located via selector "${terminal.selector}".`);
-
-    // PA quirk: the console process only actually starts once the console
-    // page has loaded in a browser, and the shell prompt can take a couple
-    // of seconds to appear over the websocket - give it room before typing.
-    await activePage.waitForTimeout(5000);
-
-    await terminal.locator.click({ timeout: 10000 });
-    await activePage.waitForTimeout(500);
-
-    // 5. Type the command as real keystrokes. xterm.js has no form input -
-    // it captures keyboard events on a focused hidden textarea, so
-    // page.keyboard.type() after focusing the terminal is the standard way
-    // to drive it (page.fill()/page.type() on a selector won't work here).
-    const command = `cd ${PA_WORKING_DIR} && git pull\n`;
-    console.log(`[gitPull] Typing command: ${command.trim()}`);
-    await activePage.keyboard.type(command, { delay: 50 });
-
-    // 6. Wait for git pull to finish over the PA network, then capture output.
-    await activePage.waitForTimeout(8000);
-
-    const output = await readTerminalText(terminal.frame);
-    console.log("[gitPull] Captured terminal output:\n" + (output || "(empty)"));
-
-    if (!output || output.trim().length === 0) {
-      throw new Error("Captured empty terminal output after running git pull - cannot confirm the command ran.");
-    }
-
-    const lowerOutput = output.toLowerCase();
-    const errorSignals = [
-      "not a git repository",
-      "permission denied",
-      "command not found",
-      "fatal:",
-      "could not resolve host",
-      "authentication failed",
-    ];
-    const hitError = errorSignals.find((signal) => lowerOutput.includes(signal));
-    if (hitError) {
-      throw new Error(`git pull output contains an error signal ("${hitError}"). Full output logged above.`);
-    }
-
-    console.log("[gitPull] git pull appears to have completed successfully.");
-  } catch (err) {
-    console.error("[gitPull] Failed:", err);
-    try {
-      await activePage.screenshot({ path: "git-pull-error.png", fullPage: true });
-      console.log("[gitPull] Saved screenshot to git-pull-error.png");
-    } catch (screenshotErr) {
-      console.error("[gitPull] Additionally failed to capture error screenshot:", screenshotErr);
-    }
-    throw err;
+    // give the console's websocket a moment to actually spin up the process
+    await page.waitForTimeout(5000);
   } finally {
     await browser.close();
   }
 }
 
-async function reloadWebapp() {
+async function gitPull() {
+  console.log(`Opening console in ${PA_WORKING_DIR}...`);
+  const console_ = await paApi("consoles/", {
+    method: "POST",
+    body: JSON.stringify({
+      executable: "bash",
+      arguments: "",
+      working_directory: PA_WORKING_DIR,
+    }),
+  });
+
+  try {
+    console.log(`Console ${console_.id} created, waking it...`);
+    await wakeConsole(console_.console_url || `/user/${PA_USERNAME}/consoles/${console_.id}/`);
+
+    await paApi(`consoles/${console_.id}/send_input/`, {
+      method: "POST",
+      body: JSON.stringify({ input: "git pull\n" }),
+    });
+
+    let output = "";
+    for (let i = 0; i < 5; i++) {
+      await new Promise((r) => setTimeout(r, 3000));
+      const chunk = await paApi(`consoles/${console_.id}/get_latest_output/`);
+      output += chunk.output;
+    }
+
+    console.log("git pull output:\n" + output);
+  } finally {
+    await paApi(`consoles/${console_.id}/`, { method: "DELETE" });
+  }
+}
+
+// Click the Reload button on PA's webapps page. Kept as a fallback in case
+// the REST API reload call (tried first in reloadWebapp()) ever misbehaves
+// again - it previously 500'd, but that turned out to be because it was
+// targeting a domain this account doesn't own, not an API problem.
+async function reloadWebappViaBrowser() {
   const browser = await chromium.launch({ headless: true });
   const page = await browser.newPage();
 
   try {
-    // Login
     await page.goto("https://www.pythonanywhere.com/login/", {
       waitUntil: "networkidle",
     });
@@ -267,19 +123,10 @@ async function reloadWebapp() {
 
     console.log("✅ Logged in");
 
-    // Open web app page
-    await page.goto(
-      `https://www.pythonanywhere.com/user/${PA_USERNAME}/webapps/`,
-      { waitUntil: "networkidle" }
-    );
+    await page.goto(`https://www.pythonanywhere.com/user/${PA_USERNAME}/webapps/`, {
+      waitUntil: "networkidle",
+    });
 
-    // Click the Reload button. PA renders these controls as
-    // <input type="submit" value="..."> (confirmed for the renewal button
-    // in renew.js: input[value="Run until 1 month from today"]), and the
-    // reload control is expected to read like "Reload <domain>". Try the
-    // exact/expected form first, then fall back to progressively looser,
-    // case-insensitive matches in case PA's markup differs from what we
-    // guessed.
     const reloadSelectors = [
       `input[value="Reload ${PA_DOMAIN}"]`,
       'input[value^="Reload "]',
@@ -308,22 +155,23 @@ async function reloadWebapp() {
       );
     }
 
-    // Give the reload request time to submit and the page to settle.
     await page.waitForLoadState("networkidle", { timeout: 30000 });
-
-    console.log(`✅ Reloaded ${PA_DOMAIN}`);
+    console.log(`✅ Reloaded ${PA_DOMAIN} (via browser click)`);
   } catch (err) {
-    console.error(err);
-
-    // Save screenshot for debugging
-    await page.screenshot({
-      path: "reload-error.png",
-      fullPage: true,
-    });
-
+    await page.screenshot({ path: "reload-error.png", fullPage: true });
     throw err;
   } finally {
     await browser.close();
+  }
+}
+
+async function reloadWebapp() {
+  try {
+    await paApi(`webapps/${PA_DOMAIN}/reload/`, { method: "POST" });
+    console.log(`✅ Reloaded ${PA_DOMAIN} (via API)`);
+  } catch (err) {
+    console.log(`Reload API failed (${err.message}); falling back to clicking the button directly.`);
+    await reloadWebappViaBrowser();
   }
 }
 

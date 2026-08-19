@@ -23,10 +23,17 @@ jobs:
       - name: Install Playwright's chromium (retries flaky apt mirrors)
         run: |
           for i in 1 2 3; do
-            if timeout 120 npx playwright install --with-deps chromium; then
+            # timeout's default SIGTERM doesn't reliably kill apt-get's own
+            # child processes, which can leave the dpkg lock held into the
+            # next attempt - force-kill anything still around first.
+            sudo pkill -9 -f apt-get || true
+            sudo pkill -9 -f dpkg || true
+            sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock || true
+
+            if timeout -k 10 150 npx playwright install --with-deps chromium; then
               exit 0
             fi
-            echo "Attempt $i failed or timed out after 120s; retrying..."
+            echo "Attempt $i failed or timed out after 150s; retrying..."
             sleep 5
           done
           echo "All attempts to install chromium failed."
@@ -37,6 +44,7 @@ jobs:
         env:
           PA_USERNAME: ${{ secrets.PA_USERNAME }}
           PA_PASSWORD: ${{ secrets.PA_PASSWORD }}
+          PA_API_TOKEN: ${{ secrets.PA_API_TOKEN }}
 
       - name: Upload failure screenshots
         if: failure()
