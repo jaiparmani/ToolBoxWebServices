@@ -3,7 +3,7 @@ const { chromium } = require("playwright");
 const PA_USERNAME = process.env.PA_USERNAME;
 const PA_PASSWORD = process.env.PA_PASSWORD;
 const PA_API_TOKEN = process.env.PA_API_TOKEN;
-const PA_WORKING_DIR = process.env.PA_WORKING_DIR || "/home/toolbox/ToolBoxWebServices";
+const PA_WORKING_DIR = process.env.PA_WORKING_DIR || "/home/toolbox";
 const PA_DOMAIN = process.env.PA_DOMAIN || "jaiparmani.pythonanywhere.com";
 
 const API_BASE = `https://www.pythonanywhere.com/api/v0/user/${PA_USERNAME}/`;
@@ -94,6 +94,11 @@ async function gitPull() {
 }
 
 async function reloadWebapp() {
+  const webapps = await paApi("webapps/");
+  console.log(
+    `Webapps visible to ${PA_USERNAME}: ${webapps.map((w) => w.domain_name).join(", ") || "(none)"}`
+  );
+
   await paApi(`webapps/${PA_DOMAIN}/reload/`, { method: "POST" });
   console.log(`✅ Reloaded ${PA_DOMAIN}`);
 }
