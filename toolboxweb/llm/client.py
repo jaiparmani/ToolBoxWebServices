@@ -42,16 +42,60 @@ class LLMRateLimited(LLMError):
     The OpenRouter free tier allows a limited number of model requests per day
     across every feature, so this is an ordinary operating condition rather
     than a bug, and deserves its own status code at the API edge.
+
+    Carries the provider's reset time when it gave one, so a stored key can be
+    benched for exactly as long as it needs.
     """
 
+    def __init__(self, message, reset_at=None):
+        super().__init__(message)
+        self.reset_at = reset_at
 
-def _config():
-    api_key = getattr(settings, 'OPENROUTER_API_KEY', '')
-    if not api_key:
+
+def _model():
+    return getattr(settings, 'OPENROUTER_MODEL', 'openrouter/free')
+
+
+def _candidate_keys():
+    """Keys to try, in rotation order, as (key_string, record_or_None) pairs.
+
+    Stored keys come first, least-recently-used first. The environment
+    variable is the fallback so the app keeps working before any keys are
+    added to the database - and so a fresh deployment isn't dead on arrival.
+    """
+    records = []
+    try:
+        from .models import OpenRouterKey
+        records = list(OpenRouterKey.objects.usable())
+    except Exception:  # table not migrated yet, or app not installed
+        logger.debug("Stored OpenRouter keys unavailable; falling back to settings")
+
+    candidates = [(record.key, record) for record in records]
+
+    env_key = getattr(settings, 'OPENROUTER_API_KEY', '')
+    # Only fall back when no stored key is usable, and never try the same
+    # string twice in one call.
+    if env_key and env_key not in {key for key, _ in candidates}:
+        if not candidates:
+            candidates.append((env_key, None))
+
+    if not candidates:
+        try:
+            from .models import OpenRouterKey
+            if OpenRouterKey.objects.filter(is_active=True).exists():
+                raise LLMNotConfigured(
+                    "Every OpenRouter key has hit its quota. They rotate back in as their "
+                    "limits reset; add another key or add credits to use AI features now."
+                )
+        except LLMNotConfigured:
+            raise
+        except Exception:
+            pass
         raise LLMNotConfigured(
-            "OPENROUTER_API_KEY is not set on the server, so AI features are unavailable."
+            "No OpenRouter API key is configured, so AI features are unavailable. "
+            "Add one with: manage.py openrouter_keys add <key>"
         )
-    return api_key, getattr(settings, 'OPENROUTER_MODEL', 'openrouter/free')
+    return candidates
 
 
 def _post(messages, api_key, model, timeout, max_tokens):
@@ -81,7 +125,8 @@ def _post(messages, api_key, model, timeout, max_tokens):
 
     if response.status_code == 429:
         logger.warning("OpenRouter rate limit hit: %s", response.text[:300])
-        raise LLMRateLimited(_rate_limit_message(response))
+        message, reset_at = _rate_limit_details(response)
+        raise LLMRateLimited(message, reset_at=reset_at)
 
     if not response.ok:
         logger.error("OpenRouter returned %s: %s", response.status_code, response.text[:500])
@@ -107,8 +152,8 @@ def _post(messages, api_key, model, timeout, max_tokens):
     return content, meta
 
 
-def _rate_limit_message(response):
-    """A sentence a user can act on, instead of the provider's raw error body."""
+def _rate_limit_details(response):
+    """(message, reset_at) - a sentence a user can act on, plus when to retry."""
     reset = None
     try:
         meta = (response.json().get('error') or {}).get('metadata') or {}
@@ -121,7 +166,8 @@ def _rate_limit_message(response):
     message = "The AI provider's request quota is used up."
     if reset:
         message += f" It resets at {reset.strftime('%Y-%m-%d %H:%M UTC')}."
-    return message + " Try again after that, or add credits to the OpenRouter account."
+    message += " Try again after that, or add credits to the OpenRouter account."
+    return message, reset
 
 
 def _json_spans(text):
@@ -206,22 +252,45 @@ def call_json(messages, validate=None, expect_key=None,
     With `return_meta`, returns (value, meta) where meta carries the model that
     actually served the call and its token counts.
     """
-    api_key, model = _config()
+    model = _model()
     original = list(messages)
-    last_error = None
+    last_rate_limit = None
 
-    for attempt in range(max_attempts):
-        content, meta = _post(messages, api_key, model, timeout, max_tokens)
-        try:
-            parsed = extract_json(content, expect_key=expect_key)
-            value = validate(parsed) if validate else parsed
-            return (value, meta) if return_meta else value
-        except LLMError as exc:
-            last_error = exc
-            logger.warning("LLM attempt %s/%s failed: %s", attempt + 1, max_attempts, exc)
-            messages = original + [
-                {"role": "assistant", "content": content[:1000]},
-                {"role": "user", "content": retry_instruction},
-            ]
+    # Outer loop rotates keys, inner loop retries a key that answered badly.
+    # A quota-exhausted key is benched and the next one tried, so N keys give
+    # N times the daily headroom rather than failing at the first cap.
+    for api_key, record in _candidate_keys():
+        messages = original
+        last_error = None
 
-    raise last_error
+        for attempt in range(max_attempts):
+            try:
+                content, meta = _post(messages, api_key, model, timeout, max_tokens)
+            except LLMRateLimited as exc:
+                if record:
+                    record.mark_rate_limited(exc.reset_at, str(exc))
+                    logger.info("Key %s benched until %s", record.masked, exc.reset_at)
+                last_rate_limit = exc
+                break  # this key is spent - move to the next one
+
+            if record:
+                record.mark_used()
+
+            try:
+                parsed = extract_json(content, expect_key=expect_key)
+                value = validate(parsed) if validate else parsed
+                return (value, meta) if return_meta else value
+            except LLMError as exc:
+                last_error = exc
+                logger.warning("LLM attempt %s/%s failed: %s", attempt + 1, max_attempts, exc)
+                messages = original + [
+                    {"role": "assistant", "content": content[:1000]},
+                    {"role": "user", "content": retry_instruction},
+                ]
+
+        if last_error is not None:
+            # The key worked, the model just wouldn't produce usable JSON.
+            # Another key would reach the same pool, so don't burn one.
+            raise last_error
+
+    raise last_rate_limit

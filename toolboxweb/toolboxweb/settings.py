@@ -42,6 +42,7 @@ INSTALLED_APPS = [
     "users",
     "health",
     "insights",
+    "llm",
 ]
 
 MIDDLEWARE = [
@@ -210,9 +211,11 @@ ANTHROPIC_MODEL = os.environ.get('ANTHROPIC_MODEL', 'claude-opus-5')
 ANTHROPIC_EFFORT = os.environ.get('ANTHROPIC_EFFORT', 'medium')
 ANTHROPIC_MAX_TOKENS = int(os.environ.get('ANTHROPIC_MAX_TOKENS', '8000'))
 
-# OpenRouter (used by the expenses app's Quick Add text parser)
-# Set OPENROUTER_API_KEY in the environment - never commit the key.
+# OpenRouter (used by the AI features in expenses and insights)
+# Keys normally live in the database and are rotated round-robin - see
+#   manage.py openrouter_keys list
+# This environment variable is the fallback used when no stored key is
+# usable, so a fresh deployment still works before any are added.
 #   export OPENROUTER_API_KEY="sk-or-v1-..."
-# On PythonAnywhere put the export in ~/.bashrc and in the WSGI file.
 OPENROUTER_API_KEY = os.environ.get('OPENROUTER_API_KEY', '')
 OPENROUTER_MODEL = os.environ.get('OPENROUTER_MODEL', 'openrouter/free')
