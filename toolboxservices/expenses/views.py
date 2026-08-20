@@ -300,18 +300,23 @@ class ExpenseViewSet(viewsets.ModelViewSet):
         except ExpenseParseError as exc:
             return Response({'error': str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
 
-        # Prefer an existing category so the transaction type stays consistent with it;
-        # only invent a new category (using the LLM's type guess) if nothing matches.
+        # The model's transaction_type wins: it read the note, whereas a category
+        # match is just a name collision. Reuse an existing category only when its
+        # type agrees, so "lent 200 to raj" can't be filed as an expense merely
+        # because some unrelated category shares the name the model picked.
+        transaction_type = parsed['transaction_type']
+        name = parsed['category_name'][:100]
         category = ExpenseCategory.objects.filter(
-            name__iexact=parsed['category_name'], is_active=True
+            name__iexact=name, is_active=True, transaction_type=transaction_type
         ).first()
-        if category:
-            transaction_type = category.transaction_type
-        else:
-            transaction_type = parsed['transaction_type']
-            category = ExpenseCategory.objects.create(
-                name=parsed['category_name'][:100],
-                transaction_type=transaction_type,
+        if not category:
+            # ExpenseCategory.name is unique, so a same-name category of a
+            # different type forces a qualified name rather than an IntegrityError.
+            if ExpenseCategory.objects.filter(name__iexact=name).exists():
+                name = f"{name} ({transaction_type})"[:100]
+            category, _ = ExpenseCategory.objects.get_or_create(
+                name=name,
+                defaults={'transaction_type': transaction_type},
             )
 
         expense = Expense.objects.create(

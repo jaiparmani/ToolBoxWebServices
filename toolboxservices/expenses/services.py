@@ -32,11 +32,15 @@ SYSTEM_PROMPT = (
     "record. Notes are often terse shorthand (e.g. \"20 aamras\", \"58 chai vada pav\", "
     "\"got 500 from raj\") - the leading number is almost always the amount.\n"
     "\n"
-    "Pick the category that best matches from the list you are given. Only invent a new "
-    "category name when nothing on the list is a reasonable fit, and keep it short.\n"
+    "Decide transaction_type first: \"expense\" for money spent, \"income\" for money "
+    "received, \"debt\" for money borrowed, \"credit\" for money lent out. Default to "
+    "\"expense\" unless the note clearly says otherwise.\n"
     "\n"
-    "Default to transaction_type \"expense\" unless the note clearly describes money coming "
-    "in (income) or a borrowing/lending relationship (debt/credit).\n"
+    "Then pick a category. Each existing category is listed with the transaction_type it "
+    "belongs to - you may only reuse one whose type matches the type you chose AND whose "
+    "meaning genuinely fits the note. Otherwise invent a short new category name (1-3 "
+    "words) describing the kind of spending, such as \"Groceries\", \"Transport\", "
+    "\"Lending\" or \"Salary\". Never reuse a category just because its name is familiar.\n"
     "\n"
     "Respond with ONLY a single JSON object - no markdown fences, no commentary - with "
     "exactly these keys: \"amount\" (positive number), \"transaction_type\" (one of "
@@ -64,7 +68,15 @@ def _call_openrouter(messages, api_key, model):
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
             },
-            json={"model": model, "messages": messages},
+            # json_object mode keeps compliant models from wrapping the object in
+            # prose. The default "openrouter/free" pool routes to a different model
+            # per call and not all of them honour it, hence the tolerant parsing and
+            # the retry in parse_expense_text().
+            json={
+                "model": model,
+                "messages": messages,
+                "response_format": {"type": "json_object"},
+            },
             timeout=30,
         )
     except requests.RequestException as exc:
@@ -86,12 +98,74 @@ def _call_openrouter(messages, api_key, model):
     return content
 
 
+def _json_objects(text):
+    """Yield every balanced {...} span in `text`, outermost first.
+
+    Brace counting rather than a regex: small models often emit a reasoning
+    block containing its own braces before the real answer, and a greedy
+    `\\{.*\\}` swallows everything between the first and last brace. Quoted
+    strings and escapes are tracked so braces inside values don't miscount.
+    """
+    depth = 0
+    start = None
+    in_string = False
+    escaped = False
+    for i, ch in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == '\\':
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == '{':
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == '}':
+            if depth:
+                depth -= 1
+                if depth == 0 and start is not None:
+                    yield text[start:i + 1]
+
+
 def _extract_json(text):
-    """Pull a JSON object out of the model's reply, tolerating markdown fences/preamble."""
-    match = re.search(r'\{.*\}', text, re.DOTALL)
-    if not match:
-        raise ExpenseParseError("Could not find JSON in the model's response.")
-    return json.loads(match.group(0))
+    """Pull the expense object out of the model's reply.
+
+    Tolerates markdown fences, prose, and <think> blocks. Returns the first
+    balanced object that actually carries the fields we need, so a reasoning
+    preamble containing some other object doesn't win.
+    """
+    # Reasoning models emit these; the answer is always after the block.
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r'```(?:json)?|```', '', text)
+
+    try:
+        candidate = json.loads(text)
+        if isinstance(candidate, dict):
+            return candidate
+    except json.JSONDecodeError:
+        pass
+
+    fallback = None
+    for span in _json_objects(text):
+        try:
+            candidate = json.loads(span)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(candidate, dict):
+            continue
+        if 'amount' in candidate:
+            return candidate
+        if fallback is None:
+            fallback = candidate
+
+    if fallback is not None:
+        return fallback
+    raise ExpenseParseError("Could not find JSON in the model's response.")
 
 
 def parse_expense_text(text):
@@ -102,11 +176,16 @@ def parse_expense_text(text):
 
     api_key, model = _openrouter_config()
 
-    category_names = list(
-        ExpenseCategory.objects.filter(is_active=True).values_list('name', flat=True)
-    )
+    # Send each category's transaction_type too - without it the model can't tell
+    # which categories are eligible for a given type and reuses whatever name looks
+    # familiar (filing "lent 200 to raj" under a food category, for instance).
+    existing = [
+        {"name": name, "transaction_type": ttype}
+        for name, ttype in ExpenseCategory.objects.filter(is_active=True)
+        .values_list('name', 'transaction_type')
+    ]
     user_content = (
-        f"Existing categories: {json.dumps(category_names)}\n\n"
+        f"Existing categories: {json.dumps(existing)}\n\n"
         f"Note: \"{text}\""
     )
 
@@ -115,21 +194,63 @@ def parse_expense_text(text):
         {"role": "user", "content": user_content},
     ]
 
-    content = _call_openrouter(messages, api_key, model)
+    # The free pool routes to a different model per call, so a single bad
+    # responder shouldn't fail the request. Retry once with the offending reply
+    # echoed back before giving up.
+    last_error = None
+    for attempt in range(2):
+        content = _call_openrouter(messages, api_key, model)
+        try:
+            return _validate(_extract_json(content))
+        except ExpenseParseError as exc:
+            last_error = exc
+            logger.warning("Expense parse attempt %s failed: %s", attempt + 1, exc)
+            messages = messages[:2] + [
+                {"role": "assistant", "content": content[:1000]},
+                {"role": "user", "content": (
+                    "That was not usable. Reply with ONLY a JSON object, no prose and no "
+                    "code fences, with exactly these keys: amount (positive number), "
+                    "transaction_type (one of \"expense\", \"income\", \"debt\", \"credit\"), "
+                    "description (string), category_name (string)."
+                )},
+            ]
 
-    try:
-        parsed = _extract_json(content)
-    except json.JSONDecodeError as exc:
-        raise ExpenseParseError("The model returned malformed JSON.") from exc
+    raise last_error
+
+
+def _validate(parsed):
+    """Check the model's object has everything the caller needs, with usable values."""
+    if not isinstance(parsed, dict):
+        raise ExpenseParseError("The model did not return a JSON object.")
 
     missing = [k for k in REQUIRED_FIELDS if k not in parsed]
     if missing:
         raise ExpenseParseError(f"The model's response is missing fields: {', '.join(missing)}")
 
-    if not isinstance(parsed.get('amount'), (int, float)) or parsed['amount'] <= 0:
+    # Models sometimes send the amount as a string ("58" or "₹58.00").
+    amount = parsed.get('amount')
+    if isinstance(amount, str):
+        cleaned = re.sub(r'[^0-9.\-]', '', amount)
+        try:
+            amount = float(cleaned)
+        except ValueError:
+            raise ExpenseParseError("The model did not return a valid positive amount.")
+        parsed['amount'] = amount
+
+    if not isinstance(amount, (int, float)) or isinstance(amount, bool) or amount <= 0:
         raise ExpenseParseError("The model did not return a valid positive amount.")
 
-    if parsed.get('transaction_type') not in VALID_TRANSACTION_TYPES:
+    transaction_type = parsed.get('transaction_type')
+    if isinstance(transaction_type, str):
+        transaction_type = transaction_type.strip().lower()
+        parsed['transaction_type'] = transaction_type
+    if transaction_type not in VALID_TRANSACTION_TYPES:
         raise ExpenseParseError("The model returned an invalid transaction_type.")
+
+    for key in ('description', 'category_name'):
+        value = parsed.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise ExpenseParseError(f"The model returned an empty {key}.")
+        parsed[key] = value.strip()
 
     return parsed
