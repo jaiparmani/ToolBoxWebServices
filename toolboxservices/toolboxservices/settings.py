@@ -10,6 +10,7 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/5.0/ref/settings/
 """
 
+import os
 from pathlib import Path
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
@@ -189,3 +190,11 @@ if not DEBUG:
     SECURE_SSL_REDIRECT = True
     SESSION_COOKIE_SECURE = True
     CSRF_COOKIE_SECURE = True
+
+
+# OpenRouter (used by the expenses app's Quick Add text parser)
+# Set OPENROUTER_API_KEY in the environment - never commit the key.
+#   export OPENROUTER_API_KEY="sk-or-v1-..."
+# On PythonAnywhere put the export in ~/.bashrc and in the WSGI file.
+OPENROUTER_API_KEY = os.environ.get('OPENROUTER_API_KEY', '')
+OPENROUTER_MODEL = os.environ.get('OPENROUTER_MODEL', 'openrouter/free')
