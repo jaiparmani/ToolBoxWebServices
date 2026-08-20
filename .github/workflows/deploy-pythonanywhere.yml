@@ -1,0 +1,22 @@
+name: Deploy to PythonAnywhere
+
+# NOTE: for `on: push`, GitHub reads this file from the branch that was
+# pushed - so listing a branch here only takes effect once this file also
+# exists ON that branch. Keep the copies on main and feature/test in sync.
+#
+# deploy.js runs a bare `git pull` in pa_working_dir, which updates whatever
+# branch is checked out on the server (currently feature/test). A push to a
+# branch the server isn't on will still reload the webapp, but won't change
+# the code it serves.
+on:
+  push:
+    branches: [main, feature/test]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    uses: jaiparmani/pa-utilities/.github/workflows/deploy-pythonanywhere.yml@main
+    with:
+      pa_working_dir: /home/toolbox/toolboxservices
+      pa_domain: toolbox.pythonanywhere.com
+    secrets: inherit
