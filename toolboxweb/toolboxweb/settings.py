@@ -209,3 +209,10 @@ ANTHROPIC_MODEL = os.environ.get('ANTHROPIC_MODEL', 'claude-opus-5')
 # of metrics; raise it if the reviews feel shallow.
 ANTHROPIC_EFFORT = os.environ.get('ANTHROPIC_EFFORT', 'medium')
 ANTHROPIC_MAX_TOKENS = int(os.environ.get('ANTHROPIC_MAX_TOKENS', '8000'))
+
+# OpenRouter (used by the expenses app's Quick Add text parser)
+# Set OPENROUTER_API_KEY in the environment - never commit the key.
+#   export OPENROUTER_API_KEY="sk-or-v1-..."
+# On PythonAnywhere put the export in ~/.bashrc and in the WSGI file.
+OPENROUTER_API_KEY = os.environ.get('OPENROUTER_API_KEY', '')
+OPENROUTER_MODEL = os.environ.get('OPENROUTER_MODEL', 'openrouter/free')

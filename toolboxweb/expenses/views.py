@@ -15,6 +15,7 @@ from .serializers import (
     ExpenseSerializer, ExpenseCreateSerializer, ExpenseListSerializer,
     ExpenseCategorySerializer, ExpenseTagSerializer, ExpenseSummarySerializer
 )
+from .services import ExpenseParseError, ExpenseParseNotPossible, parse_expense_text
 
 
 class StandardResultsSetPagination(PageNumberPagination):
@@ -273,6 +274,57 @@ class ExpenseViewSet(viewsets.ModelViewSet):
         }
 
         return Response(report_data)
+
+    @action(detail=False, methods=['post'])
+    def quick_add(self, request):
+        """Parse a free-text note (e.g. "20 aamras") with an LLM and save it as an expense."""
+        userid = request.GET.get('userid')
+        if not userid:
+            return Response({'error': 'userid parameter is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            user_id = int(userid)
+            from django.contrib.auth.models import User
+            user = User.objects.get(id=user_id, is_active=True)
+        except (ValueError, ObjectDoesNotExist):
+            return Response({'error': 'Invalid userid parameter'}, status=status.HTTP_400_BAD_REQUEST)
+
+        text = request.data.get('text', '')
+        if not text or not text.strip():
+            return Response({'error': 'text is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            parsed = parse_expense_text(text)
+        except ExpenseParseNotPossible as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except ExpenseParseError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+
+        # Prefer an existing category so the transaction type stays consistent with it;
+        # only invent a new category (using the LLM's type guess) if nothing matches.
+        category = ExpenseCategory.objects.filter(
+            name__iexact=parsed['category_name'], is_active=True
+        ).first()
+        if category:
+            transaction_type = category.transaction_type
+        else:
+            transaction_type = parsed['transaction_type']
+            category = ExpenseCategory.objects.create(
+                name=parsed['category_name'][:100],
+                transaction_type=transaction_type,
+            )
+
+        expense = Expense.objects.create(
+            user=user,
+            amount=parsed['amount'],
+            transaction_type=transaction_type,
+            category=category,
+            description=parsed['description'],
+            date=timezone.now().date(),
+        )
+
+        serializer = ExpenseSerializer(expense)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=['post'])
     def add_tags(self, request, pk=None):
