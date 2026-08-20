@@ -1,10 +1,11 @@
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 
-from .views import HealthInsightViewSet
+from .views import ExpenseInsightViewSet, HealthInsightViewSet
 
 router = DefaultRouter()
 router.register(r'health', HealthInsightViewSet, basename='health-insight')
+router.register(r'expense', ExpenseInsightViewSet, basename='expense-insight')
 
 urlpatterns = [
     path('', include(router.urls)),
@@ -15,3 +16,5 @@ urlpatterns = [
 # GET  /api/insights/health/latest/?userid=X    - most recent successful insight
 # POST /api/insights/health/generate/?userid=X  - run the analysis now
 #      body: {"days": 30, "force": false}
+#
+# The same four routes exist under /api/insights/expense/ for spending reviews.

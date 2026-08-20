@@ -11,7 +11,10 @@ from rest_framework.response import Response
 
 from .models import Insight
 from .serializers import InsightSerializer
-from .services import InsightGenerationError, InsightNotPossible, generate_health_insight
+from .services import (
+    InsightGenerationError, InsightNotPossible, InsightRateLimited,
+    generate_expense_insight, generate_health_insight,
+)
 
 # Don't spend a model call regenerating the same day's review unless asked.
 REGENERATE_AFTER = timedelta(hours=12)
@@ -36,11 +39,18 @@ def _resolve_user(request):
                               status=status.HTTP_400_BAD_REQUEST)
 
 
-class HealthInsightViewSet(viewsets.ReadOnlyModelViewSet):
-    """Past health insights, plus the endpoint that creates a new one."""
+class BaseInsightViewSet(viewsets.ReadOnlyModelViewSet):
+    """Past insights for one scope, plus the endpoint that creates a new one.
+
+    Subclasses set `scope` and `generator`; everything else - caching, failure
+    recording, the ?userid= contract - is identical across scopes.
+    """
     serializer_class = InsightSerializer
     permission_classes = [AllowAny]
     pagination_class = StandardResultsSetPagination
+
+    scope = None
+    generator = None
 
     def get_queryset(self):
         userid = self.request.GET.get('userid')
@@ -50,7 +60,7 @@ class HealthInsightViewSet(viewsets.ReadOnlyModelViewSet):
             user_id = int(userid)
         except ValueError:
             return Insight.objects.none()
-        return Insight.objects.filter(user_id=user_id, user__is_active=True, scope='health')
+        return Insight.objects.filter(user_id=user_id, user__is_active=True, scope=self.scope)
 
     @action(detail=False, methods=['get'])
     def latest(self, request):
@@ -90,13 +100,16 @@ class HealthInsightViewSet(viewsets.ReadOnlyModelViewSet):
                 return Response(data)
 
         try:
-            parsed, meta = generate_health_insight(user, days=days)
+            parsed, meta = self.generator(user, days=days)
         except InsightNotPossible as exc:
             return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except InsightRateLimited as exc:
+            # Quota, not a failed analysis - don't write a "failed" row for it.
+            return Response({'error': str(exc)}, status=status.HTTP_429_TOO_MANY_REQUESTS)
         except InsightGenerationError as exc:
             # Record the failure so a run of bad days is visible in the history.
             Insight.objects.create(
-                user=user, scope='health', status='failed',
+                user=user, scope=self.scope, status='failed',
                 period_start=timezone.now().date() - timedelta(days=days - 1),
                 period_end=timezone.now().date(),
                 error_message=str(exc),
@@ -105,7 +118,7 @@ class HealthInsightViewSet(viewsets.ReadOnlyModelViewSet):
 
         insight = Insight.objects.create(
             user=user,
-            scope='health',
+            scope=self.scope,
             status='success',
             period_start=meta['period_start'],
             period_end=meta['period_end'],
@@ -127,3 +140,15 @@ class HealthInsightViewSet(viewsets.ReadOnlyModelViewSet):
         data = self.get_serializer(insight).data
         data['regenerated'] = True
         return Response(data, status=status.HTTP_201_CREATED)
+
+
+class HealthInsightViewSet(BaseInsightViewSet):
+    """Claude-written reviews of logged health metrics."""
+    scope = 'health'
+    generator = staticmethod(generate_health_insight)
+
+
+class ExpenseInsightViewSet(BaseInsightViewSet):
+    """LLM-written reviews of a period's spending."""
+    scope = 'expense'
+    generator = staticmethod(generate_expense_insight)

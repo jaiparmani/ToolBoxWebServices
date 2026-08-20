@@ -15,7 +15,10 @@ from .serializers import (
     ExpenseSerializer, ExpenseCreateSerializer, ExpenseListSerializer,
     ExpenseCategorySerializer, ExpenseTagSerializer, ExpenseSummarySerializer
 )
-from .services import ExpenseParseError, ExpenseParseNotPossible, parse_expense_text
+from .services import (
+    ExpenseParseError, ExpenseParseNotPossible, ExpenseParseRateLimited,
+    parse_expense_batch, parse_expense_text,
+)
 
 
 class StandardResultsSetPagination(PageNumberPagination):
@@ -275,35 +278,28 @@ class ExpenseViewSet(viewsets.ModelViewSet):
 
         return Response(report_data)
 
-    @action(detail=False, methods=['post'])
-    def quick_add(self, request):
-        """Parse a free-text note (e.g. "20 aamras") with an LLM and save it as an expense."""
+    def _resolve_user(self, request):
+        """Same ?userid= contract the rest of the API uses. Returns (user, error)."""
         userid = request.GET.get('userid')
         if not userid:
-            return Response({'error': 'userid parameter is required'}, status=status.HTTP_400_BAD_REQUEST)
-
+            return None, Response({'error': 'userid parameter is required'},
+                                  status=status.HTTP_400_BAD_REQUEST)
         try:
-            user_id = int(userid)
             from django.contrib.auth.models import User
-            user = User.objects.get(id=user_id, is_active=True)
+            return User.objects.get(id=int(userid), is_active=True), None
         except (ValueError, ObjectDoesNotExist):
-            return Response({'error': 'Invalid userid parameter'}, status=status.HTTP_400_BAD_REQUEST)
+            return None, Response({'error': 'Invalid userid parameter'},
+                                  status=status.HTTP_400_BAD_REQUEST)
 
-        text = request.data.get('text', '')
-        if not text or not text.strip():
-            return Response({'error': 'text is required'}, status=status.HTTP_400_BAD_REQUEST)
+    @staticmethod
+    def _resolve_category(parsed):
+        """Find or create the category for a parsed item, honouring its type.
 
-        try:
-            parsed = parse_expense_text(text)
-        except ExpenseParseNotPossible as exc:
-            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
-        except ExpenseParseError as exc:
-            return Response({'error': str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
-
-        # The model's transaction_type wins: it read the note, whereas a category
-        # match is just a name collision. Reuse an existing category only when its
-        # type agrees, so "lent 200 to raj" can't be filed as an expense merely
-        # because some unrelated category shares the name the model picked.
+        The model's transaction_type wins: it read the note, whereas a category
+        match is just a name collision. Reuse an existing category only when its
+        type agrees, so "lent 200 to raj" can't be filed as an expense merely
+        because some unrelated category shares the name the model picked.
+        """
         transaction_type = parsed['transaction_type']
         name = parsed['category_name'][:100]
         category = ExpenseCategory.objects.filter(
@@ -318,18 +314,107 @@ class ExpenseViewSet(viewsets.ModelViewSet):
                 name=name,
                 defaults={'transaction_type': transaction_type},
             )
+        return category
+
+    @action(detail=False, methods=['post'])
+    def quick_add(self, request):
+        """Parse a free-text note (e.g. "20 aamras") with an LLM and save it as an expense."""
+        user, error = self._resolve_user(request)
+        if error:
+            return error
+
+        text = request.data.get('text', '')
+        if not text or not text.strip():
+            return Response({'error': 'text is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            parsed = parse_expense_text(text)
+        except ExpenseParseNotPossible as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except ExpenseParseRateLimited as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_429_TOO_MANY_REQUESTS)
+        except ExpenseParseError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
 
         expense = Expense.objects.create(
             user=user,
             amount=parsed['amount'],
-            transaction_type=transaction_type,
-            category=category,
+            transaction_type=parsed['transaction_type'],
+            category=self._resolve_category(parsed),
             description=parsed['description'],
             date=timezone.now().date(),
         )
 
         serializer = ExpenseSerializer(expense)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=['post'])
+    def bulk_add(self, request):
+        """Extract every transaction in a pasted log (e.g. an exported chat).
+
+        Body: {"text": "...", "commit": false}
+
+        Defaults to a dry run: the parsed rows come back for review and nothing
+        is written. The client re-sends with commit=true to save them. Bulk
+        writes driven by model output shouldn't happen without a look first.
+        """
+        user, error = self._resolve_user(request)
+        if error:
+            return error
+
+        text = request.data.get('text', '')
+        if not text or not text.strip():
+            return Response({'error': 'text is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        commit = str(request.data.get('commit', False)).lower() in ('true', '1', 'yes')
+
+        try:
+            items = parse_expense_batch(text)
+        except ExpenseParseNotPossible as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except ExpenseParseRateLimited as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_429_TOO_MANY_REQUESTS)
+        except ExpenseParseError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+
+        if not items:
+            return Response(
+                {'committed': False, 'count': 0, 'items': [],
+                 'detail': 'No transactions were found in that text.'},
+                status=status.HTTP_200_OK,
+            )
+
+        if not commit:
+            preview = [
+                {
+                    'amount': item['amount'],
+                    'transaction_type': item['transaction_type'],
+                    'description': item['description'],
+                    'category_name': item['category_name'],
+                    'date': item['date'].isoformat() if item['date'] else None,
+                }
+                for item in items
+            ]
+            return Response({'committed': False, 'count': len(preview), 'items': preview})
+
+        today = timezone.now().date()
+        created = [
+            Expense.objects.create(
+                user=user,
+                amount=item['amount'],
+                transaction_type=item['transaction_type'],
+                category=self._resolve_category(item),
+                description=item['description'],
+                date=item['date'] or today,
+            )
+            for item in items
+        ]
+
+        serializer = ExpenseSerializer(created, many=True)
+        return Response(
+            {'committed': True, 'count': len(created), 'items': serializer.data},
+            status=status.HTTP_201_CREATED,
+        )
 
     @action(detail=True, methods=['post'])
     def add_tags(self, request, pk=None):

@@ -12,6 +12,7 @@ class Insight(models.Model):
 
     SCOPE_CHOICES = [
         ('health', 'Health'),
+        ('expense', 'Expense'),
     ]
 
     STATUS_CHOICES = [
