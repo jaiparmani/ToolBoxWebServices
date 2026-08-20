@@ -41,6 +41,7 @@ INSTALLED_APPS = [
     "expenses",
     "users",
     "health",
+    "insights",
 ]
 
 MIDDLEWARE = [
