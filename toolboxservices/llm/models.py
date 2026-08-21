@@ -1,62 +1,38 @@
-"""Stored OpenRouter credentials, rotated round-robin.
+"""OpenRouter API keys, held as a queue.
 
 One free-tier key allows a limited number of model requests per day across
-every feature. Holding several keys and spreading calls over them multiplies
-that ceiling, and lets a key that has hit its cap sit out until it resets
-instead of failing the request.
+every AI feature. Several keys multiply that: take the key at the front of
+the queue, use it, and push it to the back, so calls spread evenly.
 
-Keys are stored as given - anyone with database access can read them, same as
-the environment variable this replaces. Rotate them at the provider if the
-database is ever exposed.
+A key that comes back rate limited is pushed to the back too and the next one
+is tried, so an exhausted key costs a little latency rather than the request.
+(A 429 doesn't consume quota, so there is no need to remember which keys are
+spent - the queue sorts itself out.)
+
+Keys are stored as given: anyone with database access can read them, exactly
+as with the environment variable this replaces.
 """
 
 from django.db import models
-from django.db.models import F, Q
-from django.utils import timezone
-
-
-class OpenRouterKeyQuerySet(models.QuerySet):
-    def usable(self):
-        """Active keys that aren't sitting out a rate-limit cooldown.
-
-        Ordered least-recently-used first, which is what makes the rotation
-        round-robin: whichever key has waited longest goes next.
-        """
-        now = timezone.now()
-        return (
-            self.filter(is_active=True)
-            .filter(Q(rate_limited_until__isnull=True) | Q(rate_limited_until__lte=now))
-            .order_by(F('last_used_at').asc(nulls_first=True), 'id')
-        )
+from django.db.models import Max
 
 
 class OpenRouterKey(models.Model):
-    """One API key in the rotation."""
+    """One key in the rotation queue. Lower `position` is nearer the front."""
 
+    key = models.CharField(max_length=255, unique=True)
     label = models.CharField(
         max_length=100, blank=True,
         help_text='Something to recognise this key by, e.g. the account it belongs to.')
-    key = models.CharField(max_length=255, unique=True)
-    is_active = models.BooleanField(
-        default=True, help_text='Uncheck to take a key out of rotation without deleting it.')
 
-    # Rotation state
-    last_used_at = models.DateTimeField(null=True, blank=True)
-    use_count = models.PositiveIntegerField(default=0)
-
-    # Set when the provider reports the key's quota is spent. The key is
-    # skipped until this passes, so one exhausted key doesn't fail a request
-    # that another key could serve.
-    rate_limited_until = models.DateTimeField(null=True, blank=True)
-    last_error = models.TextField(blank=True)
+    # Queue order. Using a number rather than a timestamp keeps "push to the
+    # back" a single UPDATE, and ties are broken by id so the order is stable.
+    position = models.BigIntegerField(default=0, db_index=True)
 
     created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
-
-    objects = OpenRouterKeyQuerySet.as_manager()
 
     class Meta:
-        ordering = ['id']
+        ordering = ['position', 'id']
         verbose_name = 'OpenRouter key'
 
     def __str__(self):
@@ -64,34 +40,23 @@ class OpenRouterKey(models.Model):
 
     @property
     def masked(self):
-        """Never print a whole key - logs and command output use this."""
+        """Never show a whole key - the UI, logs and CLI all use this."""
         if len(self.key) <= 14:
             return f"{self.key[:4]}...{self.key[-2:]}"
         return f"{self.key[:12]}...{self.key[-4:]}"
 
-    @property
-    def is_cooling_down(self):
-        return bool(self.rate_limited_until and self.rate_limited_until > timezone.now())
+    @classmethod
+    def _next_position(cls):
+        return (cls.objects.aggregate(Max('position'))['position__max'] or 0) + 1
 
-    def mark_used(self):
-        """Record a call. Moves this key to the back of the rotation."""
-        now = timezone.now()
-        # F() so concurrent calls can't lose a count to a read-modify-write race.
-        type(self).objects.filter(pk=self.pk).update(
-            last_used_at=now, use_count=F('use_count') + 1)
-        self.last_used_at = now
+    def save(self, *args, **kwargs):
+        # New keys join at the back of the queue.
+        if self._state.adding and not self.position:
+            self.position = self._next_position()
+        super().save(*args, **kwargs)
 
-    def mark_rate_limited(self, until=None, message=''):
-        """Take this key out of rotation until its quota resets.
-
-        Without a reset time from the provider, sit out an hour rather than
-        retrying immediately and burning the request.
-        """
-        until = until or (timezone.now() + timezone.timedelta(hours=1))
-        type(self).objects.filter(pk=self.pk).update(
-            rate_limited_until=until, last_error=message[:500])
-        self.rate_limited_until = until
-
-    def clear_rate_limit(self):
-        type(self).objects.filter(pk=self.pk).update(rate_limited_until=None, last_error='')
-        self.rate_limited_until = None
+    def push_to_back(self):
+        """Send this key to the end of the queue, so the next call uses another."""
+        position = self._next_position()
+        type(self).objects.filter(pk=self.pk).update(position=position)
+        self.position = position

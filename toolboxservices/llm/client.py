@@ -57,43 +57,28 @@ def _model():
 
 
 def _candidate_keys():
-    """Keys to try, in rotation order, as (key_string, record_or_None) pairs.
+    """The key queue, front first, as (key_string, record_or_None) pairs.
 
-    Stored keys come first, least-recently-used first. The environment
-    variable is the fallback so the app keeps working before any keys are
-    added to the database - and so a fresh deployment isn't dead on arrival.
+    The environment variable is the fallback so the app keeps working before
+    any keys are stored - a fresh deployment isn't dead on arrival.
     """
     records = []
     try:
         from .models import OpenRouterKey
-        records = list(OpenRouterKey.objects.usable())
+        records = list(OpenRouterKey.objects.all())  # Meta.ordering = queue order
     except Exception:  # table not migrated yet, or app not installed
         logger.debug("Stored OpenRouter keys unavailable; falling back to settings")
 
     candidates = [(record.key, record) for record in records]
 
     env_key = getattr(settings, 'OPENROUTER_API_KEY', '')
-    # Only fall back when no stored key is usable, and never try the same
-    # string twice in one call.
-    if env_key and env_key not in {key for key, _ in candidates}:
-        if not candidates:
-            candidates.append((env_key, None))
+    if env_key and not candidates:
+        candidates.append((env_key, None))
 
     if not candidates:
-        try:
-            from .models import OpenRouterKey
-            if OpenRouterKey.objects.filter(is_active=True).exists():
-                raise LLMNotConfigured(
-                    "Every OpenRouter key has hit its quota. They rotate back in as their "
-                    "limits reset; add another key or add credits to use AI features now."
-                )
-        except LLMNotConfigured:
-            raise
-        except Exception:
-            pass
         raise LLMNotConfigured(
             "No OpenRouter API key is configured, so AI features are unavailable. "
-            "Add one with: manage.py openrouter_keys add <key>"
+            "Add one in the app, or with: manage.py openrouter_keys add <key>"
         )
     return candidates
 
@@ -267,14 +252,16 @@ def call_json(messages, validate=None, expect_key=None,
             try:
                 content, meta = _post(messages, api_key, model, timeout, max_tokens)
             except LLMRateLimited as exc:
+                # Spent for now. Send it to the back and let the next key serve.
                 if record:
-                    record.mark_rate_limited(exc.reset_at, str(exc))
-                    logger.info("Key %s benched until %s", record.masked, exc.reset_at)
+                    record.push_to_back()
+                    logger.info("Key %s is rate limited; moved to back of queue", record.masked)
                 last_rate_limit = exc
-                break  # this key is spent - move to the next one
+                break
 
+            # Used it - back of the queue, so the next call takes a different one.
             if record:
-                record.mark_used()
+                record.push_to_back()
 
             try:
                 parsed = extract_json(content, expect_key=expect_key)

@@ -65,23 +65,32 @@ SYSTEM_PROMPT = (
 )
 
 BATCH_SYSTEM_PROMPT = (
-    "You extract money transactions from a pasted log - usually exported chat messages, "
-    "one entry per line, e.g.\n"
-    "  [28/05/25, 3:21:37 PM] Jai Parmani: 20 aamras\n"
-    "Terse shorthand is normal and the leading number is almost always the amount.\n"
+    "You pull every money transaction out of a piece of text and return them as a list.\n"
+    "\n"
+    "The text can be in any shape - an exported chat log, a typed list, notes with one "
+    "entry per line, or a single sentence. Do not assume one transaction per line: a line "
+    "or sentence often holds several, separated by commas, \"and\", or nothing at all. "
+    "Split them apart. Terse shorthand is normal, and each amount is usually followed (or "
+    "preceded) by what it was for.\n"
+    "\n"
+    "Examples of the splitting expected:\n"
+    "  \"20 vada pav 100 chai\"           -> two: 20 vada pav, 100 chai\n"
+    "  \"20 vada pav, 100 chai, 250 lunch\" -> three: 20 vada pav, 100 chai, 250 lunch\n"
+    "  \"spent 40 on samosa and 90 on metro\" -> two: 40 samosa, 90 metro\n"
+    "  \"[28/05/25, 3:21 PM] Jai: 20 aamras\" -> one: 20 aamras, dated 2025-05-28\n"
     "\n"
     + _CLASSIFICATION_RULES + "\n"
     "\n"
-    "Skip any line that is not a transaction (greetings, chatter, system messages like "
-    "\"Messages are end-to-end encrypted\"). Never invent a transaction that is not in the "
-    "text. If a line carries a date, report it as \"date\" in YYYY-MM-DD form (a leading "
-    "DD/MM/YY timestamp means day first); use null when the line has no date.\n"
+    "Ignore text that isn't a transaction (greetings, chatter, system notices like "
+    "\"Messages are end-to-end encrypted\"), and never invent one that isn't there. If an "
+    "entry carries a date, report it as \"date\" in YYYY-MM-DD form - a leading DD/MM/YY "
+    "timestamp is day first - otherwise use null.\n"
     "\n"
     "Respond with ONLY a single JSON object - no markdown fences, no commentary - shaped "
     "{\"items\": [...]}, where each item has exactly these keys: \"amount\" (positive "
     "number), \"transaction_type\" (one of \"expense\", \"income\", \"debt\", \"credit\"), "
     "\"description\" (short string), \"category_name\" (string), \"date\" (YYYY-MM-DD or "
-    "null). Return {\"items\": []} if the text contains no transactions."
+    "null). Use {\"items\": []} only when the text genuinely contains no transaction."
 )
 
 
@@ -236,15 +245,28 @@ def parse_expense_batch(text):
         {"role": "system", "content": BATCH_SYSTEM_PROMPT},
         {"role": "user", "content": user_content},
     ]
-    return _translate_errors(
-        call_json,
-        messages,
-        validate=_validate_batch,
-        expect_key='items',
-        retry_instruction=(
-            "That was not usable. Reply with ONLY a JSON object shaped "
-            "{\"items\": [...]}, no prose and no code fences, where each item has the keys "
-            "amount, transaction_type, description, category_name and date."
-        ),
-        max_tokens=4000,
+    retry_instruction = (
+        "That was not usable. Reply with ONLY a JSON object shaped "
+        "{\"items\": [...]}, no prose and no code fences, where each item has the keys "
+        "amount, transaction_type, description, category_name and date."
     )
+    items = _translate_errors(
+        call_json, messages, validate=_validate_batch, expect_key='items',
+        retry_instruction=retry_instruction, max_tokens=4000,
+    )
+
+    # "Nothing here" is a legitimate answer, but it is also what a model returns
+    # when it has misread the shape of the text - a comma-separated sentence
+    # being the common case. If the text plainly contains amounts, insist once.
+    if not items and re.search(r'\d', text):
+        insist = messages + [{"role": "user", "content": (
+            "That text does contain amounts. Read it again and list every transaction, "
+            "remembering that one line or sentence can hold several separated by commas, "
+            "\"and\", or nothing at all. Reply with ONLY {\"items\": [...]}."
+        )}]
+        items = _translate_errors(
+            call_json, insist, validate=_validate_batch, expect_key='items',
+            retry_instruction=retry_instruction, max_tokens=4000,
+        )
+
+    return items
