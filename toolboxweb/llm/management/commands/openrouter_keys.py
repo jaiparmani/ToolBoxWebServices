@@ -4,16 +4,12 @@ There is no Django admin on this project, so this is how keys get added:
 
     manage.py openrouter_keys add sk-or-v1-... --label "personal"
     manage.py openrouter_keys list
-    manage.py openrouter_keys disable 3
-    manage.py openrouter_keys enable 3
-    manage.py openrouter_keys clear-limits
     manage.py openrouter_keys remove 3
 
 Keys are only ever printed masked.
 """
 
 from django.core.management.base import BaseCommand, CommandError
-from django.utils import timezone
 
 from llm.models import OpenRouterKey
 
@@ -28,14 +24,10 @@ class Command(BaseCommand):
         add.add_argument('key')
         add.add_argument('--label', default='', help='Something to recognise it by')
 
-        sub.add_parser('list', help='Show every key and its rotation state')
-        sub.add_parser('clear-limits', help='Forget recorded rate limits and retry every key')
+        sub.add_parser('list', help='Show the key queue, front first')
 
-        for name, helptext in (('disable', 'Take a key out of rotation'),
-                               ('enable', 'Put a key back in rotation'),
-                               ('remove', 'Delete a key')):
-            p = sub.add_parser(name, help=helptext)
-            p.add_argument('id', type=int)
+        remove = sub.add_parser('remove', help='Delete a key')
+        remove.add_argument('id', type=int)
 
     def handle(self, *args, **options):
         getattr(self, f"_{options['action'].replace('-', '_')}")(options)
@@ -57,7 +49,7 @@ class Command(BaseCommand):
         self.stdout.write(self.style.SUCCESS(
             f"Added key {record.id}: {record.masked}"
             + (f" ({record.label})" if record.label else '')))
-        self.stdout.write(f"{OpenRouterKey.objects.usable().count()} key(s) now in rotation.")
+        self.stdout.write(f"{OpenRouterKey.objects.count()} key(s) in the queue.")
 
     def _list(self, options):
         keys = OpenRouterKey.objects.all()
@@ -66,41 +58,15 @@ class Command(BaseCommand):
                               'manage.py openrouter_keys add sk-or-v1-...')
             return
 
-        now = timezone.now()
-        self.stdout.write(f"{'id':<4} {'key':<22} {'label':<14} {'state':<24} {'uses':>5}  last used")
-        self.stdout.write('-' * 88)
-        for k in keys:
-            if not k.is_active:
-                state = 'disabled'
-            elif k.is_cooling_down:
-                mins = int((k.rate_limited_until - now).total_seconds() // 60)
-                state = f'rate limited ({mins}m left)'
-            else:
-                state = 'ready'
-            last = k.last_used_at.strftime('%Y-%m-%d %H:%M') if k.last_used_at else 'never'
-            self.stdout.write(
-                f"{k.id:<4} {k.masked:<22} {(k.label or '-'):<14} {state:<24} {k.use_count:>5}  {last}")
-        self.stdout.write(f"\n{OpenRouterKey.objects.usable().count()} of {len(keys)} ready to use.")
-
-    def _disable(self, options):
-        record = self._get(options)
-        record.is_active = False
-        record.save(update_fields=['is_active'])
-        self.stdout.write(self.style.SUCCESS(f'Disabled {record.masked}'))
-
-    def _enable(self, options):
-        record = self._get(options)
-        record.is_active = True
-        record.save(update_fields=['is_active'])
-        self.stdout.write(self.style.SUCCESS(f'Enabled {record.masked}'))
+        self.stdout.write(f"{'#':<3} {'id':<4} {'key':<22} label")
+        self.stdout.write('-' * 52)
+        for i, k in enumerate(keys, 1):
+            arrow = '->' if i == 1 else '  '
+            self.stdout.write(f"{arrow}{i:<2} {k.id:<4} {k.masked:<22} {k.label or '-'}")
+        self.stdout.write(f"\n{len(keys)} key(s) queued; '->' is next up.")
 
     def _remove(self, options):
         record = self._get(options)
         masked = record.masked
         record.delete()
         self.stdout.write(self.style.SUCCESS(f'Removed {masked}'))
-
-    def _clear_limits(self, options):
-        count = OpenRouterKey.objects.exclude(rate_limited_until=None).update(
-            rate_limited_until=None, last_error='')
-        self.stdout.write(self.style.SUCCESS(f'Cleared rate limits on {count} key(s).'))
