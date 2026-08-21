@@ -17,7 +17,7 @@ from .serializers import (
 )
 from .services import (
     ExpenseParseError, ExpenseParseNotPossible, ExpenseParseRateLimited,
-    parse_expense_batch, parse_expense_text,
+    parse_expense_batch, parse_expense_text, validate_supplied_items,
 )
 
 
@@ -353,29 +353,42 @@ class ExpenseViewSet(viewsets.ModelViewSet):
         """Extract every transaction in a pasted log (e.g. an exported chat).
 
         Body: {"text": "...", "commit": false}
+           or {"items": [...], "commit": true}
 
         Defaults to a dry run: the parsed rows come back for review and nothing
-        is written. The client re-sends with commit=true to save them. Bulk
-        writes driven by model output shouldn't happen without a look first.
+        is written. Bulk writes driven by model output shouldn't happen without
+        a look first.
+
+        To save, send back the reviewed rows as "items". That skips a second
+        model call - which was both slow and wrong, since re-parsing could
+        produce different rows than the ones the user actually approved.
         """
         user, error = self._resolve_user(request)
         if error:
             return error
 
-        text = request.data.get('text', '')
-        if not text or not text.strip():
-            return Response({'error': 'text is required'}, status=status.HTTP_400_BAD_REQUEST)
-
         commit = str(request.data.get('commit', False)).lower() in ('true', '1', 'yes')
+        supplied = request.data.get('items')
+        text = request.data.get('text', '')
 
-        try:
-            items = parse_expense_batch(text)
-        except ExpenseParseNotPossible as exc:
-            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
-        except ExpenseParseRateLimited as exc:
-            return Response({'error': str(exc)}, status=status.HTTP_429_TOO_MANY_REQUESTS)
-        except ExpenseParseError as exc:
-            return Response({'error': str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+        if commit and supplied is not None:
+            # Saving rows the user already reviewed - no model call needed.
+            try:
+                items = validate_supplied_items(supplied)
+            except ExpenseParseNotPossible as exc:
+                return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        else:
+            if not text or not text.strip():
+                return Response({'error': 'text is required'},
+                                status=status.HTTP_400_BAD_REQUEST)
+            try:
+                items = parse_expense_batch(text)
+            except ExpenseParseNotPossible as exc:
+                return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+            except ExpenseParseRateLimited as exc:
+                return Response({'error': str(exc)}, status=status.HTTP_429_TOO_MANY_REQUESTS)
+            except ExpenseParseError as exc:
+                return Response({'error': str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
 
         if not items:
             return Response(

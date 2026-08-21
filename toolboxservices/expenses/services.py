@@ -187,6 +187,30 @@ def _validate_batch(parsed):
     return validated
 
 
+def validate_supplied_items(items):
+    """Validate rows a client sends back after reviewing them.
+
+    Saving the reviewed rows avoids parsing the same text twice - which cost a
+    second model call, and risked storing something other than what the user
+    approved, since the pool can answer differently each time. The rows still
+    get checked here rather than trusted.
+    """
+    if not isinstance(items, list):
+        raise ExpenseParseNotPossible("items must be a list.")
+
+    validated = []
+    for raw in items[:MAX_BATCH_ITEMS]:
+        if not isinstance(raw, dict):
+            raise ExpenseParseNotPossible("Each item must be an object.")
+        try:
+            item = _validate_item(dict(raw))
+        except LLMError as exc:
+            raise ExpenseParseNotPossible(f"Invalid item: {exc}") from exc
+        item['date'] = _coerce_date(raw.get('date'))
+        validated.append(item)
+    return validated
+
+
 def _translate_errors(fn, *args, **kwargs):
     """Run an llm.client call, re-raising in this module's vocabulary."""
     try:
