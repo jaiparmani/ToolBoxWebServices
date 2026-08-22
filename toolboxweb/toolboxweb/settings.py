@@ -32,8 +32,11 @@ ALLOWED_HOSTS = ['toolbox.pythonanywhere.com', '127.0.0.1', 'localhost', 'roarin
 # Application definition
 
 INSTALLED_APPS = [
+    "django.contrib.admin",
     "django.contrib.auth",
     "django.contrib.contenttypes",
+    "django.contrib.sessions",
+    "django.contrib.messages",
     "django.contrib.staticfiles",
     "rest_framework",
     "corsheaders",
@@ -47,8 +50,12 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
+    "django.contrib.sessions.middleware.SessionMiddleware",
     "corsheaders.middleware.CorsMiddleware",
     "django.middleware.common.CommonMiddleware",
+    "django.middleware.csrf.CsrfViewMiddleware",
+    "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "django.contrib.messages.middleware.MessageMiddleware",
     "toolboxweb.middleware.UserIdValidationMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
@@ -138,6 +145,13 @@ REST_FRAMEWORK = {
     'DEFAULT_PERMISSION_CLASSES': [
         'rest_framework.permissions.AllowAny',
     ],
+    # The API authenticates with ?userid= via UserIdValidationMiddleware, not
+    # Django sessions. Leaving DRF's default SessionAuthentication on would mean
+    # that once someone logs into /admin/ in the same browser, DRF starts
+    # treating their API calls as authenticated and enforces CSRF on them -
+    # every write from the frontend would then fail with "CSRF Failed: CSRF
+    # cookie not set". Session auth grants this API nothing, so it is off.
+    'DEFAULT_AUTHENTICATION_CLASSES': [],
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
     'PAGE_SIZE': 20,
     # Rate limiting disabled for now
