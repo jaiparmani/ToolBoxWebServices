@@ -26,6 +26,9 @@ VALID_TRANSACTION_TYPES = {"expense", "income", "debt", "credit"}
 # A batch is capped so one paste can't turn into hundreds of model-invented rows.
 MAX_BATCH_ITEMS = 50
 
+# Two or three tags describe a purchase; more is noise in the UI.
+MAX_TAGS_PER_ITEM = 3
+
 
 class ExpenseParseNotPossible(Exception):
     """Caller's fault or nothing to work with - no API key, empty text."""
@@ -51,6 +54,15 @@ _CLASSIFICATION_RULES = (
     "\"Lending\" or \"Salary\". Never reuse a category just because its name is familiar."
 )
 
+
+_TAG_RULES = (
+    "Finally, add up to three short lowercase tags describing the purchase in ways the "
+    "category does not - who or what it was for, the occasion, how it was paid. Reuse a "
+    "tag from the provided list whenever it fits, since tags are only useful when they "
+    "group things together; invent one only when nothing fits. Use an empty list when "
+    "nothing meaningful can be said - do not restate the category or the description."
+)
+
 SYSTEM_PROMPT = (
     "You convert a short, informally written note about money into a structured expense "
     "record. Notes are often terse shorthand (e.g. \"20 aamras\", \"58 chai vada pav\", "
@@ -58,10 +70,12 @@ SYSTEM_PROMPT = (
     "\n"
     + _CLASSIFICATION_RULES + "\n"
     "\n"
+    + _TAG_RULES + "\n"
+    "\n"
     "Respond with ONLY a single JSON object - no markdown fences, no commentary - with "
     "exactly these keys: \"amount\" (positive number), \"transaction_type\" (one of "
     "\"expense\", \"income\", \"debt\", \"credit\"), \"description\" (short string), "
-    "\"category_name\" (string)."
+    "\"category_name\" (string), \"tags\" (array of 0-3 short lowercase strings)."
 )
 
 BATCH_SYSTEM_PROMPT = (
@@ -81,6 +95,8 @@ BATCH_SYSTEM_PROMPT = (
     "\n"
     + _CLASSIFICATION_RULES + "\n"
     "\n"
+    + _TAG_RULES + "\n"
+    "\n"
     "Ignore text that isn't a transaction (greetings, chatter, system notices like "
     "\"Messages are end-to-end encrypted\"), and never invent one that isn't there. If an "
     "entry carries a date, report it as \"date\" in YYYY-MM-DD form - a leading DD/MM/YY "
@@ -90,7 +106,8 @@ BATCH_SYSTEM_PROMPT = (
     "{\"items\": [...]}, where each item has exactly these keys: \"amount\" (positive "
     "number), \"transaction_type\" (one of \"expense\", \"income\", \"debt\", \"credit\"), "
     "\"description\" (short string), \"category_name\" (string), \"date\" (YYYY-MM-DD or "
-    "null). Use {\"items\": []} only when the text genuinely contains no transaction."
+    "null), \"tags\" (array of 0-3 short lowercase strings). Use {\"items\": []} only when "
+    "the text genuinely contains no transaction."
 )
 
 
@@ -143,7 +160,25 @@ def _validate_item(parsed):
             raise LLMError(f"The model returned an empty {key}.")
         parsed[key] = value.strip()
 
+    parsed['tags'] = _clean_tags(parsed.get('tags'))
     return parsed
+
+
+def _clean_tags(value):
+    """Normalise the model's tag list. Tags are a nicety - never fail on them."""
+    if isinstance(value, str):
+        value = [v for v in re.split(r'[,;]', value)]
+    if not isinstance(value, list):
+        return []
+
+    cleaned = []
+    for tag in value:
+        if not isinstance(tag, (str, int, float)):
+            continue
+        tag = str(tag).strip().lstrip('#').lower()[:50]
+        if tag and tag not in cleaned:
+            cleaned.append(tag)
+    return cleaned[:MAX_TAGS_PER_ITEM]
 
 
 def _coerce_date(value):
@@ -223,14 +258,15 @@ def _translate_errors(fn, *args, **kwargs):
         raise ExpenseParseError(str(exc)) from exc
 
 
-def parse_expense_text(text):
+def parse_expense_text(text, known_tags=()):
     """Ask the model to turn one free-text note into an expense dict."""
     text = (text or '').strip()
     if not text:
         raise ExpenseParseNotPossible("No text provided.")
 
     user_content = (
-        f"Existing categories: {json.dumps(_category_context())}\n\n"
+        f"Existing categories: {json.dumps(_category_context())}\n"
+        f"Existing tags: {json.dumps(list(known_tags))}\n\n"
         f"Note: \"{text}\""
     )
     messages = [
@@ -251,7 +287,7 @@ def parse_expense_text(text):
     )
 
 
-def parse_expense_batch(text):
+def parse_expense_batch(text, known_tags=()):
     """Extract every transaction in a pasted log. Returns a list of expense dicts.
 
     An empty list is a legitimate result - the paste may hold no transactions.
@@ -261,7 +297,8 @@ def parse_expense_batch(text):
         raise ExpenseParseNotPossible("No text provided.")
 
     user_content = (
-        f"Existing categories: {json.dumps(_category_context())}\n\n"
+        f"Existing categories: {json.dumps(_category_context())}\n"
+        f"Existing tags: {json.dumps(list(known_tags))}\n\n"
         f"Today's date is {date.today().isoformat()}.\n\n"
         f"Log:\n{text}"
     )

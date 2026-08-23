@@ -1,10 +1,13 @@
-"""Turn a user's logged health metrics into a Claude-written review.
+"""Turn a user's logged data into an LLM-written review.
 
-Two halves that stay independent on purpose:
+Two scopes, health and expense, sharing one shape: a headline, a summary and
+four lists. Each scope keeps two halves independent on purpose:
 
-  build_health_context() - pure Django ORM, no network. Testable on its own.
-  generate_health_insight() - takes that context to Claude and validates what
+  build_*_context()  - pure Django ORM, no network. Testable on its own.
+  generate_*_insight() - takes that context to the model and validates what
   comes back.
+
+Both run on OpenRouter via llm.client.
 """
 
 import json
@@ -44,43 +47,12 @@ DAILY_AGGREGATION = {
     'steps': 'sum',
 }
 
-# Structured output contract. Every property is required and additionalProperties
-# is false - both are required by the structured-outputs API.
-INSIGHT_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "headline": {
-            "type": "string",
-            "description": "One short sentence (max ~90 chars) capturing the period.",
-        },
-        "summary": {
-            "type": "string",
-            "description": "2-4 sentences of plain-language overview across all metrics.",
-        },
-        "observations": {
-            "type": "array",
-            "items": {"type": "string"},
-            "description": "Specific patterns visible in the data, each citing the numbers it rests on.",
-        },
-        "concerns": {
-            "type": "array",
-            "items": {"type": "string"},
-            "description": "Trends worth attention. Empty array if nothing stands out.",
-        },
-        "suggestions": {
-            "type": "array",
-            "items": {"type": "string"},
-            "description": "Concrete, small actions for the coming week.",
-        },
-        "data_gaps": {
-            "type": "array",
-            "items": {"type": "string"},
-            "description": "Metrics that were missing or logged too sparsely to say anything about.",
-        },
-    },
-    "required": ["headline", "summary", "observations", "concerns", "suggestions", "data_gaps"],
-    "additionalProperties": False,
-}
+JSON_SHAPE_INSTRUCTION = (
+    "Respond with ONLY a JSON object - no prose, no code fences - with exactly these keys: "
+    "\"headline\" (one sentence, max ~90 chars), \"summary\" (2-4 sentences), "
+    "\"observations\" (array of strings), \"concerns\" (array of strings), "
+    "\"suggestions\" (array of strings), \"data_gaps\" (array of strings)."
+)
 
 SYSTEM_PROMPT = (
     "You review a person's self-logged health metrics and report what the numbers show.\n"
@@ -195,33 +167,14 @@ def build_health_context(user, days=30):
     return context
 
 
-def _client():
-    """Build the Anthropic client, or explain why we can't."""
-    api_key = getattr(settings, 'ANTHROPIC_API_KEY', '')
-    if not api_key:
-        raise InsightNotPossible(
-            "ANTHROPIC_API_KEY is not set on the server, so insights cannot be generated."
-        )
-    try:
-        import anthropic
-    except ImportError as exc:  # pragma: no cover - depends on deployment
-        raise InsightNotPossible(
-            "The 'anthropic' package is not installed. Run: pip install -r requirements.txt"
-        ) from exc
-    return anthropic, anthropic.Anthropic(api_key=api_key)
-
-
 def generate_health_insight(user, days=30):
-    """Build the context, ask Claude, and return (parsed_dict, metadata).
+    """Build the context, ask the model, and return (parsed_dict, metadata).
 
-    metadata carries model / effort / token counts for the Insight row.
+    Runs on OpenRouter like every other AI feature here. It previously called
+    Anthropic directly, which meant health reviews needed a second API key that
+    the server was never given - the feature was deployed but could not run.
     """
     context = build_health_context(user, days=days)
-    anthropic, client = _client()
-
-    model = getattr(settings, 'ANTHROPIC_MODEL', 'claude-opus-5')
-    effort = getattr(settings, 'ANTHROPIC_EFFORT', 'medium')
-    max_tokens = getattr(settings, 'ANTHROPIC_MAX_TOKENS', 8000)
 
     user_content = (
         f"Here is {user.username}'s logged health data for the period. Values are already "
@@ -229,59 +182,41 @@ def generate_health_insight(user, days=30):
         f"```json\n{context.as_prompt_json()}\n```\n\n"
         f"Review the period and fill in the required structure."
     )
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT + "\n\n" + JSON_SHAPE_INSTRUCTION},
+        {"role": "user", "content": user_content},
+    ]
 
     try:
-        response = client.messages.create(
-            model=model,
-            max_tokens=max_tokens,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_content}],
-            output_config={
-                "effort": effort,
-                "format": {"type": "json_schema", "schema": INSIGHT_SCHEMA},
-            },
+        parsed, meta = call_json(
+            messages,
+            validate=_validate_insight,
+            expect_key='headline',
+            retry_instruction=(
+                "That was not usable. Reply with ONLY a JSON object, no prose and no code "
+                "fences, with the keys headline, summary, observations, concerns, "
+                "suggestions and data_gaps."
+            ),
+            max_tokens=4000,
+            timeout=60,
+            return_meta=True,
         )
-    except anthropic.APIStatusError as exc:
-        logger.exception("Claude returned %s for user %s", exc.status_code, user.id)
-        raise InsightGenerationError(f"Claude API error ({exc.status_code}): {exc.message}") from exc
-    except anthropic.APIConnectionError as exc:
-        logger.exception("Could not reach Claude for user %s", user.id)
-        raise InsightGenerationError("Could not reach the Claude API. Check network access.") from exc
+    except LLMNotConfigured as exc:
+        raise InsightNotPossible(str(exc)) from exc
+    except LLMRateLimited as exc:
+        raise InsightRateLimited(str(exc)) from exc
+    except LLMError as exc:
+        raise InsightGenerationError(str(exc)) from exc
 
-    # Check why generation stopped before trusting the content.
-    if response.stop_reason == "refusal":
-        details = getattr(response, 'stop_details', None)
-        detail = getattr(details, 'explanation', None) if details else None
-        raise InsightGenerationError(f"Claude declined to answer. {detail or ''}".strip())
-    if response.stop_reason == "max_tokens":
-        raise InsightGenerationError(
-            f"Response hit the {max_tokens}-token limit before finishing. "
-            f"Raise ANTHROPIC_MAX_TOKENS or lower ANTHROPIC_EFFORT."
-        )
-
-    text = next((b.text for b in response.content if b.type == "text"), None)
-    if not text:
-        raise InsightGenerationError("Claude returned no text content.")
-
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise InsightGenerationError("Claude returned malformed JSON.") from exc
-
-    missing = [k for k in INSIGHT_SCHEMA["required"] if k not in parsed]
-    if missing:
-        raise InsightGenerationError(f"Claude's response is missing fields: {', '.join(missing)}")
-
-    metadata = {
-        "model": response.model,
-        "effort": effort,
-        "input_tokens": response.usage.input_tokens,
-        "output_tokens": response.usage.output_tokens,
+    return parsed, {
+        "model": meta["model"],
+        "effort": "",
+        "input_tokens": meta["input_tokens"],
+        "output_tokens": meta["output_tokens"],
         "period_start": context.period_start,
         "period_end": context.period_end,
         "entry_count": context.entry_count,
     }
-    return parsed, metadata
 
 
 # --------------------------------------------------------------------------
@@ -293,10 +228,17 @@ def generate_health_insight(user, days=30):
 # server, and the JSON hardening there already survives the free pool.
 # --------------------------------------------------------------------------
 
-EXPENSE_REQUIRED_FIELDS = ["headline", "summary", "observations", "concerns",
+INSIGHT_REQUIRED_FIELDS = ["headline", "summary", "observations", "concerns",
                            "suggestions", "data_gaps"]
 
-EXPENSE_SYSTEM_PROMPT = (
+EXPENSE_JSON_SHAPE_INSTRUCTION = (
+    "Respond with ONLY a JSON object - no prose, no code fences - with exactly these keys: "
+    "\"headline\" (one sentence, max ~90 chars), \"summary\" (2-4 sentences), "
+    "\"observations\" (array of strings), \"concerns\" (array of strings), "
+    "\"suggestions\" (array of strings), \"data_gaps\" (array of strings)."
+)
+
+SYSTEM_PROMPT = (
     "You review a person's spending record for a period and report what the numbers show.\n"
     "\n"
     "Ground every statement in the data you are given: quote actual amounts, counts and "
@@ -406,12 +348,12 @@ def build_expense_context(user, days=30):
     }
 
 
-def _validate_expense_insight(parsed):
+def _validate_insight(parsed):
     """The model's review must have every field, with the list fields as lists."""
     if not isinstance(parsed, dict):
         raise LLMError("The model did not return a JSON object.")
 
-    missing = [k for k in EXPENSE_REQUIRED_FIELDS if k not in parsed]
+    missing = [k for k in INSIGHT_REQUIRED_FIELDS if k not in parsed]
     if missing:
         raise LLMError(f"The response is missing fields: {', '.join(missing)}")
 
@@ -448,7 +390,7 @@ def generate_expense_insight(user, days=30):
     try:
         parsed, meta = call_json(
             messages,
-            validate=_validate_expense_insight,
+            validate=_validate_insight,
             expect_key='headline',
             retry_instruction=(
                 "That was not usable. Reply with ONLY a JSON object, no prose and no code "
