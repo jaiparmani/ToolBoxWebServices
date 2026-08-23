@@ -8,6 +8,7 @@ from django.db.models import Sum, Count, Q
 from django.utils import timezone
 from django.core.exceptions import ObjectDoesNotExist
 from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation
 import django_filters
 
 from .models import Expense, ExpenseCategory, ExpenseSplit, ExpenseTag, Person
@@ -17,6 +18,7 @@ from .serializers import (
     ExpenseSplitSerializer, PersonSerializer
 )
 from .services import (
+    compute_shares,
     ExpenseParseError, ExpenseParseNotPossible, ExpenseParseRateLimited,
     parse_expense_batch, parse_expense_text, parse_search_query, parse_split_text,
     validate_supplied_items,
@@ -459,6 +461,143 @@ class ExpenseViewSet(viewsets.ModelViewSet):
         )
 
     @action(detail=False, methods=['post'])
+    def create_split(self, request):
+        """Create a shared bill from explicit fields - no model call.
+
+        Body: {
+          "amount": 1200, "description": "dinner", "category_id": 1,
+          "date": "2026-08-23", "split_with_me": true,
+          "participants": [{"person_id": 3}, {"name": "priya", "amount": 500}]
+        }
+
+        The LLM route is convenient but costs a request against a daily quota
+        and can misread a sentence into a wrong balance. This is the path for
+        when the numbers need to be exactly what you typed.
+        """
+        user, error = self._resolve_user(request)
+        if error:
+            return error
+
+        data = request.data
+        try:
+            amount = Decimal(str(data.get('amount'))).quantize(Decimal('0.01'))
+        except (TypeError, InvalidOperation):
+            return Response({'error': 'A valid amount is required'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        if amount <= 0:
+            return Response({'error': 'Amount must be greater than zero'},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        description = str(data.get('description') or '').strip()
+        if not description:
+            return Response({'error': 'A description is required'},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        participants = data.get('participants') or []
+        if not isinstance(participants, list) or not participants:
+            return Response({'error': 'At least one person to split with is required'},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        # Resolve each participant to a Person, creating by name when needed.
+        resolved, explicit = [], {}
+        for entry in participants:
+            if not isinstance(entry, dict):
+                return Response({'error': 'Each participant must be an object'},
+                                status=status.HTTP_400_BAD_REQUEST)
+            person = None
+            if entry.get('person_id'):
+                person = Person.objects.filter(user=user, id=entry['person_id']).first()
+                if not person:
+                    return Response({'error': f"Unknown person {entry['person_id']}"},
+                                    status=status.HTTP_400_BAD_REQUEST)
+            elif entry.get('user_id'):
+                # Picked from the app's users: link by id rather than by name, so
+                # the split reaches their panel without depending on spelling.
+                from django.contrib.auth.models import User as AuthUser
+                account = AuthUser.objects.filter(id=entry['user_id'], is_active=True).first()
+                if not account:
+                    return Response({'error': f"Unknown user {entry['user_id']}"},
+                                    status=status.HTTP_400_BAD_REQUEST)
+                if account == user:
+                    return Response({'error': "You're already part of the split - "
+                                              "use 'split with me' instead of adding yourself"},
+                                    status=status.HTTP_400_BAD_REQUEST)
+                person = Person.objects.filter(user=user, linked_user=account).first()
+                if not person:
+                    person = (Person.objects.filter(user=user, name__iexact=account.username)
+                              .first())
+                    if person:
+                        person.linked_user = account
+                        person.save(update_fields=['linked_user'])
+                    else:
+                        person = Person.objects.create(user=user, name=account.username,
+                                                       linked_user=account)
+            else:
+                name = str(entry.get('name') or '').strip()[:100]
+                if not name:
+                    return Response({'error': 'Each participant needs a person_id or a name'},
+                                    status=status.HTTP_400_BAD_REQUEST)
+                person = Person.objects.filter(user=user, name__iexact=name).first()
+                if not person:
+                    person = Person.objects.create(user=user, name=name,
+                                                   linked_user=match_account(name))
+            if person in resolved:
+                continue  # the same person listed twice is one share
+            resolved.append(person)
+            if entry.get('amount') not in (None, ''):
+                try:
+                    share = Decimal(str(entry['amount'])).quantize(Decimal('0.01'))
+                except InvalidOperation:
+                    return Response({'error': f'Invalid amount for {person.name}'},
+                                    status=status.HTTP_400_BAD_REQUEST)
+                if share <= 0:
+                    return Response({'error': f'Amount for {person.name} must be above zero'},
+                                    status=status.HTTP_400_BAD_REQUEST)
+                explicit[person.name] = share
+
+        if explicit and sum(explicit.values()) > amount:
+            return Response(
+                {'error': "The shares add up to more than the bill."},
+                status=status.HTTP_400_BAD_REQUEST)
+
+        split_with_me = bool(data.get('split_with_me', True))
+        if not split_with_me and not explicit and not resolved:
+            return Response({'error': 'Nobody to split with'},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        owed = compute_shares(amount, [p.name for p in resolved], split_with_me,
+                              {k: v for k, v in explicit.items()} or None)
+
+        category = None
+        if data.get('category_id'):
+            category = ExpenseCategory.objects.filter(id=data['category_id'], is_active=True).first()
+        if not category:
+            category = self._resolve_category(
+                {'transaction_type': 'expense', 'category_name': data.get('category_name') or 'Shared'})
+
+        expense_date = _coerce_date_value(data.get('date')) or timezone.now().date()
+        expense = Expense.objects.create(
+            user=user, amount=amount, transaction_type='expense',
+            category=category, description=description, date=expense_date,
+        )
+
+        splits = []
+        by_name = {p.name: p for p in resolved}
+        for name, share in owed.items():
+            person = by_name.get(name)
+            if person:
+                splits.append(ExpenseSplit.objects.create(
+                    expense=expense, person=person, amount=share))
+
+        owed_total = sum(s.amount for s in splits)
+        return Response({
+            'expense': ExpenseSerializer(expense).data,
+            'splits': ExpenseSplitSerializer(splits, many=True).data,
+            'your_share': expense.amount - owed_total,
+            'owed_to_you': owed_total,
+        }, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=['post'])
     def split_add(self, request):
         """Log a shared bill: "split 1200 dinner with raj and priya".
 
@@ -682,6 +821,37 @@ class PersonViewSet(viewsets.ModelViewSet):
             raise serializers.ValidationError({'userid': 'A valid userid is required.'})
         serializer.save(user=user)
 
+    @action(detail=False, methods=['get'])
+    def available_users(self, request):
+        """Accounts you can split with, for a picker.
+
+        Only id and username are returned - enough to choose somebody, and
+        nothing about their money. A search term is required beyond the people
+        already known to you, so this isn't a way to page through every account
+        on the server.
+        """
+        user, error = _resolve_split_user(request)
+        if error:
+            return error
+
+        from django.contrib.auth.models import User as AuthUser
+        already = dict(Person.objects.filter(user=user, linked_user__isnull=False)
+                       .values_list('linked_user_id', 'name'))
+
+        search = (request.GET.get('search') or '').strip()
+        accounts = AuthUser.objects.filter(is_active=True).exclude(id=user.id)
+        if search:
+            accounts = accounts.filter(username__icontains=search)
+        else:
+            # No search term: show only the people already split with, so the
+            # full account list isn't handed out for the asking.
+            accounts = accounts.filter(id__in=already.keys())
+
+        return Response([
+            {'user_id': a.id, 'username': a.username, 'already_added': a.id in already}
+            for a in accounts.order_by('username')[:20]
+        ])
+
 
 class SplitViewSet(viewsets.ReadOnlyModelViewSet):
     """Shared expenses: what each person owes, and settling up."""
@@ -808,3 +978,13 @@ class SplitViewSet(viewsets.ReadOnlyModelViewSet):
             'settled_total': total,
             'splits': ExpenseSplitSerializer(settled, many=True).data,
         })
+
+
+def _coerce_date_value(value):
+    """A client-supplied YYYY-MM-DD, or None when absent or unusable."""
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        return datetime.strptime(value.strip()[:10], '%Y-%m-%d').date()
+    except ValueError:
+        return None
