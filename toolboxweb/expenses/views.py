@@ -292,6 +292,30 @@ class ExpenseViewSet(viewsets.ModelViewSet):
                                   status=status.HTTP_400_BAD_REQUEST)
 
     @staticmethod
+    def _known_tag_names(user):
+        """The user's existing tags, so the model reuses them instead of coining near-duplicates."""
+        return list(ExpenseTag.objects.filter(user=user).values_list('name', flat=True))
+
+    @staticmethod
+    def _resolve_tags(user, names):
+        """Map model-suggested tag names onto the user's tags, creating what's missing.
+
+        ExpenseTag.name is globally unique rather than unique per user, so a name
+        another account already holds cannot be created here. Skip those rather
+        than failing the save - a missing tag is a far smaller loss than a
+        rejected expense.
+        """
+        resolved = []
+        for name in names or []:
+            tag = ExpenseTag.objects.filter(name__iexact=name, user=user).first()
+            if not tag:
+                if ExpenseTag.objects.filter(name__iexact=name).exists():
+                    continue  # owned by another user
+                tag = ExpenseTag.objects.create(name=name[:50], user=user)
+            resolved.append(tag)
+        return resolved
+
+    @staticmethod
     def _resolve_category(parsed):
         """Find or create the category for a parsed item, honouring its type.
 
@@ -328,7 +352,7 @@ class ExpenseViewSet(viewsets.ModelViewSet):
             return Response({'error': 'text is required'}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            parsed = parse_expense_text(text)
+            parsed = parse_expense_text(text, known_tags=self._known_tag_names(user))
         except ExpenseParseNotPossible as exc:
             return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         except ExpenseParseRateLimited as exc:
@@ -344,6 +368,7 @@ class ExpenseViewSet(viewsets.ModelViewSet):
             description=parsed['description'],
             date=timezone.now().date(),
         )
+        expense.tags.set(self._resolve_tags(user, parsed.get('tags')))
 
         serializer = ExpenseSerializer(expense)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
@@ -382,7 +407,7 @@ class ExpenseViewSet(viewsets.ModelViewSet):
                 return Response({'error': 'text is required'},
                                 status=status.HTTP_400_BAD_REQUEST)
             try:
-                items = parse_expense_batch(text)
+                items = parse_expense_batch(text, known_tags=self._known_tag_names(user))
             except ExpenseParseNotPossible as exc:
                 return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
             except ExpenseParseRateLimited as exc:
@@ -404,6 +429,7 @@ class ExpenseViewSet(viewsets.ModelViewSet):
                     'transaction_type': item['transaction_type'],
                     'description': item['description'],
                     'category_name': item['category_name'],
+                    'tags': item.get('tags', []),
                     'date': item['date'].isoformat() if item['date'] else None,
                 }
                 for item in items
@@ -411,8 +437,9 @@ class ExpenseViewSet(viewsets.ModelViewSet):
             return Response({'committed': False, 'count': len(preview), 'items': preview})
 
         today = timezone.now().date()
-        created = [
-            Expense.objects.create(
+        created = []
+        for item in items:
+            expense = Expense.objects.create(
                 user=user,
                 amount=item['amount'],
                 transaction_type=item['transaction_type'],
@@ -420,8 +447,8 @@ class ExpenseViewSet(viewsets.ModelViewSet):
                 description=item['description'],
                 date=item['date'] or today,
             )
-            for item in items
-        ]
+            expense.tags.set(self._resolve_tags(user, item.get('tags')))
+            created.append(expense)
 
         serializer = ExpenseSerializer(created, many=True)
         return Response(
