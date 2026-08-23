@@ -231,14 +231,7 @@ def generate_health_insight(user, days=30):
 INSIGHT_REQUIRED_FIELDS = ["headline", "summary", "observations", "concerns",
                            "suggestions", "data_gaps"]
 
-EXPENSE_JSON_SHAPE_INSTRUCTION = (
-    "Respond with ONLY a JSON object - no prose, no code fences - with exactly these keys: "
-    "\"headline\" (one sentence, max ~90 chars), \"summary\" (2-4 sentences), "
-    "\"observations\" (array of strings), \"concerns\" (array of strings), "
-    "\"suggestions\" (array of strings), \"data_gaps\" (array of strings)."
-)
-
-SYSTEM_PROMPT = (
+EXPENSE_SYSTEM_PROMPT = (
     "You review a person's spending record for a period and report what the numbers show.\n"
     "\n"
     "Ground every statement in the data you are given: quote actual amounts, counts and "
