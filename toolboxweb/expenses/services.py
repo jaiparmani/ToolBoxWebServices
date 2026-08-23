@@ -331,3 +331,106 @@ def parse_expense_batch(text, known_tags=()):
         )
 
     return items
+
+
+# --------------------------------------------------------------------------
+# Natural-language search
+#
+# The model never writes a query. It returns the same filter fields the REST
+# API already accepts, which ExpenseFilter then validates and applies - so a
+# bad or hostile answer can only produce a filter combination a user could
+# have typed by hand, never arbitrary SQL.
+# --------------------------------------------------------------------------
+
+SEARCH_FIELDS = {
+    'date_from', 'date_to', 'amount_min', 'amount_max',
+    'category', 'transaction_type', 'search',
+}
+
+SEARCH_SYSTEM_PROMPT = (
+    "You turn a question about someone's spending into a set of filters.\n"
+    "\n"
+    "Available filters, all optional - use only the ones the question calls for:\n"
+    "  date_from, date_to   YYYY-MM-DD, inclusive\n"
+    "  amount_min, amount_max   numbers\n"
+    "  category             the exact name of one existing category\n"
+    "  transaction_type     one of \"expense\", \"income\", \"debt\", \"credit\"\n"
+    "  search               free text matched against description, location and payment "
+    "method - use it for a thing, shop or person the categories don't cover\n"
+    "\n"
+    "Resolve relative dates against today's date, which is given to you. \"last month\" "
+    "means the whole of the previous calendar month, \"this week\" the current week from "
+    "Monday, \"yesterday\" a single day with date_from equal to date_to.\n"
+    "\n"
+    "Prefer category over search when the question names something that matches an "
+    "existing category, since categories are exact and search is fuzzy. Return no filters "
+    "at all - an empty object - when the question asks about everything.\n"
+    "\n"
+    "Also write \"interpretation\": one short sentence restating what you filtered for, so "
+    "the person can see whether you understood them.\n"
+    "\n"
+    "Respond with ONLY a JSON object - no prose, no code fences - shaped "
+    "{\"filters\": {...}, \"interpretation\": \"...\"}."
+)
+
+
+def _validate_search(parsed):
+    """Keep only filters the API actually accepts, with values it can use."""
+    if not isinstance(parsed, dict):
+        raise LLMError("The model did not return a JSON object.")
+
+    filters = parsed.get('filters')
+    if filters is None:
+        # Some models drop the envelope and return the filters directly.
+        filters = {k: v for k, v in parsed.items() if k in SEARCH_FIELDS}
+    if not isinstance(filters, dict):
+        raise LLMError("The model's response has no \"filters\" object.")
+
+    clean = {}
+    for key, value in filters.items():
+        if key not in SEARCH_FIELDS or value in (None, '', [], {}):
+            continue  # anything unrecognised is dropped rather than passed through
+        if key in ('date_from', 'date_to'):
+            parsed_date = _coerce_date(value if isinstance(value, str) else None)
+            if parsed_date:
+                clean[key] = parsed_date.isoformat()
+        elif key in ('amount_min', 'amount_max'):
+            try:
+                clean[key] = float(str(value).replace(',', ''))
+            except ValueError:
+                continue
+        elif key == 'transaction_type':
+            if str(value).strip().lower() in VALID_TRANSACTION_TYPES:
+                clean[key] = str(value).strip().lower()
+        else:
+            clean[key] = str(value).strip()
+
+    interpretation = parsed.get('interpretation')
+    return {
+        'filters': clean,
+        'interpretation': (interpretation or '').strip() if isinstance(interpretation, str) else '',
+    }
+
+
+def parse_search_query(question):
+    """Turn a question into {'filters': {...}, 'interpretation': '...'}."""
+    question = (question or '').strip()
+    if not question:
+        raise ExpenseParseNotPossible("No question provided.")
+
+    user_content = (
+        f"Today's date is {date.today().isoformat()}.\n"
+        f"Existing categories: {json.dumps(_category_context())}\n\n"
+        f"Question: \"{question}\""
+    )
+    messages = [
+        {"role": "system", "content": SEARCH_SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
+    return _translate_errors(
+        call_json, messages, validate=_validate_search, expect_key='filters',
+        retry_instruction=(
+            "That was not usable. Reply with ONLY a JSON object shaped "
+            "{\"filters\": {...}, \"interpretation\": \"...\"}, no prose and no code fences."
+        ),
+    )

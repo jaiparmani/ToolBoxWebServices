@@ -17,7 +17,7 @@ from .serializers import (
 )
 from .services import (
     ExpenseParseError, ExpenseParseNotPossible, ExpenseParseRateLimited,
-    parse_expense_batch, parse_expense_text, validate_supplied_items,
+    parse_expense_batch, parse_expense_text, parse_search_query, validate_supplied_items,
 )
 
 
@@ -455,6 +455,62 @@ class ExpenseViewSet(viewsets.ModelViewSet):
             {'committed': True, 'count': len(created), 'items': serializer.data},
             status=status.HTTP_201_CREATED,
         )
+
+    @action(detail=False, methods=['post'])
+    def ask(self, request):
+        """Answer a question about spending by filtering, not by generating prose.
+
+        Body: {"question": "how much on food last month"}
+
+        The model only chooses filter values; ExpenseFilter applies them. That
+        keeps the arithmetic in the database - the totals are computed here, not
+        written by a model that might get them wrong - and means a bad answer can
+        only ever be a filter combination the user could have picked by hand.
+        """
+        user, error = self._resolve_user(request)
+        if error:
+            return error
+
+        question = request.data.get('question', '')
+        if not question or not question.strip():
+            return Response({'error': 'question is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            parsed = parse_search_query(question)
+        except ExpenseParseNotPossible as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except ExpenseParseRateLimited as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_429_TOO_MANY_REQUESTS)
+        except ExpenseParseError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+
+        filters = parsed['filters']
+
+        # A category name is friendlier for the model than an id; the filter wants the id.
+        applied = dict(filters)
+        category_name = applied.pop('category', None)
+        queryset = self.get_queryset()
+        if category_name:
+            category = ExpenseCategory.objects.filter(name__iexact=category_name).first()
+            if category:
+                queryset = queryset.filter(category=category)
+            else:
+                # Unknown category: fall back to matching the text rather than
+                # silently returning everything, which would look like an answer.
+                applied['search'] = applied.get('search') or category_name
+
+        queryset = ExpenseFilter(applied, queryset=queryset).qs
+
+        totals = queryset.aggregate(total=Sum('amount'), count=Count('id'))
+        serializer = ExpenseListSerializer(queryset.order_by('-date')[:50], many=True)
+        return Response({
+            'question': question.strip(),
+            'interpretation': parsed['interpretation'],
+            'filters': filters,
+            'total': totals['total'] or 0,
+            'count': totals['count'] or 0,
+            'results': serializer.data,
+        })
 
     @action(detail=True, methods=['post'])
     def add_tags(self, request, pk=None):
