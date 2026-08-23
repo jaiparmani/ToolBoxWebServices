@@ -149,6 +149,15 @@ class Person(models.Model):
     name = models.CharField(max_length=100)
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
                              related_name='split_people')
+
+    # When this person also has an account, their side of the split shows up in
+    # their own panel: the same ExpenseSplit rows are "owed to me" for the payer
+    # and "I owe" for whoever is linked here, so nothing is recorded twice.
+    # SET_NULL rather than CASCADE - deleting an account shouldn't erase the
+    # history of what was split with them.
+    linked_user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+                                    null=True, blank=True, related_name='split_debts',
+                                    help_text='The account this person signs in with, if any')
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

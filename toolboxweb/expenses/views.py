@@ -502,7 +502,16 @@ class ExpenseViewSet(viewsets.ModelViewSet):
             # stay one balance rather than two.
             person = Person.objects.filter(user=user, name__iexact=name).first()
             if not person:
-                person = Person.objects.create(user=user, name=name)
+                # Link to an account with this username when there is one, so the
+                # split appears in their panel too.
+                person = Person.objects.create(user=user, name=name,
+                                               linked_user=match_account(name))
+            elif person.linked_user_id is None:
+                # A person added before they had an account picks the link up now.
+                account = match_account(person.name)
+                if account:
+                    person.linked_user = account
+                    person.save(update_fields=['linked_user'])
             splits.append(ExpenseSplit.objects.create(
                 expense=expense, person=person, amount=share))
 
@@ -623,6 +632,21 @@ class ExpenseViewSet(viewsets.ModelViewSet):
         return Response(serializer.data)
 
 
+def match_account(name):
+    """Find the account a split-partner name refers to, or None.
+
+    An exact username wins outright. A case-insensitive match is only used when
+    it is unambiguous - this database holds both "Jai" and "jai", and guessing
+    between them would attach someone's debts to the wrong account.
+    """
+    from django.contrib.auth.models import User
+    exact = User.objects.filter(username=name, is_active=True).first()
+    if exact:
+        return exact
+    candidates = list(User.objects.filter(username__iexact=name, is_active=True)[:2])
+    return candidates[0] if len(candidates) == 1 else None
+
+
 def _resolve_split_user(request):
     """The ?userid= contract, shared by the split viewsets."""
     userid = request.GET.get('userid')
@@ -670,8 +694,11 @@ class SplitViewSet(viewsets.ReadOnlyModelViewSet):
         if not userid:
             return ExpenseSplit.objects.none()
         try:
+            uid = int(userid)
+            # Splits you are party to, whichever end you are on.
             queryset = ExpenseSplit.objects.filter(
-                expense__user_id=int(userid)).select_related('person', 'expense')
+                Q(expense__user_id=uid) | Q(person__linked_user_id=uid)
+            ).select_related('person', 'expense')
         except ValueError:
             return ExpenseSplit.objects.none()
         if self.request.GET.get('settled') == 'false':
@@ -683,15 +710,18 @@ class SplitViewSet(viewsets.ReadOnlyModelViewSet):
 
     @action(detail=False, methods=['get'])
     def balances(self, request):
-        """What each person currently owes, largest first.
+        """Both directions: what people owe you, and what you owe them.
 
-        Only unsettled splits count. People who owe nothing are still listed so
-        the UI can show them without a second call.
+        The two lists come from the same ExpenseSplit rows read from opposite
+        ends - a split is "owed to me" for whoever paid and "I owe" for the
+        account the person is linked to - so a shared bill is never stored
+        twice and the two sides cannot drift apart.
         """
         user, error = _resolve_split_user(request)
         if error:
             return error
 
+        # Money coming back to you: splits on expenses you paid.
         rows = (ExpenseSplit.objects
                 .filter(expense__user=user, is_settled=False)
                 .values('person_id', 'person__name')
@@ -704,14 +734,34 @@ class SplitViewSet(viewsets.ReadOnlyModelViewSet):
             balances.append({
                 'person_id': person.id,
                 'name': person.name,
+                'linked_username': person.linked_user.username if person.linked_user else None,
                 'owed': row['owed'] if row else 0,
                 'unsettled_count': row['items'] if row else 0,
             })
         balances.sort(key=lambda b: (-(b['owed'] or 0), b['name']))
 
+        # Money you owe: splits pointing at you, on expenses somebody else paid.
+        debts = (ExpenseSplit.objects
+                 .filter(person__linked_user=user, is_settled=False)
+                 .exclude(expense__user=user)
+                 .values('expense__user_id', 'expense__user__username')
+                 .annotate(owed=Sum('amount'), items=Count('id')))
+        you_owe = [{
+            'user_id': d['expense__user_id'],
+            'name': d['expense__user__username'],
+            'owed': d['owed'],
+            'unsettled_count': d['items'],
+        } for d in debts]
+        you_owe.sort(key=lambda b: (-(b['owed'] or 0), b['name']))
+
+        total_owed_to_you = sum((b['owed'] or 0) for b in balances)
+        total_you_owe = sum((b['owed'] or 0) for b in you_owe)
         return Response({
-            'total_owed_to_you': sum((b['owed'] or 0) for b in balances),
+            'total_owed_to_you': total_owed_to_you,
+            'total_you_owe': total_you_owe,
+            'net': total_owed_to_you - total_you_owe,
             'balances': balances,
+            'you_owe': you_owe,
         })
 
     @action(detail=False, methods=['post'])
@@ -727,15 +777,23 @@ class SplitViewSet(viewsets.ReadOnlyModelViewSet):
         if error:
             return error
 
-        queryset = ExpenseSplit.objects.filter(expense__user=user, is_settled=False)
+        # Either side can record that the money moved: the payer confirming it
+        # arrived, or the debtor marking that they sent it.
+        queryset = ExpenseSplit.objects.filter(
+            Q(expense__user=user) | Q(person__linked_user=user), is_settled=False)
         split_ids = request.data.get('split_ids')
         person_id = request.data.get('person_id')
+        owed_to_user_id = request.data.get('owed_to_user_id')
         if split_ids:
             queryset = queryset.filter(id__in=split_ids)
         elif person_id:
             queryset = queryset.filter(person_id=person_id)
+        elif owed_to_user_id:
+            # Settling a debt of yours: every split you owe that account.
+            queryset = queryset.filter(person__linked_user=user,
+                                       expense__user_id=owed_to_user_id)
         else:
-            return Response({'error': 'person_id or split_ids is required'},
+            return Response({'error': 'person_id, owed_to_user_id or split_ids is required'},
                             status=status.HTTP_400_BAD_REQUEST)
 
         settled = list(queryset)
