@@ -13,6 +13,7 @@ import json
 import logging
 import re
 from datetime import date, datetime
+from decimal import ROUND_DOWN, Decimal, InvalidOperation
 
 from llm.client import LLMError, LLMNotConfigured, LLMRateLimited, call_json
 
@@ -434,3 +435,185 @@ def parse_search_query(question):
             "{\"filters\": {...}, \"interpretation\": \"...\"}, no prose and no code fences."
         ),
     )
+
+
+# --------------------------------------------------------------------------
+# Splitting a bill
+#
+# "split 1200 dinner with raj and priya" has to yield both an expense and who
+# owes what. The model reads the sentence; the arithmetic is done here, because
+# shares must sum to the total exactly and that is not something to leave to a
+# model that cannot reliably divide 1000 by 3.
+# --------------------------------------------------------------------------
+
+SPLIT_SYSTEM_PROMPT = (
+    "You read a note about a shared expense and report who it was shared with.\n"
+    "\n"
+    "The person writing paid the bill. List the OTHER people it was split with, by "
+    "name, in \"people\". Do not include the writer themselves - no \"me\", \"myself\" or "
+    "their own name. Reuse a spelling from the known people list when it plainly refers "
+    "to the same person, so \"raj\" and \"Raj\" don't become two people.\n"
+    "\n"
+    "Set \"split_with_me\" to true when the writer is one of the people sharing the cost, "
+    "and false only when they clearly just paid on someone else's behalf. Sharing is by "
+    "far the common case: a meal, a cab or a trip described as being \"with\" someone was "
+    "used by the writer too. Read \"for\" plus another person's possession as paying on "
+    "their behalf.\n"
+    "\n"
+    "  \"split 1200 dinner with raj and priya\" -> people [raj, priya], split_with_me true "
+    "(three ways, 400 each)\n"
+    "  \"1000 cab with raj and priya\"         -> people [raj, priya], split_with_me true "
+    "(three ways)\n"
+    "  \"900 lunch with raj\"                  -> people [raj], split_with_me true "
+    "(two ways, 450 each)\n"
+    "  \"paid 500 for raj's ticket\"           -> people [raj], split_with_me false "
+    "(raj owes all 500)\n"
+    "  \"lent priya 300\"                      -> people [priya], split_with_me false\n"
+    "\n"
+    "If the note gives explicit amounts per person, put them in \"shares\" as an object "
+    "mapping name to number. Otherwise omit shares and the cost will be divided equally.\n"
+    "\n"
+    + _CLASSIFICATION_RULES + "\n"
+    "\n"
+    "Respond with ONLY a JSON object - no prose, no code fences - with these keys: "
+    "\"amount\" (the full bill, positive number), \"description\" (short string), "
+    "\"category_name\" (string), \"people\" (array of names), \"split_with_me\" (boolean), "
+    "and optionally \"shares\" (object of name to number)."
+)
+
+
+def _validate_split(parsed):
+    """Check the split object, leaving the arithmetic to the caller."""
+    if not isinstance(parsed, dict):
+        raise LLMError("The model did not return a JSON object.")
+
+    for key in ('amount', 'description', 'category_name'):
+        if key not in parsed:
+            raise LLMError(f"The model's response is missing {key}.")
+
+    amount = parsed['amount']
+    if isinstance(amount, str):
+        try:
+            amount = float(re.sub(r'[^0-9.\-]', '', amount))
+        except ValueError:
+            raise LLMError("The model did not return a valid amount.")
+    if not isinstance(amount, (int, float)) or isinstance(amount, bool) or amount <= 0:
+        raise LLMError("The model did not return a valid positive amount.")
+    parsed['amount'] = amount
+
+    for key in ('description', 'category_name'):
+        if not isinstance(parsed[key], str) or not parsed[key].strip():
+            raise LLMError(f"The model returned an empty {key}.")
+        parsed[key] = parsed[key].strip()
+
+    people, seen = [], set()
+    for name in parsed.get('people') or []:
+        if not isinstance(name, (str, int)):
+            continue
+        name = str(name).strip()[:100]
+        if name and name.lower() not in seen and name.lower() not in {'me', 'myself', 'i'}:
+            seen.add(name.lower())
+            people.append(name)
+    if not people:
+        raise LLMError("The model did not name anyone to split with.")
+    parsed['people'] = people
+
+    parsed['split_with_me'] = bool(parsed.get('split_with_me', True))
+
+    shares = parsed.get('shares')
+    parsed['shares'] = shares if isinstance(shares, dict) else None
+    parsed['transaction_type'] = 'expense'
+    parsed['tags'] = _clean_tags(parsed.get('tags'))
+    return parsed
+
+
+def divide_evenly(total, ways):
+    """Split `total` into `ways` shares of whole paise that add back to `total`.
+
+    Rounding each share independently loses or gains a paisa on totals like
+    1000/3, which then shows up as a balance that never settles. The remainder
+    is handed out one paisa at a time instead.
+    """
+    total = Decimal(str(total)).quantize(Decimal('0.01'))
+    if ways < 1:
+        return []
+    base = (total / ways).quantize(Decimal('0.01'), rounding=ROUND_DOWN)
+    shares = [base] * ways
+    remainder = int(((total - base * ways) * 100).to_integral_value())
+    for i in range(remainder):
+        shares[i] += Decimal('0.01')
+    return shares
+
+
+def compute_shares(amount, people, split_with_me=True, shares=None):
+    """Work out what each named person owes. Returns {name: Decimal}.
+
+    Explicit amounts are honoured as given; anything left over is divided
+    evenly among whoever wasn't named a figure.
+    """
+    amount = Decimal(str(amount)).quantize(Decimal('0.01'))
+    owed = {}
+
+    explicit = {}
+    if shares:
+        lowered = {str(k).strip().lower(): v for k, v in shares.items()}
+        for name in people:
+            value = lowered.get(name.lower())
+            if value is None:
+                continue
+            try:
+                parsed = Decimal(str(value)).quantize(Decimal('0.01'))
+            except (InvalidOperation, ValueError):
+                continue
+            if parsed > 0:
+                explicit[name] = parsed
+
+    if explicit:
+        for name, value in explicit.items():
+            owed[name] = value
+        remaining_people = [p for p in people if p not in explicit]
+        leftover = amount - sum(explicit.values())
+        # Whatever is unaccounted for belongs to the payer unless others are
+        # still unnamed, in which case they share it.
+        if remaining_people and leftover > 0:
+            for name, share in zip(remaining_people, divide_evenly(leftover, len(remaining_people))):
+                owed[name] = share
+        return owed
+
+    ways = len(people) + (1 if split_with_me else 0)
+    portions = divide_evenly(amount, ways)
+    # The payer keeps the first portion when they shared the cost, so any
+    # rounding remainder lands on them rather than on a friend.
+    portions = portions[1:] if split_with_me else portions
+    for name, share in zip(people, portions):
+        owed[name] = share
+    return owed
+
+
+def parse_split_text(text, known_people=(), known_tags=()):
+    """Turn "split 1200 dinner with raj and priya" into an expense plus shares."""
+    text = (text or '').strip()
+    if not text:
+        raise ExpenseParseNotPossible("No text provided.")
+
+    user_content = (
+        f"Existing categories: {json.dumps(_category_context())}\n"
+        f"Known people: {json.dumps(list(known_people))}\n"
+        f"Existing tags: {json.dumps(list(known_tags))}\n\n"
+        f"Note: \"{text}\""
+    )
+    messages = [
+        {"role": "system", "content": SPLIT_SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
+    parsed = _translate_errors(
+        call_json, messages, validate=_validate_split, expect_key='people',
+        retry_instruction=(
+            "That was not usable. Reply with ONLY a JSON object, no prose and no code "
+            "fences, with the keys amount, description, category_name, people, "
+            "split_with_me and optionally shares."
+        ),
+    )
+    parsed['owed'] = compute_shares(
+        parsed['amount'], parsed['people'], parsed['split_with_me'], parsed['shares'])
+    return parsed
