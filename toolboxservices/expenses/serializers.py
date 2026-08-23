@@ -1,6 +1,6 @@
 from rest_framework import serializers
 from django.contrib.auth.models import User
-from .models import Expense, ExpenseCategory, ExpenseTag
+from .models import Expense, ExpenseCategory, ExpenseSplit, ExpenseTag, Person
 
 
 class ExpenseCategorySerializer(serializers.ModelSerializer):
@@ -225,3 +225,26 @@ class ExpenseSummarySerializer(serializers.Serializer):
     net_balance = serializers.DecimalField(max_digits=12, decimal_places=2)
     transaction_count = serializers.IntegerField()
     category_breakdown = serializers.DictField(child=serializers.DecimalField(max_digits=10, decimal_places=2))
+
+class PersonSerializer(serializers.ModelSerializer):
+    """Someone the user splits expenses with."""
+
+    class Meta:
+        model = Person
+        fields = ['id', 'name', 'created_at']
+        read_only_fields = ['id', 'created_at']
+
+
+class ExpenseSplitSerializer(serializers.ModelSerializer):
+    """One person's share of one expense, with enough of the expense to read it."""
+    person_name = serializers.CharField(source='person.name', read_only=True)
+    description = serializers.CharField(source='expense.description', read_only=True)
+    date = serializers.DateField(source='expense.date', read_only=True)
+    expense_total = serializers.DecimalField(
+        source='expense.amount', max_digits=10, decimal_places=2, read_only=True)
+
+    class Meta:
+        model = ExpenseSplit
+        fields = ['id', 'expense', 'expense_total', 'person', 'person_name',
+                  'description', 'date', 'amount', 'is_settled', 'settled_at']
+        read_only_fields = fields

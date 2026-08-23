@@ -135,3 +135,67 @@ class Expense(models.Model):
         elif self.transaction_type == 'repayment':
             return self.amount  # Repayment reduces debt, so positive effect
         return decimal.Decimal('0')
+
+
+class Person(models.Model):
+    """Someone you split expenses with.
+
+    Not a Django user - most people you share a bill with will never log in.
+    The existing Expense.lender_borrower is free text, which cannot support
+    splitting one bill several ways and turns every typo into a new person,
+    so shared spending gets its own record instead.
+    """
+
+    name = models.CharField(max_length=100)
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
+                             related_name='split_people')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['name']
+        verbose_name_plural = 'People'
+        constraints = [
+            # Scoped to the owner, unlike ExpenseTag.name which is globally
+            # unique and so cannot be shared between accounts.
+            models.UniqueConstraint(fields=['user', 'name'], name='unique_person_per_user'),
+        ]
+
+    def __str__(self):
+        return self.name
+
+
+class ExpenseSplit(models.Model):
+    """One person's share of one expense.
+
+    The expense's owner paid the bill; each split is what somebody else owes
+    them for it. Settling marks the split rather than deleting it, so the
+    history of who paid for what survives.
+    """
+
+    expense = models.ForeignKey(Expense, on_delete=models.CASCADE, related_name='splits')
+    person = models.ForeignKey(Person, on_delete=models.CASCADE, related_name='splits')
+    amount = models.DecimalField(
+        max_digits=10, decimal_places=2,
+        validators=[MinValueValidator(decimal.Decimal('0.01'))],
+        help_text="What this person owes the payer for this expense")
+    is_settled = models.BooleanField(default=False)
+    settled_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        constraints = [
+            models.UniqueConstraint(fields=['expense', 'person'], name='unique_split_per_person'),
+        ]
+        indexes = [
+            models.Index(fields=['person', 'is_settled']),
+        ]
+
+    def __str__(self):
+        return f"{self.person.name} owes {self.amount} for {self.expense.description[:30]}"
+
+    def settle(self):
+        from django.utils import timezone as _tz
+        self.is_settled = True
+        self.settled_at = _tz.now()
+        self.save(update_fields=['is_settled', 'settled_at'])

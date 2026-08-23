@@ -1,4 +1,4 @@
-from rest_framework import viewsets, status, filters
+from rest_framework import viewsets, status, filters, serializers
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.response import Response
 from rest_framework.permissions import AllowAny
@@ -10,14 +10,16 @@ from django.core.exceptions import ObjectDoesNotExist
 from datetime import datetime, timedelta
 import django_filters
 
-from .models import Expense, ExpenseCategory, ExpenseTag
+from .models import Expense, ExpenseCategory, ExpenseSplit, ExpenseTag, Person
 from .serializers import (
     ExpenseSerializer, ExpenseCreateSerializer, ExpenseListSerializer,
-    ExpenseCategorySerializer, ExpenseTagSerializer, ExpenseSummarySerializer
+    ExpenseCategorySerializer, ExpenseTagSerializer, ExpenseSummarySerializer,
+    ExpenseSplitSerializer, PersonSerializer
 )
 from .services import (
     ExpenseParseError, ExpenseParseNotPossible, ExpenseParseRateLimited,
-    parse_expense_batch, parse_expense_text, parse_search_query, validate_supplied_items,
+    parse_expense_batch, parse_expense_text, parse_search_query, parse_split_text,
+    validate_supplied_items,
 )
 
 
@@ -457,6 +459,62 @@ class ExpenseViewSet(viewsets.ModelViewSet):
         )
 
     @action(detail=False, methods=['post'])
+    def split_add(self, request):
+        """Log a shared bill: "split 1200 dinner with raj and priya".
+
+        The expense is recorded in full against the payer, and each other
+        person's share is stored as a split they owe. The payer's own share is
+        simply what's left, so their spending total stays truthful without a
+        second record.
+        """
+        user, error = self._resolve_user(request)
+        if error:
+            return error
+
+        text = request.data.get('text', '')
+        if not text or not text.strip():
+            return Response({'error': 'text is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        known_people = list(Person.objects.filter(user=user).values_list('name', flat=True))
+        try:
+            parsed = parse_split_text(text, known_people=known_people,
+                                      known_tags=self._known_tag_names(user))
+        except ExpenseParseNotPossible as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except ExpenseParseRateLimited as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_429_TOO_MANY_REQUESTS)
+        except ExpenseParseError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+
+        expense = Expense.objects.create(
+            user=user,
+            amount=parsed['amount'],
+            transaction_type='expense',
+            category=self._resolve_category(parsed),
+            description=parsed['description'],
+            date=timezone.now().date(),
+        )
+        expense.tags.set(self._resolve_tags(user, parsed.get('tags')))
+
+        splits = []
+        for name, share in parsed['owed'].items():
+            # Match an existing person case-insensitively so "raj" and "Raj"
+            # stay one balance rather than two.
+            person = Person.objects.filter(user=user, name__iexact=name).first()
+            if not person:
+                person = Person.objects.create(user=user, name=name)
+            splits.append(ExpenseSplit.objects.create(
+                expense=expense, person=person, amount=share))
+
+        owed_total = sum(s.amount for s in splits)
+        return Response({
+            'expense': ExpenseSerializer(expense).data,
+            'splits': ExpenseSplitSerializer(splits, many=True).data,
+            'your_share': expense.amount - owed_total,
+            'owed_to_you': owed_total,
+        }, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=['post'])
     def ask(self, request):
         """Answer a question about spending by filtering, not by generating prose.
 
@@ -563,3 +621,132 @@ class ExpenseViewSet(viewsets.ModelViewSet):
 
         serializer = self.get_serializer(expense)
         return Response(serializer.data)
+
+
+def _resolve_split_user(request):
+    """The ?userid= contract, shared by the split viewsets."""
+    userid = request.GET.get('userid')
+    if not userid:
+        return None, Response({'error': 'userid parameter is required'},
+                              status=status.HTTP_400_BAD_REQUEST)
+    try:
+        from django.contrib.auth.models import User
+        return User.objects.get(id=int(userid), is_active=True), None
+    except (ValueError, ObjectDoesNotExist):
+        return None, Response({'error': 'Invalid userid parameter'},
+                              status=status.HTTP_400_BAD_REQUEST)
+
+
+class PersonViewSet(viewsets.ModelViewSet):
+    """People the user splits expenses with."""
+    serializer_class = PersonSerializer
+    permission_classes = [AllowAny]
+    pagination_class = None
+
+    def get_queryset(self):
+        userid = self.request.GET.get('userid')
+        if not userid:
+            return Person.objects.none()
+        try:
+            return Person.objects.filter(user_id=int(userid))
+        except ValueError:
+            return Person.objects.none()
+
+    def perform_create(self, serializer):
+        user, error = _resolve_split_user(self.request)
+        if error:
+            raise serializers.ValidationError({'userid': 'A valid userid is required.'})
+        serializer.save(user=user)
+
+
+class SplitViewSet(viewsets.ReadOnlyModelViewSet):
+    """Shared expenses: what each person owes, and settling up."""
+    serializer_class = ExpenseSplitSerializer
+    permission_classes = [AllowAny]
+    pagination_class = StandardResultsSetPagination
+
+    def get_queryset(self):
+        userid = self.request.GET.get('userid')
+        if not userid:
+            return ExpenseSplit.objects.none()
+        try:
+            queryset = ExpenseSplit.objects.filter(
+                expense__user_id=int(userid)).select_related('person', 'expense')
+        except ValueError:
+            return ExpenseSplit.objects.none()
+        if self.request.GET.get('settled') == 'false':
+            queryset = queryset.filter(is_settled=False)
+        person = self.request.GET.get('person')
+        if person:
+            queryset = queryset.filter(person_id=person)
+        return queryset
+
+    @action(detail=False, methods=['get'])
+    def balances(self, request):
+        """What each person currently owes, largest first.
+
+        Only unsettled splits count. People who owe nothing are still listed so
+        the UI can show them without a second call.
+        """
+        user, error = _resolve_split_user(request)
+        if error:
+            return error
+
+        rows = (ExpenseSplit.objects
+                .filter(expense__user=user, is_settled=False)
+                .values('person_id', 'person__name')
+                .annotate(owed=Sum('amount'), items=Count('id')))
+        owed_by_person = {r['person_id']: r for r in rows}
+
+        balances = []
+        for person in Person.objects.filter(user=user):
+            row = owed_by_person.get(person.id)
+            balances.append({
+                'person_id': person.id,
+                'name': person.name,
+                'owed': row['owed'] if row else 0,
+                'unsettled_count': row['items'] if row else 0,
+            })
+        balances.sort(key=lambda b: (-(b['owed'] or 0), b['name']))
+
+        return Response({
+            'total_owed_to_you': sum((b['owed'] or 0) for b in balances),
+            'balances': balances,
+        })
+
+    @action(detail=False, methods=['post'])
+    def settle(self, request):
+        """Mark someone's outstanding shares as paid.
+
+        Body: {"person_id": 3}  (optionally {"split_ids": [1, 2]} for specific ones)
+
+        Splits are marked rather than deleted, so who paid for what stays on
+        record after the money changes hands.
+        """
+        user, error = _resolve_split_user(request)
+        if error:
+            return error
+
+        queryset = ExpenseSplit.objects.filter(expense__user=user, is_settled=False)
+        split_ids = request.data.get('split_ids')
+        person_id = request.data.get('person_id')
+        if split_ids:
+            queryset = queryset.filter(id__in=split_ids)
+        elif person_id:
+            queryset = queryset.filter(person_id=person_id)
+        else:
+            return Response({'error': 'person_id or split_ids is required'},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        settled = list(queryset)
+        if not settled:
+            return Response({'error': 'Nothing outstanding to settle.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        total = sum(s.amount for s in settled)
+        queryset.update(is_settled=True, settled_at=timezone.now())
+        return Response({
+            'settled_count': len(settled),
+            'settled_total': total,
+            'splits': ExpenseSplitSerializer(settled, many=True).data,
+        })
