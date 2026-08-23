@@ -226,18 +226,26 @@ class ExpenseSummarySerializer(serializers.Serializer):
     transaction_count = serializers.IntegerField()
     category_breakdown = serializers.DictField(child=serializers.DecimalField(max_digits=10, decimal_places=2))
 
+
 class PersonSerializer(serializers.ModelSerializer):
-    """Someone the user splits expenses with."""
+    """Someone the user splits expenses with.
+
+    linked_user is writable so a person added before they had an account can be
+    attached to one later, which makes their side of existing splits appear in
+    their own panel.
+    """
+    linked_username = serializers.CharField(source='linked_user.username', read_only=True)
 
     class Meta:
         model = Person
-        fields = ['id', 'name', 'created_at']
-        read_only_fields = ['id', 'created_at']
+        fields = ['id', 'name', 'linked_user', 'linked_username', 'created_at']
+        read_only_fields = ['id', 'linked_username', 'created_at']
 
 
 class ExpenseSplitSerializer(serializers.ModelSerializer):
     """One person's share of one expense, with enough of the expense to read it."""
     person_name = serializers.CharField(source='person.name', read_only=True)
+    paid_by = serializers.CharField(source='expense.user.username', read_only=True)
     description = serializers.CharField(source='expense.description', read_only=True)
     date = serializers.DateField(source='expense.date', read_only=True)
     expense_total = serializers.DecimalField(
@@ -245,6 +253,6 @@ class ExpenseSplitSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = ExpenseSplit
-        fields = ['id', 'expense', 'expense_total', 'person', 'person_name',
+        fields = ['id', 'expense', 'expense_total', 'person', 'person_name', 'paid_by',
                   'description', 'date', 'amount', 'is_settled', 'settled_at']
         read_only_fields = fields
