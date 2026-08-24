@@ -81,6 +81,11 @@ class Expense(models.Model):
     location = models.CharField(max_length=255, blank=True, null=True)
     payment_method = models.CharField(max_length=50, blank=True, null=True)
 
+    # Shared spending: set when the expense was split within a group, so the
+    # group can be totalled without duplicating any of the split rows.
+    group = models.ForeignKey('SplitGroup', on_delete=models.SET_NULL, null=True, blank=True,
+                              related_name='expenses')
+
     # Recurring transactions
     is_recurring = models.BooleanField(default=False)
     recurring_interval = models.CharField(max_length=20, blank=True, null=True)  # daily, weekly, monthly, yearly
@@ -208,3 +213,31 @@ class ExpenseSplit(models.Model):
         self.is_settled = True
         self.settled_at = _tz.now()
         self.save(update_fields=['is_settled', 'settled_at'])
+
+
+class SplitGroup(models.Model):
+    """A set of people you split with repeatedly - a flat, a trip, a regular table.
+
+    The group is a lens over existing splits, not a second ledger. An expense
+    points at a group and its ExpenseSplit rows stay exactly as they are, so a
+    group balance and a person balance can never disagree - they are the same
+    rows counted with a different filter.
+    """
+
+    name = models.CharField(max_length=100)
+    owner = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
+                              related_name='split_groups')
+    members = models.ManyToManyField(Person, related_name='groups', blank=True)
+    emoji = models.CharField(max_length=8, blank=True, default='',
+                             help_text='Optional icon shown in the group list')
+    is_archived = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        constraints = [
+            models.UniqueConstraint(fields=['owner', 'name'], name='unique_group_per_owner'),
+        ]
+
+    def __str__(self):
+        return self.name
