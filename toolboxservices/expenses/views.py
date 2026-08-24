@@ -11,11 +11,11 @@ from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 import django_filters
 
-from .models import Expense, ExpenseCategory, ExpenseSplit, ExpenseTag, Person, SplitGroup
+from .models import Expense, ExpenseCategory, ExpenseSplit, ExpenseTag, Person, SplitGroup, RecurringRule
 from .serializers import (
     ExpenseSerializer, ExpenseCreateSerializer, ExpenseListSerializer,
     ExpenseCategorySerializer, ExpenseTagSerializer, ExpenseSummarySerializer,
-    ExpenseSplitSerializer, PersonSerializer, SplitGroupSerializer
+    ExpenseSplitSerializer, PersonSerializer, SplitGroupSerializer, RecurringRuleSerializer
 )
 from .services import (
     compute_shares,
@@ -1138,3 +1138,55 @@ class SplitGroupViewSet(viewsets.ModelViewSet):
         group = self.get_object()
         queryset = group.expenses.select_related('category').order_by('-date', '-created_at')[:50]
         return Response(ExpenseListSerializer(queryset, many=True).data)
+
+
+class RecurringRuleViewSet(viewsets.ModelViewSet):
+    """Recurring income and bills - the rules the projection layer runs on."""
+    serializer_class = RecurringRuleSerializer
+    permission_classes = [AllowAny]
+    pagination_class = None
+
+    def get_queryset(self):
+        userid = self.request.GET.get('userid')
+        if not userid:
+            return RecurringRule.objects.none()
+        try:
+            return RecurringRule.objects.filter(user_id=int(userid)).select_related('category')
+        except ValueError:
+            return RecurringRule.objects.none()
+
+    def perform_create(self, serializer):
+        user, error = _resolve_split_user(self.request)
+        if error:
+            raise serializers.ValidationError({'userid': 'A valid userid is required.'})
+        serializer.save(user=user)
+
+
+class MoneyViewSet(viewsets.ViewSet):
+    """Read-only money intelligence: the forward projection and the pulse.
+
+    Separate from expenses CRUD because it computes rather than stores - the
+    seam the Cash Flow River and Money Pulse render, and where budgets/goals
+    will hang later.
+    """
+    permission_classes = [AllowAny]
+
+    @action(detail=False, methods=['get'])
+    def projection(self, request):
+        user, error = _resolve_split_user(request)
+        if error:
+            return error
+        try:
+            days = max(7, min(int(request.GET.get('days', 30)), 120))
+        except (TypeError, ValueError):
+            days = 30
+        from .projections import build_projection
+        return Response(build_projection(user, days=days))
+
+    @action(detail=False, methods=['get'])
+    def pulse(self, request):
+        user, error = _resolve_split_user(request)
+        if error:
+            return error
+        from .projections import money_pulse
+        return Response(money_pulse(user))
