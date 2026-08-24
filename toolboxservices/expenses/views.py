@@ -11,11 +11,11 @@ from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 import django_filters
 
-from .models import Expense, ExpenseCategory, ExpenseSplit, ExpenseTag, Person
+from .models import Expense, ExpenseCategory, ExpenseSplit, ExpenseTag, Person, SplitGroup
 from .serializers import (
     ExpenseSerializer, ExpenseCreateSerializer, ExpenseListSerializer,
     ExpenseCategorySerializer, ExpenseTagSerializer, ExpenseSummarySerializer,
-    ExpenseSplitSerializer, PersonSerializer
+    ExpenseSplitSerializer, PersonSerializer, SplitGroupSerializer
 )
 from .services import (
     compute_shares,
@@ -493,7 +493,17 @@ class ExpenseViewSet(viewsets.ModelViewSet):
             return Response({'error': 'A description is required'},
                             status=status.HTTP_400_BAD_REQUEST)
 
+        group = None
+        if data.get('group_id'):
+            group = SplitGroup.objects.filter(id=data['group_id'], owner=user).first()
+            if not group:
+                return Response({'error': 'Unknown group'}, status=status.HTTP_400_BAD_REQUEST)
+
         participants = data.get('participants') or []
+        # Splitting within a group usually means splitting with everyone in it,
+        # so the members stand in when no participants are named.
+        if group and not participants:
+            participants = [{'person_id': p.id} for p in group.members.all()]
         if not isinstance(participants, list) or not participants:
             return Response({'error': 'At least one person to split with is required'},
                             status=status.HTTP_400_BAD_REQUEST)
@@ -579,7 +589,12 @@ class ExpenseViewSet(viewsets.ModelViewSet):
         expense = Expense.objects.create(
             user=user, amount=amount, transaction_type='expense',
             category=category, description=description, date=expense_date,
+            group=group,
         )
+        # Anyone split with inside a group belongs to it from then on, so the
+        # membership list can't drift from who actually shares the bills.
+        if group:
+            group.members.add(*resolved)
 
         splits = []
         by_name = {p.name: p for p in resolved}
@@ -614,7 +629,17 @@ class ExpenseViewSet(viewsets.ModelViewSet):
         if not text or not text.strip():
             return Response({'error': 'text is required'}, status=status.HTTP_400_BAD_REQUEST)
 
-        known_people = list(Person.objects.filter(user=user).values_list('name', flat=True))
+        group = None
+        if request.data.get('group_id'):
+            group = SplitGroup.objects.filter(id=request.data['group_id'], owner=user).first()
+            if not group:
+                return Response({'error': 'Unknown group'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Inside a group, the members are the likely names - handing them to the
+        # model keeps "split 900 with the flat" resolving to the right people.
+        known_people = list(
+            (group.members if group else Person.objects.filter(user=user))
+            .values_list('name', flat=True))
         try:
             parsed = parse_split_text(text, known_people=known_people,
                                       known_tags=self._known_tag_names(user))
@@ -632,6 +657,7 @@ class ExpenseViewSet(viewsets.ModelViewSet):
             category=self._resolve_category(parsed),
             description=parsed['description'],
             date=timezone.now().date(),
+            group=group,
         )
         expense.tags.set(self._resolve_tags(user, parsed.get('tags')))
 
@@ -653,6 +679,9 @@ class ExpenseViewSet(viewsets.ModelViewSet):
                     person.save(update_fields=['linked_user'])
             splits.append(ExpenseSplit.objects.create(
                 expense=expense, person=person, amount=share))
+
+        if group:
+            group.members.add(*[s.person for s in splits])
 
         owed_total = sum(s.amount for s in splits)
         return Response({
@@ -988,3 +1017,124 @@ def _coerce_date_value(value):
         return datetime.strptime(value.strip()[:10], '%Y-%m-%d').date()
     except ValueError:
         return None
+
+
+class SplitGroupViewSet(viewsets.ModelViewSet):
+    """Groups you split within - a flat, a trip, a regular table.
+
+    A group is a filter over existing splits rather than a second ledger, so
+    its balances are the same ExpenseSplit rows the person view uses, counted
+    with the group applied. The two can't disagree.
+    """
+    serializer_class = SplitGroupSerializer
+    permission_classes = [AllowAny]
+    pagination_class = None
+
+    def get_queryset(self):
+        userid = self.request.GET.get('userid')
+        if not userid:
+            return SplitGroup.objects.none()
+        try:
+            queryset = SplitGroup.objects.filter(owner_id=int(userid))
+        except ValueError:
+            return SplitGroup.objects.none()
+        if self.request.GET.get('archived') != 'true':
+            queryset = queryset.filter(is_archived=False)
+        return queryset.prefetch_related('members')
+
+    def perform_create(self, serializer):
+        user, error = _resolve_split_user(self.request)
+        if error:
+            raise serializers.ValidationError({'userid': 'A valid userid is required.'})
+        serializer.save(owner=user)
+
+    @action(detail=True, methods=['post'])
+    def add_members(self, request, pk=None):
+        """Add people to a group, by person_id, user_id or plain name.
+
+        Accepting a name means a group can be built before everyone involved
+        has an account; accepting user_id links them properly when they do.
+        """
+        group = self.get_object()
+        user = group.owner
+        added = []
+        for entry in request.data.get('members') or []:
+            person = None
+            if isinstance(entry, dict) and entry.get('person_id'):
+                person = Person.objects.filter(user=user, id=entry['person_id']).first()
+            elif isinstance(entry, dict) and entry.get('user_id'):
+                from django.contrib.auth.models import User as AuthUser
+                account = AuthUser.objects.filter(id=entry['user_id'], is_active=True).first()
+                if account and account != user:
+                    person = (Person.objects.filter(user=user, linked_user=account).first()
+                              or Person.objects.create(user=user, name=account.username,
+                                                       linked_user=account))
+            else:
+                name = str(entry.get('name') if isinstance(entry, dict) else entry).strip()[:100]
+                if name:
+                    person = (Person.objects.filter(user=user, name__iexact=name).first()
+                              or Person.objects.create(user=user, name=name,
+                                                       linked_user=match_account(name)))
+            if person:
+                group.members.add(person)
+                added.append(person)
+
+        if not added:
+            return Response({'error': 'No valid members to add'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        return Response(self.get_serializer(group).data)
+
+    @action(detail=True, methods=['post'])
+    def remove_member(self, request, pk=None):
+        """Take somebody out of the group.
+
+        Their past splits stay: they really did owe that money, and deleting
+        the history to tidy a membership list would quietly change balances.
+        """
+        group = self.get_object()
+        person_id = request.data.get('person_id')
+        person = group.members.filter(id=person_id).first()
+        if not person:
+            return Response({'error': 'That person is not in this group'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        group.members.remove(person)
+        return Response(self.get_serializer(group).data)
+
+    @action(detail=True, methods=['get'])
+    def balances(self, request, pk=None):
+        """What each member owes for this group's expenses only."""
+        group = self.get_object()
+
+        rows = (ExpenseSplit.objects
+                .filter(expense__group=group, is_settled=False)
+                .values('person_id', 'person__name')
+                .annotate(owed=Sum('amount'), items=Count('id')))
+        owed = {r['person_id']: r for r in rows}
+
+        members = []
+        for person in group.members.all():
+            row = owed.get(person.id)
+            members.append({
+                'person_id': person.id,
+                'name': person.name,
+                'linked_username': person.linked_user.username if person.linked_user else None,
+                'owed': row['owed'] if row else 0,
+                'unsettled_count': row['items'] if row else 0,
+            })
+        members.sort(key=lambda m: (-(m['owed'] or 0), m['name']))
+
+        spend = group.expenses.aggregate(total=Sum('amount'), count=Count('id'))
+        return Response({
+            'group': self.get_serializer(group).data,
+            'total_spent': spend['total'] or 0,
+            'expense_count': spend['count'] or 0,
+            'total_outstanding': sum((m['owed'] or 0) for m in members),
+            'members': members,
+        })
+
+    @action(detail=True, methods=['get'])
+    def expenses(self, request, pk=None):
+        """This group's expenses, most recent first."""
+        group = self.get_object()
+        queryset = group.expenses.select_related('category').order_by('-date', '-created_at')[:50]
+        return Response(ExpenseListSerializer(queryset, many=True).data)

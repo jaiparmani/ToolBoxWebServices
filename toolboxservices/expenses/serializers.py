@@ -1,6 +1,6 @@
 from rest_framework import serializers
 from django.contrib.auth.models import User
-from .models import Expense, ExpenseCategory, ExpenseSplit, ExpenseTag, Person
+from .models import Expense, ExpenseCategory, ExpenseSplit, ExpenseTag, Person, SplitGroup
 
 
 class ExpenseCategorySerializer(serializers.ModelSerializer):
@@ -234,7 +234,11 @@ class PersonSerializer(serializers.ModelSerializer):
     attached to one later, which makes their side of existing splits appear in
     their own panel.
     """
-    linked_username = serializers.CharField(source='linked_user.username', read_only=True)
+    # default=None matters: without it, a person with no account hits a None
+    # partway along 'linked_user.username', DRF raises SkipField, and the key
+    # vanishes from that row - so the payload shape differed per person.
+    linked_username = serializers.CharField(
+        source='linked_user.username', read_only=True, default=None)
 
     class Meta:
         model = Person
@@ -256,3 +260,33 @@ class ExpenseSplitSerializer(serializers.ModelSerializer):
         fields = ['id', 'expense', 'expense_total', 'person', 'person_name', 'paid_by',
                   'description', 'date', 'amount', 'is_settled', 'settled_at']
         read_only_fields = fields
+
+
+class SplitGroupSerializer(serializers.ModelSerializer):
+    """A group, with enough about its members to render a list without a second call."""
+    members = PersonSerializer(many=True, read_only=True)
+    member_ids = serializers.PrimaryKeyRelatedField(
+        many=True, write_only=True, required=False,
+        queryset=Person.objects.all(), source='members')
+    member_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SplitGroup
+        fields = ['id', 'name', 'emoji', 'members', 'member_ids', 'member_count',
+                  'is_archived', 'created_at']
+        read_only_fields = ['id', 'members', 'member_count', 'created_at']
+
+    def get_member_count(self, obj):
+        return obj.members.count()
+
+    def validate_member_ids(self, value):
+        """Members have to be people the caller owns, or a group could be built
+        out of somebody else's contacts."""
+        request = self.context.get('request')
+        owner_id = request.GET.get('userid') if request else None
+        if owner_id:
+            foreign = [p.name for p in value if str(p.user_id) != str(owner_id)]
+            if foreign:
+                raise serializers.ValidationError(
+                    f"Not your contacts: {', '.join(foreign)}")
+        return value
