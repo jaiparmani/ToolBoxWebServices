@@ -279,6 +279,22 @@ class SplitGroupSerializer(serializers.ModelSerializer):
     def get_member_count(self, obj):
         return obj.members.count()
 
+    def validate_name(self, value):
+        """Names are unique per owner. Without this the DB constraint fires as
+        an uncaught IntegrityError - a 500 - the moment you reuse a name."""
+        value = (value or '').strip()
+        if not value:
+            raise serializers.ValidationError('A name is required.')
+        request = self.context.get('request')
+        owner_id = request.GET.get('userid') if request else None
+        if owner_id:
+            clash = SplitGroup.objects.filter(owner_id=owner_id, name__iexact=value)
+            if self.instance:
+                clash = clash.exclude(pk=self.instance.pk)
+            if clash.exists():
+                raise serializers.ValidationError('You already have a group with that name.')
+        return value
+
     def validate_member_ids(self, value):
         """Members have to be people the caller owns, or a group could be built
         out of somebody else's contacts."""
