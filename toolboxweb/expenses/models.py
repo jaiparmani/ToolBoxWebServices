@@ -241,3 +241,103 @@ class SplitGroup(models.Model):
 
     def __str__(self):
         return self.name
+
+
+class RecurringRule(models.Model):
+    """A transaction that repeats - salary, rent, a subscription.
+
+    The seam for the whole projection layer: instead of guessing which past
+    expenses were recurring, the user (or, later, a detector) records the rule
+    once and the app can place every future occurrence on a calendar. That's
+    what makes "predicted bills", "before payday" and runway possible without
+    real bank data - and the same shape extends to budgets and goals later.
+
+    A rule stores one known occurrence (anchor_date) and a cadence; every other
+    date is computed from it, so there are no rows to keep in sync.
+    """
+
+    CADENCE_CHOICES = [
+        ('daily', 'Daily'),
+        ('weekly', 'Weekly'),
+        ('monthly', 'Monthly'),
+        ('yearly', 'Yearly'),
+    ]
+
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
+                             related_name='recurring_rules')
+    description = models.CharField(max_length=200)
+    amount = models.DecimalField(
+        max_digits=10, decimal_places=2,
+        validators=[MinValueValidator(decimal.Decimal('0.01'))])
+    transaction_type = models.CharField(max_length=20, default='expense',
+                                        help_text="'expense' (money out) or 'income' (money in)")
+    category = models.ForeignKey(ExpenseCategory, on_delete=models.SET_NULL, null=True, blank=True,
+                                 related_name='recurring_rules')
+
+    cadence = models.CharField(max_length=10, choices=CADENCE_CHOICES, default='monthly')
+    interval = models.PositiveIntegerField(default=1, help_text='Every N cadence units (e.g. 2 = fortnightly)')
+    anchor_date = models.DateField(help_text='One date the rule occurs on; the rest are derived from it')
+    end_date = models.DateField(null=True, blank=True, help_text='Optional last occurrence')
+
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [models.Index(fields=['user', 'is_active'])]
+
+    def __str__(self):
+        return f"{self.description} ({self.amount} {self.cadence})"
+
+    @property
+    def signed_amount(self):
+        """Positive for income, negative for money leaving."""
+        return self.amount if self.transaction_type == 'income' else -self.amount
+
+    def _step(self, date, n=1):
+        """Advance a date by n cadence*interval steps."""
+        from datetime import timedelta
+        step = self.interval * n
+        if self.cadence == 'daily':
+            return date + timedelta(days=step)
+        if self.cadence == 'weekly':
+            return date + timedelta(weeks=step)
+        if self.cadence == 'yearly':
+            try:
+                return date.replace(year=date.year + step)
+            except ValueError:  # Feb 29
+                return date.replace(year=date.year + step, day=28)
+        # monthly
+        month_index = date.month - 1 + step
+        year = date.year + month_index // 12
+        month = month_index % 12 + 1
+        # clamp the day to the month's length (31st -> 30th/28th)
+        import calendar
+        day = min(date.day, calendar.monthrange(year, month)[1])
+        return date.replace(year=year, month=month, day=day)
+
+    def occurrences(self, start, end):
+        """Every occurrence date in [start, end], inclusive. Cheap and bounded."""
+        if not self.is_active:
+            return []
+        # Walk from the anchor toward the window rather than from year zero.
+        current = self.anchor_date
+        if current > end:
+            # step backward to the last occurrence on/before end
+            # (rare; anchor set in the future) - just walk forward capped
+            pass
+        # fast-forward close to `start`
+        guard = 0
+        while current < start and guard < 5000:
+            current = self._step(current, 1)
+            guard += 1
+        dates = []
+        while current <= end and guard < 5000:
+            if self.end_date and current > self.end_date:
+                break
+            if current >= start:
+                dates.append(current)
+            current = self._step(current, 1)
+            guard += 1
+        return dates

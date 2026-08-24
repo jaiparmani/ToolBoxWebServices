@@ -2,7 +2,7 @@ from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 from .views import (
     ExpenseViewSet, ExpenseCategoryViewSet, ExpenseTagViewSet,
-    PersonViewSet, SplitViewSet, SplitGroupViewSet,
+    PersonViewSet, SplitViewSet, SplitGroupViewSet, RecurringRuleViewSet, MoneyViewSet,
 )
 
 # Create a router for API endpoints
@@ -15,6 +15,8 @@ router.register(r'expenses', ExpenseViewSet, basename='expense')
 router.register(r'people', PersonViewSet, basename='person')
 router.register(r'splits', SplitViewSet, basename='split')
 router.register(r'groups', SplitGroupViewSet, basename='split-group')
+router.register(r'recurring', RecurringRuleViewSet, basename='recurring')
+router.register(r'money', MoneyViewSet, basename='money')
 
 # URL patterns
 urlpatterns = [

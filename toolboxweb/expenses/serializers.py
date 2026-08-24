@@ -1,6 +1,6 @@
 from rest_framework import serializers
 from django.contrib.auth.models import User
-from .models import Expense, ExpenseCategory, ExpenseSplit, ExpenseTag, Person, SplitGroup
+from .models import Expense, ExpenseCategory, ExpenseSplit, ExpenseTag, Person, SplitGroup, RecurringRule
 
 
 class ExpenseCategorySerializer(serializers.ModelSerializer):
@@ -305,4 +305,29 @@ class SplitGroupSerializer(serializers.ModelSerializer):
             if foreign:
                 raise serializers.ValidationError(
                     f"Not your contacts: {', '.join(foreign)}")
+        return value
+
+
+class RecurringRuleSerializer(serializers.ModelSerializer):
+    """A recurring income or bill."""
+    category_name = serializers.CharField(source='category.name', read_only=True, default=None)
+    next_date = serializers.SerializerMethodField()
+
+    class Meta:
+        model = RecurringRule
+        fields = ['id', 'description', 'amount', 'transaction_type', 'category', 'category_name',
+                  'cadence', 'interval', 'anchor_date', 'end_date', 'is_active',
+                  'next_date', 'created_at']
+        read_only_fields = ['id', 'category_name', 'next_date', 'created_at']
+
+    def get_next_date(self, obj):
+        from django.utils import timezone
+        from datetime import timedelta
+        today = timezone.now().date()
+        upcoming = obj.occurrences(today, today + timedelta(days=400))
+        return upcoming[0].isoformat() if upcoming else None
+
+    def validate_transaction_type(self, value):
+        if value not in ('expense', 'income'):
+            raise serializers.ValidationError("Recurring rules are 'expense' or 'income' only.")
         return value
