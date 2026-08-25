@@ -35,7 +35,7 @@ class ExpenseTagSerializer(serializers.ModelSerializer):
         """Create tag with proper user assignment"""
         request = self.context.get('request')
         if request:
-            user = getattr(request, 'validated_user', request.user)
+            user = request.user
             if not user or user.is_anonymous:
                 raise serializers.ValidationError("User authentication required.")
             validated_data['user'] = user
@@ -50,7 +50,7 @@ class ExpenseTagSerializer(serializers.ModelSerializer):
         """Ensure tag name is unique for the user"""
         request = self.context.get('request')
         if request:
-            user = request.validated_user or request.user
+            user = request.user
             if not user or user.is_anonymous:
                 raise serializers.ValidationError("User authentication required.")
         else:
@@ -286,7 +286,7 @@ class SplitGroupSerializer(serializers.ModelSerializer):
         if not value:
             raise serializers.ValidationError('A name is required.')
         request = self.context.get('request')
-        owner_id = request.GET.get('userid') if request else None
+        owner_id = request.user.id if request and request.user.is_authenticated else None
         if owner_id:
             clash = SplitGroup.objects.filter(owner_id=owner_id, name__iexact=value)
             if self.instance:
@@ -299,7 +299,7 @@ class SplitGroupSerializer(serializers.ModelSerializer):
         """Members have to be people the caller owns, or a group could be built
         out of somebody else's contacts."""
         request = self.context.get('request')
-        owner_id = request.GET.get('userid') if request else None
+        owner_id = request.user.id if request and request.user.is_authenticated else None
         if owner_id:
             foreign = [p.name for p in value if str(p.user_id) != str(owner_id)]
             if foreign:

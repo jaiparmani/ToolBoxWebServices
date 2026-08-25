@@ -27,40 +27,24 @@ class StandardResultsSetPagination(PageNumberPagination):
 
 
 def _resolve_user(request):
-    """Same ?userid= contract the rest of the API uses."""
-    userid = request.GET.get('userid')
-    if not userid:
-        return None, Response({'error': 'userid parameter is required'},
-                              status=status.HTTP_400_BAD_REQUEST)
-    try:
-        return User.objects.get(id=int(userid), is_active=True), None
-    except (ValueError, ObjectDoesNotExist):
-        return None, Response({'error': 'Invalid userid parameter'},
-                              status=status.HTTP_400_BAD_REQUEST)
+    """The authenticated user. Kept as (user, error) so callers are unchanged."""
+    return request.user, None
 
 
 class BaseInsightViewSet(viewsets.ReadOnlyModelViewSet):
     """Past insights for one scope, plus the endpoint that creates a new one.
 
     Subclasses set `scope` and `generator`; everything else - caching, failure
-    recording, the ?userid= contract - is identical across scopes.
+    recording - is identical across scopes. The user comes from the auth token.
     """
     serializer_class = InsightSerializer
-    permission_classes = [AllowAny]
     pagination_class = StandardResultsSetPagination
 
     scope = None
     generator = None
 
     def get_queryset(self):
-        userid = self.request.GET.get('userid')
-        if not userid:
-            return Insight.objects.none()
-        try:
-            user_id = int(userid)
-        except ValueError:
-            return Insight.objects.none()
-        return Insight.objects.filter(user_id=user_id, user__is_active=True, scope=self.scope)
+        return Insight.objects.filter(user=self.request.user, scope=self.scope)
 
     @action(detail=False, methods=['get'])
     def latest(self, request):
