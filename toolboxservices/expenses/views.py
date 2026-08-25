@@ -65,7 +65,6 @@ class ExpenseCategoryViewSet(viewsets.ModelViewSet):
     """ViewSet for ExpenseCategory CRUD operations"""
     queryset = ExpenseCategory.objects.filter(is_active=True)
     serializer_class = ExpenseCategorySerializer
-    permission_classes = [AllowAny]
     pagination_class = StandardResultsSetPagination
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
     ordering_fields = ['name', 'transaction_type', 'created_at']
@@ -87,42 +86,21 @@ class ExpenseCategoryViewSet(viewsets.ModelViewSet):
 class ExpenseTagViewSet(viewsets.ModelViewSet):
     """ViewSet for ExpenseTag CRUD operations"""
     serializer_class = ExpenseTagSerializer
-    permission_classes = [AllowAny]
     pagination_class = StandardResultsSetPagination
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
     ordering_fields = ['name', 'created_at']
     ordering = ['name']
 
     def get_queryset(self):
-        """Only return tags for the specified user"""
-        userid = self.request.GET.get('userid')
-        if not userid:
-            return ExpenseTag.objects.none()
-
-        try:
-            user_id = int(userid)
-            return ExpenseTag.objects.filter(user_id=user_id, user__is_active=True)
-        except ValueError:
-            return ExpenseTag.objects.none()
+        """Only the authenticated user's tags."""
+        return ExpenseTag.objects.filter(user=self.request.user)
 
     def perform_create(self, serializer):
-        """Associate tag with specified user"""
-        userid = self.request.GET.get('userid')
-        if not userid:
-            raise PermissionDenied("userid parameter is required.")
-
-        try:
-            user_id = int(userid)
-            from django.contrib.auth.models import User
-            user = User.objects.get(id=user_id, is_active=True)
-            serializer.save(user=user)
-        except (ValueError, ObjectDoesNotExist):
-            raise PermissionDenied("Invalid userid parameter.")
+        serializer.save(user=self.request.user)
 
 
 class ExpenseViewSet(viewsets.ModelViewSet):
     """ViewSet for Expense CRUD operations with filtering and pagination"""
-    permission_classes = [AllowAny]
     pagination_class = StandardResultsSetPagination
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter, filters.SearchFilter]
     filterset_class = ExpenseFilter
@@ -131,16 +109,8 @@ class ExpenseViewSet(viewsets.ModelViewSet):
     search_fields = ['description', 'location', 'payment_method']
 
     def get_queryset(self):
-        """Only return expenses for the specified user"""
-        userid = self.request.GET.get('userid')
-        if not userid:
-            return Expense.objects.none()
-
-        try:
-            user_id = int(userid)
-            return Expense.objects.filter(user_id=user_id, user__is_active=True)
-        except ValueError:
-            return Expense.objects.none()
+        """Only the authenticated user's expenses."""
+        return Expense.objects.filter(user=self.request.user)
 
     def get_serializer_class(self):
         """Return appropriate serializer based on action"""
@@ -152,33 +122,11 @@ class ExpenseViewSet(viewsets.ModelViewSet):
             return ExpenseSerializer
 
     def perform_create(self, serializer):
-        """Associate expense with specified user"""
-        userid = self.request.GET.get('userid')
-        if not userid:
-            raise PermissionDenied("userid parameter is required.")
-
-        try:
-            user_id = int(userid)
-            from django.contrib.auth.models import User
-            user = User.objects.get(id=user_id, is_active=True)
-            serializer.save(user=user)
-        except (ValueError, ObjectDoesNotExist):
-            raise PermissionDenied("Invalid userid parameter.")
+        serializer.save(user=self.request.user)
 
     @action(detail=False, methods=['get'])
     def summary(self, request):
-        """Get expense summary statistics"""
-        userid = request.GET.get('userid')
-        if not userid:
-            return Response({'error': 'userid parameter is required'}, status=status.HTTP_400_BAD_REQUEST)
-
-        try:
-            user_id = int(userid)
-            from django.contrib.auth.models import User
-            user = User.objects.get(id=user_id, is_active=True)
-        except (ValueError, ObjectDoesNotExist):
-            return Response({'error': 'Invalid userid parameter'}, status=status.HTTP_400_BAD_REQUEST)
-
+        """Get expense summary statistics for the authenticated user."""
         queryset = self.get_queryset()
 
         # Date range filter
@@ -238,17 +186,8 @@ class ExpenseViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'])
     def monthly_report(self, request):
-        """Get monthly expense report"""
-        userid = request.GET.get('userid')
-        if not userid:
-            return Response({'error': 'userid parameter is required'}, status=status.HTTP_400_BAD_REQUEST)
-
-        try:
-            user_id = int(userid)
-            from django.contrib.auth.models import User
-            user = User.objects.get(id=user_id, is_active=True)
-        except (ValueError, ObjectDoesNotExist):
-            return Response({'error': 'Invalid userid parameter'}, status=status.HTTP_400_BAD_REQUEST)
+        """Get monthly expense report for the authenticated user."""
+        user = request.user
         year = request.query_params.get('year', timezone.now().year)
         month = request.query_params.get('month', timezone.now().month)
 
@@ -284,17 +223,9 @@ class ExpenseViewSet(viewsets.ModelViewSet):
         return Response(report_data)
 
     def _resolve_user(self, request):
-        """Same ?userid= contract the rest of the API uses. Returns (user, error)."""
-        userid = request.GET.get('userid')
-        if not userid:
-            return None, Response({'error': 'userid parameter is required'},
-                                  status=status.HTTP_400_BAD_REQUEST)
-        try:
-            from django.contrib.auth.models import User
-            return User.objects.get(id=int(userid), is_active=True), None
-        except (ValueError, ObjectDoesNotExist):
-            return None, Response({'error': 'Invalid userid parameter'},
-                                  status=status.HTTP_400_BAD_REQUEST)
+        """The authenticated user. Kept as (user, error) so callers are unchanged;
+        IsAuthenticated guarantees a real user, so the error is always None."""
+        return request.user, None
 
     @staticmethod
     def _known_tag_names(user):
@@ -760,16 +691,8 @@ class ExpenseViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        userid = request.GET.get('userid')
-        if not userid:
-            return Response({'error': 'userid parameter is required'}, status=status.HTTP_400_BAD_REQUEST)
-
-        try:
-            user_id = int(userid)
-            tags = ExpenseTag.objects.filter(id__in=tag_ids, user_id=user_id, user__is_active=True)
-            expense.tags.add(*tags)
-        except ValueError:
-            return Response({'error': 'Invalid userid parameter'}, status=status.HTTP_400_BAD_REQUEST)
+        tags = ExpenseTag.objects.filter(id__in=tag_ids, user=request.user)
+        expense.tags.add(*tags)
 
         serializer = self.get_serializer(expense)
         return Response(serializer.data)
@@ -786,16 +709,8 @@ class ExpenseViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        userid = request.GET.get('userid')
-        if not userid:
-            return Response({'error': 'userid parameter is required'}, status=status.HTTP_400_BAD_REQUEST)
-
-        try:
-            user_id = int(userid)
-            tags = ExpenseTag.objects.filter(id__in=tag_ids, user_id=user_id, user__is_active=True)
-            expense.tags.remove(*tags)
-        except ValueError:
-            return Response({'error': 'Invalid userid parameter'}, status=status.HTTP_400_BAD_REQUEST)
+        tags = ExpenseTag.objects.filter(id__in=tag_ids, user=request.user)
+        expense.tags.remove(*tags)
 
         serializer = self.get_serializer(expense)
         return Response(serializer.data)
@@ -817,33 +732,18 @@ def match_account(name):
 
 
 def _resolve_split_user(request):
-    """The ?userid= contract, shared by the split viewsets."""
-    userid = request.GET.get('userid')
-    if not userid:
-        return None, Response({'error': 'userid parameter is required'},
-                              status=status.HTTP_400_BAD_REQUEST)
-    try:
-        from django.contrib.auth.models import User
-        return User.objects.get(id=int(userid), is_active=True), None
-    except (ValueError, ObjectDoesNotExist):
-        return None, Response({'error': 'Invalid userid parameter'},
-                              status=status.HTTP_400_BAD_REQUEST)
+    """The authenticated user, shared by the split viewsets. IsAuthenticated
+    guarantees a real user, so the error is always None."""
+    return request.user, None
 
 
 class PersonViewSet(viewsets.ModelViewSet):
     """People the user splits expenses with."""
     serializer_class = PersonSerializer
-    permission_classes = [AllowAny]
     pagination_class = None
 
     def get_queryset(self):
-        userid = self.request.GET.get('userid')
-        if not userid:
-            return Person.objects.none()
-        try:
-            return Person.objects.filter(user_id=int(userid))
-        except ValueError:
-            return Person.objects.none()
+        return Person.objects.filter(user=self.request.user)
 
     def perform_create(self, serializer):
         user, error = _resolve_split_user(self.request)
@@ -886,21 +786,14 @@ class PersonViewSet(viewsets.ModelViewSet):
 class SplitViewSet(viewsets.ReadOnlyModelViewSet):
     """Shared expenses: what each person owes, and settling up."""
     serializer_class = ExpenseSplitSerializer
-    permission_classes = [AllowAny]
     pagination_class = StandardResultsSetPagination
 
     def get_queryset(self):
-        userid = self.request.GET.get('userid')
-        if not userid:
-            return ExpenseSplit.objects.none()
-        try:
-            uid = int(userid)
-            # Splits you are party to, whichever end you are on.
-            queryset = ExpenseSplit.objects.filter(
-                Q(expense__user_id=uid) | Q(person__linked_user_id=uid)
-            ).select_related('person', 'expense')
-        except ValueError:
-            return ExpenseSplit.objects.none()
+        uid = self.request.user.id
+        # Splits you are party to, whichever end you are on.
+        queryset = ExpenseSplit.objects.filter(
+            Q(expense__user_id=uid) | Q(person__linked_user_id=uid)
+        ).select_related('person', 'expense')
         if self.request.GET.get('settled') == 'false':
             queryset = queryset.filter(is_settled=False)
         person = self.request.GET.get('person')
@@ -1028,17 +921,10 @@ class SplitGroupViewSet(viewsets.ModelViewSet):
     with the group applied. The two can't disagree.
     """
     serializer_class = SplitGroupSerializer
-    permission_classes = [AllowAny]
     pagination_class = None
 
     def get_queryset(self):
-        userid = self.request.GET.get('userid')
-        if not userid:
-            return SplitGroup.objects.none()
-        try:
-            queryset = SplitGroup.objects.filter(owner_id=int(userid))
-        except ValueError:
-            return SplitGroup.objects.none()
+        queryset = SplitGroup.objects.filter(owner=self.request.user)
         if self.request.GET.get('archived') != 'true':
             queryset = queryset.filter(is_archived=False)
         return queryset.prefetch_related('members')
@@ -1144,17 +1030,10 @@ class SplitGroupViewSet(viewsets.ModelViewSet):
 class RecurringRuleViewSet(viewsets.ModelViewSet):
     """Recurring income and bills - the rules the projection layer runs on."""
     serializer_class = RecurringRuleSerializer
-    permission_classes = [AllowAny]
     pagination_class = None
 
     def get_queryset(self):
-        userid = self.request.GET.get('userid')
-        if not userid:
-            return RecurringRule.objects.none()
-        try:
-            return RecurringRule.objects.filter(user_id=int(userid)).select_related('category')
-        except ValueError:
-            return RecurringRule.objects.none()
+        return RecurringRule.objects.filter(user=self.request.user).select_related('category')
 
     def perform_create(self, serializer):
         user, error = _resolve_split_user(self.request)
@@ -1170,7 +1049,6 @@ class MoneyViewSet(viewsets.ViewSet):
     seam the Cash Flow River and Money Pulse render, and where budgets/goals
     will hang later.
     """
-    permission_classes = [AllowAny]
 
     @action(detail=False, methods=['get'])
     def projection(self, request):

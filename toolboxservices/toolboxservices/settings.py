@@ -39,6 +39,7 @@ INSTALLED_APPS = [
     "django.contrib.messages",
     "django.contrib.staticfiles",
     "rest_framework",
+    "rest_framework.authtoken",
     "corsheaders",
     "tools",
     "expenses",
@@ -56,7 +57,6 @@ MIDDLEWARE = [
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
-    "toolboxservices.middleware.UserIdValidationMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
 
@@ -142,16 +142,19 @@ STATIC_URL = '/static/'
 
 # REST Framework configuration
 REST_FRAMEWORK = {
+    # Every endpoint requires a real, authenticated user by default. Individual
+    # views opt out with permission_classes=[AllowAny] only where genuinely
+    # public (login, register). The user is derived from the token, never from
+    # a client-supplied ?userid= — that trust has been removed.
     'DEFAULT_PERMISSION_CLASSES': [
-        'rest_framework.permissions.AllowAny',
+        'rest_framework.permissions.IsAuthenticated',
     ],
-    # The API authenticates with ?userid= via UserIdValidationMiddleware, not
-    # Django sessions. Leaving DRF's default SessionAuthentication on would mean
-    # that once someone logs into /admin/ in the same browser, DRF starts
-    # treating their API calls as authenticated and enforces CSRF on them -
-    # every write from the frontend would then fail with "CSRF Failed: CSRF
-    # cookie not set". Session auth grants this API nothing, so it is off.
-    'DEFAULT_AUTHENTICATION_CLASSES': [],
+    # Token auth only. Session auth is deliberately left off so that logging
+    # into /admin/ in the same browser can't make the API treat those calls as
+    # authenticated (and start enforcing CSRF on the frontend's writes).
+    'DEFAULT_AUTHENTICATION_CLASSES': [
+        'rest_framework.authentication.TokenAuthentication',
+    ],
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
     'PAGE_SIZE': 20,
     'DEFAULT_THROTTLE_CLASSES': [

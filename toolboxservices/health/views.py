@@ -23,21 +23,11 @@ class StandardResultsSetPagination(PageNumberPagination):
 class HealthMetricViewSet(viewsets.ModelViewSet):
     """ViewSet for HealthMetric CRUD operations"""
     serializer_class = HealthMetricSerializer
-    permission_classes = [AllowAny]
     pagination_class = StandardResultsSetPagination
 
     def get_queryset(self):
-        """Only return metrics for the specified user, optionally filtered by type/date"""
-        userid = self.request.GET.get('userid')
-        if not userid:
-            return HealthMetric.objects.none()
-
-        try:
-            user_id = int(userid)
-        except ValueError:
-            return HealthMetric.objects.none()
-
-        queryset = HealthMetric.objects.filter(user_id=user_id, user__is_active=True)
+        """Only the authenticated user's metrics, optionally filtered by type/date."""
+        queryset = HealthMetric.objects.filter(user=self.request.user)
 
         metric_type = self.request.GET.get('metric_type')
         if metric_type:
@@ -53,32 +43,13 @@ class HealthMetricViewSet(viewsets.ModelViewSet):
         return queryset
 
     def perform_create(self, serializer):
-        """Associate metric with specified user"""
-        userid = self.request.GET.get('userid')
-        if not userid:
-            raise PermissionDenied("userid parameter is required.")
-
-        try:
-            user_id = int(userid)
-            user = User.objects.get(id=user_id, is_active=True)
-            serializer.save(user=user)
-        except (ValueError, ObjectDoesNotExist):
-            raise PermissionDenied("Invalid userid parameter.")
+        serializer.save(user=self.request.user)
 
     @action(detail=False, methods=['get'])
     def summary(self, request):
-        """Latest reading plus 7-day stats, broken down by metric type"""
-        userid = request.GET.get('userid')
-        if not userid:
-            return Response({'error': 'userid parameter is required'}, status=status.HTTP_400_BAD_REQUEST)
-
-        try:
-            user_id = int(userid)
-        except ValueError:
-            return Response({'error': 'Invalid userid parameter'}, status=status.HTTP_400_BAD_REQUEST)
-
+        """Latest reading plus 7-day stats, broken down by metric type."""
         week_ago = timezone.now().date() - timedelta(days=7)
-        base_qs = HealthMetric.objects.filter(user_id=user_id, user__is_active=True)
+        base_qs = HealthMetric.objects.filter(user=request.user)
 
         result = {}
         for metric_type, label in HealthMetric.METRIC_TYPE_CHOICES:

@@ -1,14 +1,11 @@
-from django.shortcuts import render
 from django.contrib.auth.models import User
 from rest_framework import viewsets, status, generics
-from rest_framework.decorators import action
-from rest_framework.permissions import AllowAny
+from rest_framework.authtoken.models import Token
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.decorators import api_view, permission_classes
-from django.core.exceptions import PermissionDenied
 from django.views.decorators.csrf import get_token
-from django.utils.decorators import method_decorator
 from django.http import JsonResponse
 from .serializers import (
     UserRegistrationSerializer,
@@ -16,220 +13,116 @@ from .serializers import (
     PasswordChangeSerializer
 )
 
-# Create your views here.
+
+def _user_payload(user):
+    return {
+        'id': user.id,
+        'username': user.username,
+        'email': user.email,
+        'first_name': user.first_name,
+        'last_name': user.last_name,
+    }
 
 
 class UserViewSet(viewsets.ModelViewSet):
-    """
-    ViewSet for user management with different serializers for different actions
-    """
+    """User management. Registration is open; everything else is the caller's
+    own record, derived from the auth token — never a client-supplied id."""
     queryset = User.objects.all()
 
     def get_serializer_class(self):
-        """
-        Return the appropriate serializer class based on the action
-        """
         if self.action == 'create':
             return UserRegistrationSerializer
         return UserProfileSerializer
 
     def get_permissions(self):
-        """
-        Return the appropriate permission classes based on the action
-        """
+        # Anyone may register; every other action needs a valid token.
         if self.action == 'create':
-            # Allow anyone to register
-            permission_classes = [AllowAny]
-        else:
-            # No authentication required - userid handled in middleware
-            permission_classes = [AllowAny]
-        return [permission() for permission in permission_classes]
+            return [AllowAny()]
+        return [IsAuthenticated()]
 
     def get_queryset(self):
-        """
-        Override queryset to show only current user data based on userid parameter
-        """
-        queryset = User.objects.all()
-
-        # Get userid from query parameters
-        userid = self.request.GET.get('userid')
-        if not userid:
+        # Only ever the authenticated user's own record.
+        if not self.request.user.is_authenticated:
             return User.objects.none()
+        return User.objects.filter(id=self.request.user.id, is_active=True)
 
-        try:
-            user_id = int(userid)
-        except ValueError:
-            return User.objects.none()
-
-        # Only return the user's own data
-        return queryset.filter(id=user_id, is_active=True)
-
-    def perform_create(self, serializer):
-        """
-        Handle user creation
-        """
-        serializer.save()
-
-    def list(self, request, *args, **kwargs):
-        """
-        Override list method to handle permissions properly
-        """
-        queryset = self.filter_queryset(self.get_queryset())
-
-        page = self.paginate_queryset(queryset)
-        if page is not None:
-            serializer = self.get_serializer(page, many=True)
-            return self.get_paginated_response(serializer.data)
-
-        serializer = self.get_serializer(queryset, many=True)
-        return Response(serializer.data)
-
-    def retrieve(self, request, *args, **kwargs):
-        """
-        Override retrieve method to handle permissions properly
-        """
-        instance = self.get_object()
-
-        # Get userid from query parameters
-        userid = request.GET.get('userid')
-        if not userid:
-            raise PermissionDenied("userid parameter is required.")
-
-        try:
-            user_id = int(userid)
-        except ValueError:
-            raise PermissionDenied("Invalid userid parameter.")
-
-        # Check if user can access this data
-        if instance.id != user_id:
-            raise PermissionDenied("You can only view your own profile.")
-
-        serializer = self.get_serializer(instance)
-        return Response(serializer.data)
+    def create(self, request, *args, **kwargs):
+        """Register and hand back a token, so sign-up logs the user straight in."""
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user = serializer.save()
+        token, _ = Token.objects.get_or_create(user=user)
+        return Response(
+            {'token': token.key, 'user': _user_payload(user)},
+            status=status.HTTP_201_CREATED,
+        )
 
 
 class UserProfileView(generics.RetrieveUpdateAPIView):
-    """
-    View for retrieving and updating current user's profile
-    """
+    """The authenticated user's own profile."""
     serializer_class = UserProfileSerializer
-    permission_classes = [AllowAny]
+    permission_classes = [IsAuthenticated]
 
     def get_object(self):
-        """
-        Return the current user object based on userid parameter
-        """
-        userid = self.request.GET.get('userid')
-        if not userid:
-            raise PermissionDenied("userid parameter is required.")
-
-        try:
-            user_id = int(userid)
-            return User.objects.get(id=user_id, is_active=True)
-        except (ValueError, ObjectDoesNotExist):
-            raise PermissionDenied("Invalid userid parameter.")
-
-    def get_queryset(self):
-        """
-        Return queryset containing only the specified user
-        """
-        userid = self.request.GET.get('userid')
-        if not userid:
-            return User.objects.none()
-
-        try:
-            user_id = int(userid)
-            return User.objects.filter(id=user_id, is_active=True)
-        except ValueError:
-            return User.objects.none()
-
-    def update(self, request, *args, **kwargs):
-        """
-        Handle profile updates with proper validation
-        """
-        partial = kwargs.pop('partial', False)
-        instance = self.get_object()
-        serializer = self.get_serializer(instance, data=request.data, partial=partial)
-        serializer.is_valid(raise_exception=True)
-        self.perform_update(serializer)
-
-        return Response(serializer.data, status=status.HTTP_200_OK)
+        return self.request.user
 
 
 class PasswordChangeView(APIView):
-    """
-    View for handling password change requests
-    """
-    permission_classes = [AllowAny]
+    """Change the authenticated user's password."""
+    permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        """
-        Handle POST request for password change
-        """
-        userid = request.GET.get('userid')
-        if not userid:
-            return Response({'error': 'userid parameter is required'}, status=status.HTTP_400_BAD_REQUEST)
-
-        try:
-            user_id = int(userid)
-            user = User.objects.get(id=user_id, is_active=True)
-        except (ValueError, ObjectDoesNotExist):
-            return Response({'error': 'Invalid userid parameter'}, status=status.HTTP_400_BAD_REQUEST)
-
+        user = request.user
         serializer = PasswordChangeSerializer(data=request.data, context={'request': request, 'user': user})
-
         if serializer.is_valid():
-            # Set the new password
             user.set_password(serializer.validated_data['new_password'])
             user.save()
-
-            return Response(
-                {"detail": "Password changed successfully."},
-                status=status.HTTP_200_OK
-            )
-
+            # Rotate the token so an old credential can't outlive the change.
+            Token.objects.filter(user=user).delete()
+            token = Token.objects.create(user=user)
+            return Response({'detail': 'Password changed successfully.', 'token': token.key}, status=status.HTTP_200_OK)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def login_view(request):
+    """Authenticate by email + password and return an auth token.
+
+    Replaces the old ?userid= "login", which performed no credential check at
+    all. The token is what every subsequent API call authenticates with.
     """
-    Login view that validates userid via middleware.
-    Since middleware already validates the userid parameter,
-    we just need to return success if we reach this point.
-    """
-    userid = request.GET.get('userid')
-    if not userid:
-        return Response({'error': 'userid parameter is required'}, status=status.HTTP_400_BAD_REQUEST)
+    email = (request.data.get('email') or '').strip()
+    password = request.data.get('password') or ''
+    if not email or not password:
+        return Response({'error': 'Email and password are required.'}, status=status.HTTP_400_BAD_REQUEST)
 
-    try:
-        user_id = int(userid)
-        # Middleware has already validated this user exists
-        user = request.validated_user
-        if not user:
-            return Response({'error': 'Invalid userid'}, status=status.HTTP_400_BAD_REQUEST)
+    matches = list(User.objects.filter(email__iexact=email, is_active=True))
+    # Generic message either way, so this can't be used to probe which emails exist.
+    invalid = Response({'error': 'Invalid email or password.'}, status=status.HTTP_401_UNAUTHORIZED)
+    if len(matches) != 1:
+        return invalid
+    user = matches[0]
+    if not user.check_password(password):
+        return invalid
 
-        return Response({
-            'detail': 'Login successful.',
-            'user': {
-                'id': user.id,
-                'username': user.username,
-                'email': user.email,
-                'first_name': user.first_name,
-                'last_name': user.last_name
-            }
-        }, status=status.HTTP_200_OK)
+    token, _ = Token.objects.get_or_create(user=user)
+    return Response(
+        {'detail': 'Login successful.', 'token': token.key, 'user': _user_payload(user)},
+        status=status.HTTP_200_OK,
+    )
 
-    except (ValueError, ObjectDoesNotExist):
-        return Response({'error': 'Invalid userid parameter'}, status=status.HTTP_400_BAD_REQUEST)
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def logout_view(request):
+    """Invalidate the caller's token."""
+    Token.objects.filter(user=request.user).delete()
+    return Response({'detail': 'Logged out.'}, status=status.HTTP_200_OK)
 
 
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def get_csrf_token(request):
-    """
-    Get CSRF token for API clients
-    """
     token = get_token(request)
     return JsonResponse({'csrftoken': token})
