@@ -271,3 +271,47 @@ def _spend(user, start, end):
     return Decimal(str(Expense.objects.filter(
         user=user, transaction_type='expense', date__gte=start, date__lte=end
     ).aggregate(t=Sum('amount'))['t'] or 0))
+
+
+def affordability(user, amount, on_date):
+    """Can the user spend `amount` on `on_date` without going under?
+
+    Simulates the spend against the same forward projection the river shows -
+    subtracts the amount from every projected day on/after the date and checks
+    whether the projected low stays non-negative. Every figure returned is real,
+    derived from recorded activity; nothing is invented.
+    """
+    from datetime import date as _date
+    today = timezone.now().date()
+    amount = Decimal(str(amount))
+    if isinstance(on_date, str):
+        on_date = _date.fromisoformat(on_date)
+    if on_date < today:
+        on_date = today
+
+    horizon = min(max(30, (on_date - today).days + 14), 120)
+    proj = build_projection(user, days=horizon)
+    series = proj['series']
+
+    # The projected low once the spend lands on/after on_date.
+    low_after, low_after_date = None, None
+    for d in series:
+        day = _date.fromisoformat(d['date'])
+        bal = Decimal(str(d['balance'])) - (amount if day >= on_date else Decimal('0'))
+        if low_after is None or bal < low_after:
+            low_after, low_after_date = bal, d['date']
+
+    affordable = low_after >= Decimal('0')
+    return {
+        'amount': _f(amount),
+        'date': on_date.isoformat(),
+        'is_today': on_date == today,
+        'affordable': affordable,
+        'safe_to_spend_today': proj['safe_to_spend_today'],
+        'projected_low_before': proj['projected_low'],
+        'projected_low_after': {'balance': _f(low_after), 'date': low_after_date},
+        'headroom': _f(low_after),           # room left at the low point after the spend
+        'daily_discretionary': proj['daily_discretionary'],
+        'next_income_date': proj['next_income_date'],
+        'runway_days': proj['runway_days'],
+    }

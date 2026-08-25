@@ -1071,6 +1071,34 @@ class MoneyViewSet(viewsets.ViewSet):
         from .projections import money_pulse
         return Response(money_pulse(user))
 
+    @action(detail=False, methods=['post'])
+    def afford(self, request):
+        """"Can I afford a ₹200 dinner Friday?" — parsed, then computed against
+        the projection. The model only reads the sentence; the maths (and the
+        yes/no) come from the user's real forward balance."""
+        user, error = _resolve_split_user(request)
+        if error:
+            return error
+        question = request.data.get('question', '')
+        if not question or not question.strip():
+            return Response({'error': 'question is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        from .services import parse_afford_query
+        from .projections import affordability
+        try:
+            parsed = parse_afford_query(question)
+        except ExpenseParseNotPossible as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except ExpenseParseRateLimited as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_429_TOO_MANY_REQUESTS)
+        except ExpenseParseError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+
+        result = affordability(user, parsed['amount'], parsed['date'])
+        result['question'] = question.strip()
+        result['interpretation'] = parsed.get('interpretation') or ''
+        return Response(result)
+
 
 class CopilotViewSet(viewsets.ViewSet):
     """The autonomous copilot: proactive, actionable cards from the user's data.
