@@ -63,6 +63,43 @@ def daily_discretionary(user, lookback=30):
     return Decimal(str(total)) / Decimal(lookback)
 
 
+def discretionary_mix(user, lookback=30, top=6):
+    """How the ordinary daily spend splits across categories, from recent history.
+
+    The projection drains at an average daily rate; this says *where* that drain
+    tends to go, so the Cash Flow River can show the composition of the everyday
+    outflow, not just the fixed bills. Derived from the last `lookback` days of
+    recorded expenses, top categories kept and the rest grouped as "Other".
+    """
+    since = timezone.now().date() - timedelta(days=lookback)
+    rows = (Expense.objects
+            .filter(user=user, transaction_type='expense', date__gte=since)
+            .values('category__id', 'category__name', 'category__color')
+            .annotate(total=Sum('amount'))
+            .order_by('-total'))
+    rows = list(rows)
+    grand = sum((Decimal(str(r['total'] or 0)) for r in rows), Decimal('0'))
+    if grand <= 0:
+        return []
+    mix = []
+    kept = rows[:top]
+    for r in kept:
+        amt = Decimal(str(r['total'] or 0))
+        mix.append({
+            'category_id': r['category__id'],
+            'category': r['category__name'] or 'Uncategorised',
+            'color': r['category__color'],
+            'amount': _f(amt),
+            'share': _f(amt / grand),
+        })
+    if len(rows) > top:
+        rest = sum((Decimal(str(r['total'] or 0)) for r in rows[top:]), Decimal('0'))
+        if rest > 0:
+            mix.append({'category_id': None, 'category': 'Other', 'color': None,
+                        'amount': _f(rest), 'share': _f(rest / grand)})
+    return mix
+
+
 def build_projection(user, days=30):
     """A forward balance series with the events that move it.
 
@@ -147,6 +184,7 @@ def build_projection(user, days=30):
         'next_income_date': next_income_date,
         'safe_to_spend_today': safe_today,
         'runway_days': runway_days,
+        'discretionary_mix': discretionary_mix(user),
         'series': series,
     }
 
