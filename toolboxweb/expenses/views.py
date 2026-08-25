@@ -263,9 +263,10 @@ class ExpenseViewSet(viewsets.ModelViewSet):
             count=Count('id')
         ).order_by('date')
 
-        # Calculate monthly totals by category
+        # Calculate monthly totals by category. category__id is included so the
+        # client can drill from a category into its actual transactions.
         category_totals = monthly_expenses.values(
-            'category__name', 'category__color'
+            'category__id', 'category__name', 'category__color'
         ).annotate(
             total=Sum('amount'),
             count=Count('id')
