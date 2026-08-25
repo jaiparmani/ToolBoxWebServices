@@ -15,7 +15,8 @@ from .models import Expense, ExpenseCategory, ExpenseSplit, ExpenseTag, Person, 
 from .serializers import (
     ExpenseSerializer, ExpenseCreateSerializer, ExpenseListSerializer,
     ExpenseCategorySerializer, ExpenseTagSerializer, ExpenseSummarySerializer,
-    ExpenseSplitSerializer, PersonSerializer, SplitGroupSerializer, RecurringRuleSerializer
+    ExpenseSplitSerializer, PersonSerializer, SplitGroupSerializer, RecurringRuleSerializer,
+    CopilotCardSerializer
 )
 from .services import (
     compute_shares,
@@ -1069,3 +1070,49 @@ class MoneyViewSet(viewsets.ViewSet):
             return error
         from .projections import money_pulse
         return Response(money_pulse(user))
+
+
+class CopilotViewSet(viewsets.ViewSet):
+    """The autonomous copilot: proactive, actionable cards from the user's data.
+
+    Listing refreshes lazily (regenerates from live data on read), so it works
+    with no external scheduler; a management command can also run it on a
+    schedule. Cards are dismissed or marked actioned - never edited by hand.
+    """
+
+    def list(self, request):
+        from . import copilot
+        cards = copilot.refresh(request.user)
+        return Response(CopilotCardSerializer(cards, many=True).data)
+
+    @action(detail=False, methods=['post'])
+    def refresh(self, request):
+        from . import copilot
+        cards = copilot.refresh(request.user)
+        return Response(CopilotCardSerializer(cards, many=True).data)
+
+    def _get_card(self, request, pk):
+        from .models import CopilotCard
+        try:
+            return CopilotCard.objects.get(pk=pk, user=request.user), None
+        except CopilotCard.DoesNotExist:
+            return None, Response({'error': 'Card not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+    @action(detail=True, methods=['post'])
+    def dismiss(self, request, pk=None):
+        card, error = self._get_card(request, pk)
+        if error:
+            return error
+        card.status = 'dismissed'
+        card.save(update_fields=['status', 'updated_at'])
+        return Response(CopilotCardSerializer(card).data)
+
+    @action(detail=True, methods=['post'])
+    def act(self, request, pk=None):
+        """Mark a card actioned - the user followed its suggestion."""
+        card, error = self._get_card(request, pk)
+        if error:
+            return error
+        card.status = 'actioned'
+        card.save(update_fields=['status', 'updated_at'])
+        return Response(CopilotCardSerializer(card).data)

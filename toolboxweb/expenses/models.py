@@ -341,3 +341,62 @@ class RecurringRule(models.Model):
             current = self._step(current, 1)
             guard += 1
         return dates
+
+
+class CopilotCard(models.Model):
+    """A proactive, actionable observation the copilot surfaces.
+
+    Each card is a real condition the app detected from the user's own data -
+    a bill that will overdraw safe-to-spend, an unusual category spike, a
+    subscription that just renewed, a split going stale - carrying the figure
+    behind it (never invented) and a suggested action.
+
+    Cards are regenerated from live data. A stable `dedupe_key` keeps exactly
+    one card per condition instance, so a re-run updates the existing card
+    rather than piling up duplicates, and `status` lets the user dismiss or act
+    without the next run resurrecting a dismissed concern.
+    """
+
+    KIND_CHOICES = [
+        ('bill_overdraw', 'Upcoming bill overdraws safe-to-spend'),
+        ('category_spike', 'Unusual category spend'),
+        ('subscription_renewed', 'Subscription renewed'),
+        ('split_stale', 'Unsettled split going stale'),
+        ('low_runway', 'Low runway'),
+    ]
+    SEVERITY_CHOICES = [('info', 'Info'), ('watch', 'Watch'), ('urgent', 'Urgent')]
+    STATUS_CHOICES = [('new', 'New'), ('seen', 'Seen'), ('dismissed', 'Dismissed'), ('actioned', 'Actioned')]
+
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
+                             related_name='copilot_cards')
+    kind = models.CharField(max_length=32, choices=KIND_CHOICES)
+    severity = models.CharField(max_length=10, choices=SEVERITY_CHOICES, default='info')
+    status = models.CharField(max_length=12, choices=STATUS_CHOICES, default='new')
+
+    title = models.CharField(max_length=200)
+    body = models.CharField(max_length=500, help_text='Plain-language explanation, citing the real figure')
+
+    # The real figures behind the card - so the UI shows the number, and it is
+    # always traceable to the user's data.
+    metric_value = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    metric_label = models.CharField(max_length=120, blank=True)
+    data = models.JSONField(default=dict, blank=True, help_text='Snapshot of the inputs used')
+
+    action_label = models.CharField(max_length=60, blank=True)
+    action_route = models.CharField(max_length=200, blank=True, help_text='Frontend route the action opens')
+
+    # One card per (user, condition instance); a re-run upserts on this key.
+    dedupe_key = models.CharField(max_length=200)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        constraints = [
+            models.UniqueConstraint(fields=['user', 'dedupe_key'], name='unique_copilot_card_per_condition'),
+        ]
+        indexes = [models.Index(fields=['user', 'status'])]
+
+    def __str__(self):
+        return f"[{self.kind}] {self.title}"
