@@ -89,7 +89,8 @@ def build_projection(user, days=30):
                 'rule_id': rule.id,
             })
 
-    series = [{'date': today.isoformat(), 'balance': _f(balance), 'events': [], 'is_today': True}]
+    series = [{'date': today.isoformat(), 'balance': _f(balance), 'events': [],
+               'inflow': 0.0, 'outflow': 0.0, 'is_today': True}]
     upcoming_income = Decimal('0')
     upcoming_bills = Decimal('0')
     next_income_date = None
@@ -99,16 +100,23 @@ def build_projection(user, days=30):
     for i in range(1, days + 1):
         day = today + timedelta(days=i)
         day_events = events_by_day.get(day, [])
+        # Per-day flow decomposition, so the river can draw money coming in
+        # (income events) against money going out (bills + the ordinary drain).
+        day_inflow = Decimal('0')
+        day_outflow = Decimal('0')
         for ev in day_events:
             balance += Decimal(str(ev['signed']))
             if ev['type'] == 'income':
+                day_inflow += Decimal(str(ev['amount']))
                 upcoming_income += Decimal(str(ev['amount']))
                 if next_income_date is None:
                     next_income_date = day.isoformat()
             else:
+                day_outflow += Decimal(str(ev['amount']))
                 upcoming_bills += Decimal(str(ev['amount']))
-        # ordinary daily drain
+        # ordinary daily drain counts as outflow too
         balance -= discretionary
+        day_outflow += discretionary
         if balance < low_point:
             low_point = balance
             low_point_date = day.isoformat()
@@ -116,6 +124,8 @@ def build_projection(user, days=30):
             'date': day.isoformat(),
             'balance': _f(balance),
             'events': day_events,
+            'inflow': _f(day_inflow),
+            'outflow': _f(day_outflow),
             'is_today': False,
         })
 
@@ -182,7 +192,7 @@ def money_pulse(user):
 
     if runway is not None and runway <= 14:
         status = 'attention'
-        headline = f'Runway is short - about {runway} days'
+        headline = f'Runway is short - about {runway} day{"" if runway == 1 else "s"}'
         detail = (f"At your recent pace (₹{proj['daily_discretionary']:.0f}/day) and with the "
                   f"bills coming up, the projected balance dips to ₹{proj['projected_low']['balance']:.0f} "
                   f"by {proj['projected_low']['date']}.")
