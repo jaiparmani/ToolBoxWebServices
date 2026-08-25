@@ -3,6 +3,7 @@ from rest_framework.routers import DefaultRouter
 from .views import (
     ExpenseViewSet, ExpenseCategoryViewSet, ExpenseTagViewSet,
     PersonViewSet, SplitViewSet, SplitGroupViewSet, RecurringRuleViewSet, MoneyViewSet,
+    CopilotViewSet,
 )
 
 # Create a router for API endpoints
@@ -17,6 +18,7 @@ router.register(r'splits', SplitViewSet, basename='split')
 router.register(r'groups', SplitGroupViewSet, basename='split-group')
 router.register(r'recurring', RecurringRuleViewSet, basename='recurring')
 router.register(r'money', MoneyViewSet, basename='money')
+router.register(r'copilot', CopilotViewSet, basename='copilot')
 
 # URL patterns
 urlpatterns = [
