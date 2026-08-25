@@ -438,6 +438,102 @@ def parse_search_query(question):
 
 
 # --------------------------------------------------------------------------
+# "Can I afford it?" - pull an amount and a date out of a plain question.
+#
+# The maths is done against the projection in Python; the model only reads the
+# sentence. And it degrades gracefully: with no API key, a small regex still
+# extracts the amount and a weekday, so the command bar works without any AI.
+# --------------------------------------------------------------------------
+
+AFFORD_SYSTEM_PROMPT = (
+    "You read a question about whether the user can afford a purchase and extract "
+    "just two things: the amount and the date they mean.\n"
+    "\n"
+    "Today's date is given. Resolve any relative date ('friday', 'next week', "
+    "'tomorrow', 'the 5th', 'in 3 days') to an absolute YYYY-MM-DD in the near "
+    "future. If no date is mentioned, use today. The amount is the price of the "
+    "thing they want to buy - a positive number.\n"
+    "\n"
+    "Respond with ONLY a JSON object - no markdown, no commentary - exactly: "
+    "{\"amount\": <number>, \"date\": \"YYYY-MM-DD\", \"interpretation\": \"<short paraphrase>\"}."
+)
+
+_WEEKDAYS = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
+
+
+def _next_weekday(name):
+    """The next date (today or later) landing on the named weekday."""
+    from datetime import timedelta
+    idx = _WEEKDAYS.index(name)
+    today = date.today()
+    delta = (idx - today.weekday()) % 7
+    return today + timedelta(days=delta)
+
+
+def _validate_afford(parsed):
+    if not isinstance(parsed, dict):
+        raise LLMError("The model did not return a JSON object.")
+    amount = parsed.get('amount')
+    if isinstance(amount, str):
+        try:
+            amount = float(re.sub(r'[^0-9.]', '', amount) or 0)
+        except ValueError:
+            raise LLMError("No usable amount.")
+    if not isinstance(amount, (int, float)) or isinstance(amount, bool) or amount <= 0:
+        raise LLMError("No usable amount.")
+    when = parsed.get('date')
+    try:
+        date.fromisoformat(when)
+    except (TypeError, ValueError):
+        when = date.today().isoformat()
+    interp = parsed.get('interpretation')
+    return {'amount': float(amount), 'date': when,
+            'interpretation': interp.strip() if isinstance(interp, str) else ''}
+
+
+def _afford_fallback(question):
+    """No-AI extraction: first number as the amount, a weekday word as the date."""
+    m = re.search(r'(\d[\d,]*\.?\d*)', question)
+    if not m:
+        raise ExpenseParseNotPossible("I couldn't find an amount in that. Try e.g. \"can I afford 500 on friday?\"")
+    amount = float(m.group(1).replace(',', ''))
+    when = date.today().isoformat()
+    low = question.lower()
+    if 'tomorrow' in low:
+        from datetime import timedelta
+        when = (date.today() + timedelta(days=1)).isoformat()
+    else:
+        for name in _WEEKDAYS:
+            if name in low:
+                when = _next_weekday(name).isoformat()
+                break
+    return {'amount': amount, 'date': when, 'interpretation': ''}
+
+
+def parse_afford_query(question):
+    """Extract {'amount', 'date', 'interpretation'} from a can-I-afford question."""
+    question = (question or '').strip()
+    if not question:
+        raise ExpenseParseNotPossible("No question provided.")
+    user_content = f"Today's date is {date.today().isoformat()}.\n\nQuestion: \"{question}\""
+    messages = [
+        {"role": "system", "content": AFFORD_SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
+    try:
+        return _translate_errors(
+            call_json, messages, validate=_validate_afford, expect_key='amount',
+            retry_instruction=(
+                "Reply with ONLY {\"amount\": <number>, \"date\": \"YYYY-MM-DD\", "
+                "\"interpretation\": \"...\"} - no prose, no code fences."
+            ),
+        )
+    except (ExpenseParseNotPossible, ExpenseParseError):
+        # No key or the model failed - fall back so the feature still works.
+        return _afford_fallback(question)
+
+
+# --------------------------------------------------------------------------
 # Splitting a bill
 #
 # "split 1200 dinner with raj and priya" has to yield both an expense and who
