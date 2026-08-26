@@ -237,21 +237,28 @@ ANTHROPIC_MAX_TOKENS = int(os.environ.get('ANTHROPIC_MAX_TOKENS', '8000'))
 OPENROUTER_API_KEY = os.environ.get('OPENROUTER_API_KEY', '')
 OPENROUTER_MODEL = os.environ.get('OPENROUTER_MODEL', 'openrouter/free')
 
-# ── Password-reset email ─────────────────────────────────────────────────────
-# Where the reset link points (the frontend origin, no trailing slash).
+# ── Password-reset email (Gmail SMTP) ────────────────────────────────────────
+# Where the reset link points (the frontend origin, no trailing slash). MUST be
+# set to the deployed frontend in production, or links point at localhost.
 FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:3000')
-DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'ToolBox <noreply@toolbox.local>')
 
-# Email delivery. Defaults to the console backend, which PRINTS the message
-# (reset link included) to the server log - fine for development and enough to
-# verify the flow. For real delivery in production, set EMAIL_HOST (and the
-# related vars) to an SMTP provider; the backend then switches to SMTP.
-if os.environ.get('EMAIL_HOST'):
+# Credentials come from the environment and are never committed. EMAIL_HOST_USER
+# is the Gmail address; EMAIL_HOST_PASSWORD must be a Gmail *App Password*
+# (Google account with 2FA, https://myaccount.google.com/apppasswords) - the
+# normal account password will not authenticate over SMTP.
+#
+# Read with .get() rather than os.environ[...] so a deploy before the vars are
+# set can't crash the whole app on import; without them, fall back to the
+# console backend (the reset link prints to the server log).
+EMAIL_HOST_USER = os.environ.get('EMAIL_HOST_USER', '')
+EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', '')
+
+if EMAIL_HOST_USER and EMAIL_HOST_PASSWORD:
     EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
-    EMAIL_HOST = os.environ['EMAIL_HOST']
-    EMAIL_PORT = int(os.environ.get('EMAIL_PORT', '587'))
-    EMAIL_HOST_USER = os.environ.get('EMAIL_HOST_USER', '')
-    EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', '')
-    EMAIL_USE_TLS = os.environ.get('EMAIL_USE_TLS', 'true').lower() == 'true'
+    EMAIL_HOST = 'smtp.gmail.com'
+    EMAIL_PORT = 587
+    EMAIL_USE_TLS = True
+    DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', EMAIL_HOST_USER)
 else:
     EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
+    DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'ToolBox <noreply@toolbox.local>')
