@@ -219,3 +219,22 @@ if not DEBUG:
 #   export OPENROUTER_API_KEY="sk-or-v1-..."
 OPENROUTER_API_KEY = os.environ.get('OPENROUTER_API_KEY', '')
 OPENROUTER_MODEL = os.environ.get('OPENROUTER_MODEL', 'openrouter/free')
+
+# ── Password-reset email ─────────────────────────────────────────────────────
+# Where the reset link points (the frontend origin, no trailing slash).
+FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:3000')
+DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'ToolBox <noreply@toolbox.local>')
+
+# Email delivery. Defaults to the console backend, which PRINTS the message
+# (reset link included) to the server log - fine for development and enough to
+# verify the flow. For real delivery in production, set EMAIL_HOST (and the
+# related vars) to an SMTP provider; the backend then switches to SMTP.
+if os.environ.get('EMAIL_HOST'):
+    EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
+    EMAIL_HOST = os.environ['EMAIL_HOST']
+    EMAIL_PORT = int(os.environ.get('EMAIL_PORT', '587'))
+    EMAIL_HOST_USER = os.environ.get('EMAIL_HOST_USER', '')
+    EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', '')
+    EMAIL_USE_TLS = os.environ.get('EMAIL_USE_TLS', 'true').lower() == 'true'
+else:
+    EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
