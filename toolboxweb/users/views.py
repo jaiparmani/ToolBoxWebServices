@@ -128,6 +128,97 @@ def logout_view(request):
     return Response({'detail': 'Logged out.'}, status=status.HTTP_200_OK)
 
 
+def _resolve_login_identifier(identifier):
+    """Map an email / username / phone to one active user, or None.
+
+    Email is detected by '@', an all-digit string is treated as a phone (matched
+    against the profile phone once that exists), otherwise it's a username. An
+    ambiguous match resolves to nobody, so a code is never sent to the wrong
+    person.
+    """
+    identifier = (identifier or '').strip()
+    if not identifier:
+        return None
+    if '@' in identifier:
+        qs = User.objects.filter(email__iexact=identifier, is_active=True)
+    elif identifier.replace('+', '').isdigit():
+        # Phone lookup — no phone field on accounts yet, so this finds nobody
+        # until phone numbers are stored. The channel (SMS) is a separate step.
+        digits = identifier.replace(' ', '')
+        qs = User.objects.filter(profile__phone=digits, is_active=True) if _has_profile_phone() else User.objects.none()
+    else:
+        qs = User.objects.filter(username__iexact=identifier, is_active=True)
+    return qs.first() if qs.count() == 1 else None
+
+
+def _has_profile_phone():
+    try:
+        from .models import UserProfile  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+class OTPRequestView(APIView):
+    """Start passwordless login: email a one-time code.
+
+    The identifier can be an email, a username (or a phone, once phones are
+    stored). Whatever they type, the code is emailed to the account's address.
+    The response is always generic, so it can't be used to probe for accounts.
+    """
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        from .models import EmailOTP
+        identifier = (request.data.get('identifier') or '').strip()
+        generic = Response(
+            {'detail': "If that account exists, a sign-in code is on its way to its email."},
+            status=status.HTTP_200_OK,
+        )
+        if not identifier:
+            return Response({'error': 'Enter your email or username.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        user = _resolve_login_identifier(identifier)
+        if user and user.email:
+            code, throttled = EmailOTP.issue(user)
+            if code:
+                send_mail(
+                    subject="Your ToolBox sign-in code",
+                    message=(
+                        f"Hi {user.first_name or user.username},\n\n"
+                        f"Your ToolBox sign-in code is:\n\n    {code}\n\n"
+                        "It expires in 10 minutes and can be used once. "
+                        "If you didn't try to sign in, you can ignore this email."
+                    ),
+                    from_email=getattr(settings, 'DEFAULT_FROM_EMAIL', 'noreply@toolbox.local'),
+                    recipient_list=[user.email],
+                    fail_silently=True,
+                )
+        return generic
+
+
+class OTPVerifyView(APIView):
+    """Finish passwordless login: verify the code and return an auth token."""
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        from .models import EmailOTP
+        identifier = (request.data.get('identifier') or '').strip()
+        code = (request.data.get('code') or '').strip()
+        invalid = Response({'error': 'That code is invalid or has expired.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        user = _resolve_login_identifier(identifier)
+        if not user or not code:
+            return invalid
+        otp = EmailOTP.objects.filter(user=user, consumed=False).order_by('-created_at').first()
+        if not otp or not otp.verify(code):
+            return invalid
+
+        token, _ = Token.objects.get_or_create(user=user)
+        return Response({'detail': 'Signed in.', 'token': token.key, 'user': _user_payload(user)},
+                        status=status.HTTP_200_OK)
+
+
 class PasswordResetRequestView(APIView):
     """Start a password reset: email a one-time link.
 
