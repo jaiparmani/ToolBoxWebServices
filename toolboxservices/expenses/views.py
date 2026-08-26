@@ -228,54 +228,22 @@ class ExpenseViewSet(viewsets.ModelViewSet):
         IsAuthenticated guarantees a real user, so the error is always None."""
         return request.user, None
 
+    # Category/tag resolution lives in expenses.resolvers now, shared with the
+    # assistant agent. These stay as thin delegates so existing callers work.
     @staticmethod
     def _known_tag_names(user):
-        """The user's existing tags, so the model reuses them instead of coining near-duplicates."""
-        return list(ExpenseTag.objects.filter(user=user).values_list('name', flat=True))
+        from .resolvers import known_tag_names
+        return known_tag_names(user)
 
     @staticmethod
     def _resolve_tags(user, names):
-        """Map model-suggested tag names onto the user's tags, creating what's missing.
-
-        ExpenseTag.name is globally unique rather than unique per user, so a name
-        another account already holds cannot be created here. Skip those rather
-        than failing the save - a missing tag is a far smaller loss than a
-        rejected expense.
-        """
-        resolved = []
-        for name in names or []:
-            tag = ExpenseTag.objects.filter(name__iexact=name, user=user).first()
-            if not tag:
-                if ExpenseTag.objects.filter(name__iexact=name).exists():
-                    continue  # owned by another user
-                tag = ExpenseTag.objects.create(name=name[:50], user=user)
-            resolved.append(tag)
-        return resolved
+        from .resolvers import resolve_tags
+        return resolve_tags(user, names)
 
     @staticmethod
     def _resolve_category(parsed):
-        """Find or create the category for a parsed item, honouring its type.
-
-        The model's transaction_type wins: it read the note, whereas a category
-        match is just a name collision. Reuse an existing category only when its
-        type agrees, so "lent 200 to raj" can't be filed as an expense merely
-        because some unrelated category shares the name the model picked.
-        """
-        transaction_type = parsed['transaction_type']
-        name = parsed['category_name'][:100]
-        category = ExpenseCategory.objects.filter(
-            name__iexact=name, is_active=True, transaction_type=transaction_type
-        ).first()
-        if not category:
-            # ExpenseCategory.name is unique, so a same-name category of a
-            # different type forces a qualified name rather than an IntegrityError.
-            if ExpenseCategory.objects.filter(name__iexact=name).exists():
-                name = f"{name} ({transaction_type})"[:100]
-            category, _ = ExpenseCategory.objects.get_or_create(
-                name=name,
-                defaults={'transaction_type': transaction_type},
-            )
-        return category
+        from .resolvers import resolve_category
+        return resolve_category(parsed)
 
     @action(detail=False, methods=['post'])
     def quick_add(self, request):

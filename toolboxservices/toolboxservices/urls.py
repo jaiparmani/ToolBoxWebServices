@@ -18,6 +18,7 @@ Including another URLconf
 from django.contrib import admin
 from django.urls import path, include
 from django.http import HttpResponse
+from expenses.assistant_views import AssistantView
 
 def hello(request):
     return HttpResponse("Hello World")
@@ -30,5 +31,7 @@ urlpatterns = [
     path("api/health/", include("health.urls")),
     path("api/insights/", include("insights.urls")),
     path("api/llm/", include("llm.urls")),
+    # One brain, one endpoint.
+    path("api/assistant/", AssistantView.as_view(), name="assistant"),
     path("", hello)
 ]
