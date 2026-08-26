@@ -94,23 +94,21 @@ class PasswordChangeView(APIView):
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def login_view(request):
-    """Authenticate by email + password and return an auth token.
+    """Authenticate by identifier (email or username) + password -> auth token.
 
-    Replaces the old ?userid= "login", which performed no credential check at
-    all. The token is what every subsequent API call authenticates with.
+    The identifier accepts an email or a username (`email` is still accepted for
+    backwards compatibility). The token is what every subsequent API call
+    authenticates with.
     """
-    email = (request.data.get('email') or '').strip()
+    identifier = (request.data.get('identifier') or request.data.get('email') or '').strip()
     password = request.data.get('password') or ''
-    if not email or not password:
-        return Response({'error': 'Email and password are required.'}, status=status.HTTP_400_BAD_REQUEST)
+    if not identifier or not password:
+        return Response({'error': 'Email/username and password are required.'}, status=status.HTTP_400_BAD_REQUEST)
 
-    matches = list(User.objects.filter(email__iexact=email, is_active=True))
-    # Generic message either way, so this can't be used to probe which emails exist.
-    invalid = Response({'error': 'Invalid email or password.'}, status=status.HTTP_401_UNAUTHORIZED)
-    if len(matches) != 1:
-        return invalid
-    user = matches[0]
-    if not user.check_password(password):
+    # Generic message either way, so this can't be used to probe which accounts exist.
+    invalid = Response({'error': 'Invalid credentials.'}, status=status.HTTP_401_UNAUTHORIZED)
+    user = _resolve_login_identifier(identifier)
+    if not user or not user.check_password(password):
         return invalid
 
     token, _ = Token.objects.get_or_create(user=user)

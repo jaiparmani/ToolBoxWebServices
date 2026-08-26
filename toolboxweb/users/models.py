@@ -4,7 +4,34 @@ from datetime import timedelta
 from django.conf import settings
 from django.contrib.auth.hashers import check_password, make_password
 from django.db import models
+from django.db.models.signals import post_save
+from django.dispatch import receiver
 from django.utils import timezone
+
+
+class UserProfile(models.Model):
+    """Extra per-user fields that don't live on Django's built-in User.
+
+    Currently just a phone number - stored so it can identify an account at
+    login (a phone entered at sign-in resolves to this user, and the one-time
+    code is emailed to them). Delivering codes over SMS is a separate step that
+    needs an SMS provider.
+    """
+
+    user = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='profile')
+    phone = models.CharField(max_length=20, blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"Profile for {self.user_id}"
+
+
+@receiver(post_save, sender=settings.AUTH_USER_MODEL)
+def ensure_profile(sender, instance, created, **kwargs):
+    """Every user has exactly one profile."""
+    if created:
+        UserProfile.objects.get_or_create(user=instance)
 
 OTP_TTL_MINUTES = 10       # how long a code stays usable
 OTP_MAX_ATTEMPTS = 5       # wrong guesses before a code is burned
