@@ -3,6 +3,7 @@ from rest_framework.routers import DefaultRouter
 from .views import (
     UserViewSet, UserProfileView, PasswordChangeView, get_csrf_token, login_view, logout_view,
     PasswordResetRequestView, PasswordResetConfirmView,
+    OTPRequestView, OTPVerifyView,
 )
 
 # Create a router for the UserViewSet
@@ -16,6 +17,9 @@ urlpatterns = [
     # Login / logout endpoints
     path('login/', login_view, name='login'),
     path('logout/', logout_view, name='logout'),
+    # Passwordless email-OTP login (email or username)
+    path('otp-request/', OTPRequestView.as_view(), name='otp-request'),
+    path('otp-verify/', OTPVerifyView.as_view(), name='otp-verify'),
 
     # User profile endpoints
     path('profile/', UserProfileView.as_view(), name='user-profile'),
