@@ -400,3 +400,38 @@ class CopilotCard(models.Model):
 
     def __str__(self):
         return f"[{self.kind}] {self.title}"
+
+
+class Notification(models.Model):
+    """A single event in a user's notification feed.
+
+    Kept deliberately simple: a titled line with an optional body and a deep
+    link into the app. Created server-side on real events (a split added), so it
+    never depends on the client being open. Delivery to a device (browser
+    notification, Telegram) is layered on top of this record, not instead of it.
+    """
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='notifications')
+    kind = models.CharField(max_length=32, default='split')
+    title = models.CharField(max_length=160)
+    body = models.CharField(max_length=400, blank=True, default='')
+    link = models.CharField(max_length=200, blank=True, default='')
+    is_read = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [models.Index(fields=['user', 'is_read'])]
+
+    def __str__(self):
+        return f"{self.kind}: {self.title}"
+
+
+def notify(user, title, body='', kind='split', link=''):
+    """Best-effort feed entry. Never let a notification failure break the action
+    that triggered it (e.g. an un-migrated table on a server mid-deploy)."""
+    if not user:
+        return None
+    try:
+        return Notification.objects.create(user=user, title=title[:160], body=body[:400], kind=kind, link=link[:200])
+    except Exception:
+        return None
