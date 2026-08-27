@@ -29,9 +29,16 @@ class UserProfile(models.Model):
 
 @receiver(post_save, sender=settings.AUTH_USER_MODEL)
 def ensure_profile(sender, instance, created, **kwargs):
-    """Every user has exactly one profile."""
+    """Every user has exactly one profile.
+
+    Guarded so a missing profile table (migration not yet applied on a server)
+    can never make user creation itself fail — the profile is best-effort.
+    """
     if created:
-        UserProfile.objects.get_or_create(user=instance)
+        try:
+            UserProfile.objects.get_or_create(user=instance)
+        except Exception:
+            pass
 
 OTP_TTL_MINUTES = 10       # how long a code stays usable
 OTP_MAX_ATTEMPTS = 5       # wrong guesses before a code is burned

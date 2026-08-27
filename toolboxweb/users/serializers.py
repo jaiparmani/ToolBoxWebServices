@@ -76,10 +76,13 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
             last_name=validated_data.get('last_name', '')
         )
         if phone:
-            # The post_save signal already created the profile.
-            profile = user.profile
-            profile.phone = phone.strip()
-            profile.save(update_fields=['phone'])
+            # The post_save signal already created the profile (best-effort).
+            try:
+                profile = user.profile
+                profile.phone = phone.strip()
+                profile.save(update_fields=['phone'])
+            except Exception:
+                pass  # profile store unavailable — registration still succeeds
         return user
 
 
@@ -87,12 +90,21 @@ class UserProfileSerializer(serializers.ModelSerializer):
     """
     Serializer for user profile operations (view/update)
     """
-    phone = serializers.CharField(source='profile.phone', required=False, allow_blank=True, max_length=20)
+    # Read via a method field so a missing/partial profile (or a profile table
+    # that hasn't been migrated yet on a server) can never 500 the whole
+    # profile read — it just reports no phone. Writes are handled in update().
+    phone = serializers.SerializerMethodField()
 
     class Meta:
         model = User
         fields = ('id', 'username', 'email', 'first_name', 'last_name', 'phone', 'date_joined')
         read_only_fields = ('id', 'date_joined')
+
+    def get_phone(self, obj):
+        try:
+            return obj.profile.phone or ''
+        except Exception:
+            return ''
 
     def validate_email(self, value):
         """
@@ -104,22 +116,20 @@ class UserProfileSerializer(serializers.ModelSerializer):
         return value
 
     def update(self, instance, validated_data):
-        """Phone lives on the related profile; split it out before updating User."""
-        from .models import UserProfile
-        profile_data = validated_data.pop('profile', None)
+        """Phone lives on the related profile; take it from the raw input (the
+        field is read-only) and save it best-effort, so a profile store that
+        isn't available yet doesn't break editing name/email."""
         user = super().update(instance, validated_data)
-        if profile_data is not None:
-            profile, _ = UserProfile.objects.get_or_create(user=user)
-            profile.phone = (profile_data.get('phone') or '').strip()
-            profile.save(update_fields=['phone'])
+        phone = self.initial_data.get('phone', None)
+        if phone is not None:
+            try:
+                from .models import UserProfile
+                profile, _ = UserProfile.objects.get_or_create(user=user)
+                profile.phone = (phone or '').strip()
+                profile.save(update_fields=['phone'])
+            except Exception:
+                pass
         return user
-
-    def to_representation(self, instance):
-        """Ensure the profile exists so reading `phone` never crashes for users
-        created before profiles were introduced."""
-        from .models import UserProfile
-        UserProfile.objects.get_or_create(user=instance)
-        return super().to_representation(instance)
 
 
 class PasswordChangeSerializer(serializers.Serializer):
