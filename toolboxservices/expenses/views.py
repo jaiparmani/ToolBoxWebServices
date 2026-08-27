@@ -187,10 +187,18 @@ class ExpenseViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'])
     def notifications(self, request):
-        """The caller's notification feed: recent items + unread count."""
-        qs = Notification.objects.filter(user=request.user)
-        unread = qs.filter(is_read=False).count()
-        items = list(qs[:40])
+        """The caller's notification feed: recent items + unread count.
+
+        Guarded: if the notification table hasn't been migrated on this server
+        yet (deploy pulls code but doesn't migrate), degrade to an empty feed
+        rather than 500 — the bell just shows nothing until the migration runs.
+        """
+        try:
+            qs = Notification.objects.filter(user=request.user)
+            unread = qs.filter(is_read=False).count()
+            items = list(qs[:40])
+        except Exception:
+            return Response({'unread_count': 0, 'results': []})
         return Response({
             'unread_count': unread,
             'results': [{
@@ -202,11 +210,14 @@ class ExpenseViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['post'], url_path='notifications/read')
     def notifications_read(self, request):
         """Mark notifications read — a list of `ids`, or all of them."""
-        qs = Notification.objects.filter(user=request.user, is_read=False)
-        ids = request.data.get('ids')
-        if isinstance(ids, list) and ids:
-            qs = qs.filter(id__in=ids)
-        updated = qs.update(is_read=True)
+        try:
+            qs = Notification.objects.filter(user=request.user, is_read=False)
+            ids = request.data.get('ids')
+            if isinstance(ids, list) and ids:
+                qs = qs.filter(id__in=ids)
+            updated = qs.update(is_read=True)
+        except Exception:
+            updated = 0
         return Response({'marked': updated})
 
     @action(detail=False, methods=['get'])
