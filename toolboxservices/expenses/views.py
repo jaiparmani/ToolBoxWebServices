@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 import django_filters
 
-from .models import Expense, ExpenseCategory, ExpenseSplit, ExpenseTag, Person, SplitGroup, RecurringRule
+from .models import Expense, ExpenseCategory, ExpenseSplit, ExpenseTag, Person, SplitGroup, RecurringRule, Notification, notify
 from .serializers import (
     ExpenseSerializer, ExpenseCreateSerializer, ExpenseListSerializer,
     ExpenseCategorySerializer, ExpenseTagSerializer, ExpenseSummarySerializer,
@@ -184,6 +184,30 @@ class ExpenseViewSet(viewsets.ModelViewSet):
         recent_expenses = self.get_queryset().filter(date__gte=week_ago)
         serializer = self.get_serializer(recent_expenses, many=True)
         return Response(serializer.data)
+
+    @action(detail=False, methods=['get'])
+    def notifications(self, request):
+        """The caller's notification feed: recent items + unread count."""
+        qs = Notification.objects.filter(user=request.user)
+        unread = qs.filter(is_read=False).count()
+        items = list(qs[:40])
+        return Response({
+            'unread_count': unread,
+            'results': [{
+                'id': n.id, 'kind': n.kind, 'title': n.title, 'body': n.body,
+                'link': n.link, 'is_read': n.is_read, 'created_at': n.created_at.isoformat(),
+            } for n in items],
+        })
+
+    @action(detail=False, methods=['post'], url_path='notifications/read')
+    def notifications_read(self, request):
+        """Mark notifications read — a list of `ids`, or all of them."""
+        qs = Notification.objects.filter(user=request.user, is_read=False)
+        ids = request.data.get('ids')
+        if isinstance(ids, list) and ids:
+            qs = qs.filter(id__in=ids)
+        updated = qs.update(is_read=True)
+        return Response({'marked': updated})
 
     @action(detail=False, methods=['get'])
     def monthly_report(self, request):
@@ -506,6 +530,21 @@ class ExpenseViewSet(viewsets.ModelViewSet):
                     expense=expense, person=person, amount=share))
 
         owed_total = sum(s.amount for s in splits)
+
+        # Notify: a record for you, and a heads-up in the feed of anyone you
+        # split with who has an account here.
+        who = ', '.join(s.person.name for s in splits) or 'someone'
+        notify(expense.user, 'Split added',
+               f"{expense.description} — ₹{expense.amount}. You're owed ₹{owed_total} from {who}.",
+               kind='split', link='/splits')
+        creator_name = (expense.user.get_full_name() or expense.user.username).strip()
+        for s in splits:
+            if s.person.linked_user and s.amount:
+                notify(s.person.linked_user,
+                       f"{creator_name} split a bill with you",
+                       f"{expense.description} — you owe ₹{s.amount}.",
+                       kind='split', link='/splits')
+
         return Response({
             'expense': ExpenseSerializer(expense).data,
             'splits': ExpenseSplitSerializer(splits, many=True).data,
@@ -585,6 +624,21 @@ class ExpenseViewSet(viewsets.ModelViewSet):
             group.members.add(*[s.person for s in splits])
 
         owed_total = sum(s.amount for s in splits)
+
+        # Notify: a record for you, and a heads-up in the feed of anyone you
+        # split with who has an account here.
+        who = ', '.join(s.person.name for s in splits) or 'someone'
+        notify(expense.user, 'Split added',
+               f"{expense.description} — ₹{expense.amount}. You're owed ₹{owed_total} from {who}.",
+               kind='split', link='/splits')
+        creator_name = (expense.user.get_full_name() or expense.user.username).strip()
+        for s in splits:
+            if s.person.linked_user and s.amount:
+                notify(s.person.linked_user,
+                       f"{creator_name} split a bill with you",
+                       f"{expense.description} — you owe ₹{s.amount}.",
+                       kind='split', link='/splits')
+
         return Response({
             'expense': ExpenseSerializer(expense).data,
             'splits': ExpenseSplitSerializer(splits, many=True).data,
