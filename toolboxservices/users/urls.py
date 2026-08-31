@@ -4,6 +4,7 @@ from .views import (
     UserViewSet, UserProfileView, PasswordChangeView, get_csrf_token, login_view, logout_view,
     PasswordResetRequestView, PasswordResetConfirmView,
     OTPRequestView, OTPVerifyView,
+    MpinSetView, MpinLoginView, MpinResetRequestView, MpinResetConfirmView,
 )
 
 # Create a router for the UserViewSet
@@ -20,6 +21,12 @@ urlpatterns = [
     # Passwordless email-OTP login (email or username)
     path('otp-request/', OTPRequestView.as_view(), name='otp-request'),
     path('otp-verify/', OTPVerifyView.as_view(), name='otp-verify'),
+
+    # MPIN: set/change (authenticated), sign in, and email-based reset
+    path('mpin/set/', MpinSetView.as_view(), name='mpin-set'),
+    path('mpin/login/', MpinLoginView.as_view(), name='mpin-login'),
+    path('mpin/reset/', MpinResetRequestView.as_view(), name='mpin-reset'),
+    path('mpin/reset-confirm/', MpinResetConfirmView.as_view(), name='mpin-reset-confirm'),
 
     # User profile endpoints
     path('profile/', UserProfileView.as_view(), name='user-profile'),

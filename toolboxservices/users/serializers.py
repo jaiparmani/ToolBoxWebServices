@@ -94,17 +94,26 @@ class UserProfileSerializer(serializers.ModelSerializer):
     # that hasn't been migrated yet on a server) can never 500 the whole
     # profile read — it just reports no phone. Writes are handled in update().
     phone = serializers.SerializerMethodField()
+    # Whether the account has a sign-in PIN set — lets the app show "set up MPIN"
+    # vs "change MPIN". Method field so a missing/unmigrated profile can't 500.
+    has_mpin = serializers.SerializerMethodField()
 
     class Meta:
         model = User
-        fields = ('id', 'username', 'email', 'first_name', 'last_name', 'phone', 'date_joined')
-        read_only_fields = ('id', 'date_joined')
+        fields = ('id', 'username', 'email', 'first_name', 'last_name', 'phone', 'has_mpin', 'date_joined')
+        read_only_fields = ('id', 'date_joined', 'has_mpin')
 
     def get_phone(self, obj):
         try:
             return obj.profile.phone or ''
         except Exception:
             return ''
+
+    def get_has_mpin(self, obj):
+        try:
+            return bool(obj.profile.has_mpin)
+        except Exception:
+            return False
 
     def validate_email(self, value):
         """

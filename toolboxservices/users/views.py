@@ -297,6 +297,147 @@ class PasswordResetConfirmView(APIView):
                          'user': _user_payload(user)}, status=status.HTTP_200_OK)
 
 
+def _get_profile(user):
+    """The user's profile, created on demand. None only if the store is down."""
+    try:
+        from .models import UserProfile
+        profile, _ = UserProfile.objects.get_or_create(user=user)
+        return profile
+    except Exception:
+        return None
+
+
+class MpinSetView(APIView):
+    """Set or change the authenticated user's sign-in PIN.
+
+    Requires the account password, so a PIN — a login credential — can only be
+    created by someone who already knows the password, never silently from a
+    lifted token alone.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        from .models import validate_mpin
+        user = request.user
+        password = request.data.get('password') or ''
+        mpin = (request.data.get('mpin') or '').strip()
+
+        if not user.check_password(password):
+            return Response({'error': 'Your password is incorrect.'}, status=status.HTTP_400_BAD_REQUEST)
+        err = validate_mpin(mpin)
+        if err:
+            return Response({'error': err}, status=status.HTTP_400_BAD_REQUEST)
+
+        profile = _get_profile(user)
+        if not profile:
+            return Response({'error': 'Could not save your MPIN right now.'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        profile.set_mpin(mpin)
+        return Response({'detail': 'MPIN set. You can now sign in with it.', 'has_mpin': True},
+                        status=status.HTTP_200_OK)
+
+
+class MpinLoginView(APIView):
+    """Sign in with an identifier (email/username) + MPIN -> auth token.
+
+    A wrong PIN counts toward a lockout on the profile; too many freezes it for
+    a while. The message is generic so this can't probe which accounts exist or
+    which have a PIN.
+    """
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        identifier = (request.data.get('identifier') or request.data.get('email') or '').strip()
+        mpin = (request.data.get('mpin') or '').strip()
+        invalid = Response({'error': 'Invalid credentials.'}, status=status.HTTP_401_UNAUTHORIZED)
+        if not identifier or not mpin:
+            return Response({'error': 'Email/username and MPIN are required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        user = _resolve_login_identifier(identifier)
+        profile = _get_profile(user) if user else None
+        if not profile or not profile.has_mpin:
+            return invalid
+
+        result = profile.check_mpin(mpin)
+        if result == 'locked':
+            return Response(
+                {'error': 'Too many wrong PINs. Try again later, or reset your MPIN by email.'},
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+        if result != 'ok':
+            return invalid
+
+        token, _ = Token.objects.get_or_create(user=user)
+        return Response({'detail': 'Signed in.', 'token': token.key, 'user': _user_payload(user)},
+                        status=status.HTTP_200_OK)
+
+
+class MpinResetRequestView(APIView):
+    """Start an MPIN reset: email a one-time code (the same 6-digit email code
+    used for passwordless sign-in). Always a generic response, so it can't be
+    used to probe for accounts."""
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        from .models import EmailOTP
+        identifier = (request.data.get('identifier') or request.data.get('email') or '').strip()
+        generic = Response(
+            {'detail': "If that account exists, an MPIN-reset code is on its way to its email."},
+            status=status.HTTP_200_OK,
+        )
+        if not identifier:
+            return Response({'error': 'Enter your email or username.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        user = _resolve_login_identifier(identifier)
+        if user and user.email:
+            code, throttled = EmailOTP.issue(user)
+            if code:
+                send_mail(
+                    subject="Your ToolBox MPIN-reset code",
+                    message=(
+                        f"Hi {user.first_name or user.username},\n\n"
+                        f"Use this code to set a new ToolBox MPIN:\n\n    {code}\n\n"
+                        "It expires in 10 minutes and can be used once. "
+                        "If you didn't ask to reset your MPIN, you can ignore this email."
+                    ),
+                    from_email=getattr(settings, 'DEFAULT_FROM_EMAIL', 'noreply@toolbox.local'),
+                    recipient_list=[user.email],
+                    fail_silently=True,
+                )
+        return generic
+
+
+class MpinResetConfirmView(APIView):
+    """Finish an MPIN reset: verify the emailed code, set the new PIN, and sign
+    the user in. This is the recovery path when a PIN is forgotten or locked."""
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        from .models import EmailOTP, validate_mpin
+        identifier = (request.data.get('identifier') or request.data.get('email') or '').strip()
+        code = (request.data.get('code') or '').strip()
+        mpin = (request.data.get('mpin') or '').strip()
+        invalid = Response({'error': 'That code is invalid or has expired.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        err = validate_mpin(mpin)
+        if err:
+            return Response({'error': err}, status=status.HTTP_400_BAD_REQUEST)
+
+        user = _resolve_login_identifier(identifier)
+        if not user or not code:
+            return invalid
+        otp = EmailOTP.objects.filter(user=user, consumed=False).order_by('-created_at').first()
+        if not otp or not otp.verify(code):
+            return invalid
+
+        profile = _get_profile(user)
+        if not profile:
+            return Response({'error': 'Could not save your MPIN right now.'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        profile.set_mpin(mpin)
+        token, _ = Token.objects.get_or_create(user=user)
+        return Response({'detail': 'MPIN reset. You are signed in.', 'token': token.key,
+                         'user': _user_payload(user)}, status=status.HTTP_200_OK)
+
+
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def get_csrf_token(request):

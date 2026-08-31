@@ -20,11 +20,72 @@ class UserProfile(models.Model):
 
     user = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='profile')
     phone = models.CharField(max_length=20, blank=True, default='')
+    # A short numeric sign-in PIN, stored HASHED exactly like a password — a
+    # database leak must not hand out working PINs. Blank means "not set up".
+    mpin_hash = models.CharField(max_length=128, blank=True, default='')
+    mpin_attempts = models.PositiveIntegerField(default=0)
+    mpin_locked_until = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     def __str__(self):
         return f"Profile for {self.user_id}"
+
+    @property
+    def has_mpin(self):
+        return bool(self.mpin_hash)
+
+    @property
+    def mpin_is_locked(self):
+        return bool(self.mpin_locked_until and timezone.now() < self.mpin_locked_until)
+
+    def set_mpin(self, pin):
+        """Store a new PIN (hashed) and clear any failed-attempt lock."""
+        self.mpin_hash = make_password(str(pin).strip())
+        self.mpin_attempts = 0
+        self.mpin_locked_until = None
+        self.save(update_fields=['mpin_hash', 'mpin_attempts', 'mpin_locked_until', 'updated_at'])
+
+    def check_mpin(self, pin):
+        """Verify a submitted PIN, counting failures and locking on abuse.
+
+        Returns 'ok', 'bad', or 'locked'. A 6-digit PIN has a million
+        combinations, so without a lockout it is brute-forceable over the API;
+        MPIN_MAX_ATTEMPTS wrong tries freezes it for MPIN_LOCK_MINUTES.
+        """
+        if not self.has_mpin:
+            return 'bad'
+        if self.mpin_is_locked:
+            return 'locked'
+        if check_password(str(pin).strip(), self.mpin_hash):
+            if self.mpin_attempts or self.mpin_locked_until:
+                self.mpin_attempts = 0
+                self.mpin_locked_until = None
+                self.save(update_fields=['mpin_attempts', 'mpin_locked_until', 'updated_at'])
+            return 'ok'
+        self.mpin_attempts += 1
+        if self.mpin_attempts >= MPIN_MAX_ATTEMPTS:
+            self.mpin_locked_until = timezone.now() + timedelta(minutes=MPIN_LOCK_MINUTES)
+            self.mpin_attempts = 0
+        self.save(update_fields=['mpin_attempts', 'mpin_locked_until', 'updated_at'])
+        return 'locked' if self.mpin_is_locked else 'bad'
+
+
+MPIN_LENGTH = 6            # digits in a sign-in PIN
+MPIN_MAX_ATTEMPTS = 5      # wrong PINs before it's frozen
+MPIN_LOCK_MINUTES = 15     # how long a frozen PIN stays frozen
+
+
+def validate_mpin(pin):
+    """A PIN is exactly MPIN_LENGTH digits, and not trivially guessable."""
+    pin = str(pin or '').strip()
+    if not (pin.isdigit() and len(pin) == MPIN_LENGTH):
+        return f"MPIN must be exactly {MPIN_LENGTH} digits."
+    if len(set(pin)) == 1:
+        return "Pick a less obvious MPIN — not the same digit repeated."
+    if pin in ('123456', '654321', '012345', '000000'):
+        return "Pick a less obvious MPIN."
+    return None
 
 
 @receiver(post_save, sender=settings.AUTH_USER_MODEL)
