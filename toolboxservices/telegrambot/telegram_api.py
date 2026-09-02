@@ -39,10 +39,21 @@ def call(method, payload=None, timeout=TIMEOUT):
     url = f"{API_ROOT}/bot{token}/{method}"
     try:
         response = requests.post(url, json=payload or {}, timeout=timeout)
-        return response.json()
+        data = response.json()
     except (requests.RequestException, ValueError) as exc:
         logger.warning("Telegram %s failed: %s", method, exc)
         return {}
+    # Telegram answers 200 with {"ok": false, ...} for things like a bad token
+    # (401), an unknown chat_id, or a parse_mode/HTML error — the reply is never
+    # delivered but nothing raised. Log it so a silent "no response" is visible.
+    if isinstance(data, dict) and not data.get("ok", True):
+        logger.error(
+            "Telegram %s rejected: error_code=%s description=%s",
+            method,
+            data.get("error_code"),
+            data.get("description"),
+        )
+    return data
 
 
 def send_message(chat_id, text, parse_mode=None, disable_preview=True):
