@@ -308,22 +308,22 @@ def _get_profile(user):
 
 
 class MpinSetView(APIView):
-    """Set or change the authenticated user's sign-in PIN.
+    """Set or change the authenticated user's sign-in PIN (settings page).
 
-    Requires the account password, so a PIN — a login credential — can only be
-    created by someone who already knows the password, never silently from a
-    lifted token alone.
+    If a PIN already exists (`has_mpin`), the caller must prove they know the
+    current one via `current_mpin` before it can be changed — so a lifted token
+    alone can't silently swap the PIN. When no PIN exists yet, it can be set
+    without one. The forgot-PIN path (mpin/reset + reset-confirm) covers the
+    case where the current PIN is unknown.
     """
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
         from .models import validate_mpin
         user = request.user
-        password = request.data.get('password') or ''
         mpin = (request.data.get('mpin') or '').strip()
+        current_mpin = (request.data.get('current_mpin') or '').strip()
 
-        if not user.check_password(password):
-            return Response({'error': 'Your password is incorrect.'}, status=status.HTTP_400_BAD_REQUEST)
         err = validate_mpin(mpin)
         if err:
             return Response({'error': err}, status=status.HTTP_400_BAD_REQUEST)
@@ -331,6 +331,22 @@ class MpinSetView(APIView):
         profile = _get_profile(user)
         if not profile:
             return Response({'error': 'Could not save your MPIN right now.'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+        # Changing an existing PIN requires verifying the current one.
+        if profile.has_mpin:
+            if not current_mpin:
+                return Response({'error': 'Enter your current MPIN to change it.'},
+                                status=status.HTTP_400_BAD_REQUEST)
+            result = profile.check_mpin(current_mpin)
+            if result == 'locked':
+                return Response(
+                    {'error': 'Too many wrong PINs. Try again later, or reset your MPIN by email.'},
+                    status=status.HTTP_429_TOO_MANY_REQUESTS,
+                )
+            if result != 'ok':
+                return Response({'error': 'Your current MPIN is incorrect.'},
+                                status=status.HTTP_400_BAD_REQUEST)
+
         profile.set_mpin(mpin)
         return Response({'detail': 'MPIN set. You can now sign in with it.', 'has_mpin': True},
                         status=status.HTTP_200_OK)
