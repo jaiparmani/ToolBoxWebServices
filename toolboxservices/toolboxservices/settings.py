@@ -47,6 +47,7 @@ INSTALLED_APPS = [
     "health",
     "insights",
     "llm",
+    "telegrambot",
 ]
 
 MIDDLEWARE = [
@@ -245,3 +246,24 @@ if EMAIL_HOST_USER and EMAIL_HOST_PASSWORD:
 else:
     EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
     DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'ToolBox <noreply@toolbox.local>')
+
+# ── Telegram bot (telegrambot app) ───────────────────────────────────────────
+# The bot runs as a webhook inside this web app, so it's up whenever the backend
+# is up — no separate long-polling process to keep alive (which is why the old
+# standalone script kept going down on PythonAnywhere). Set these in the
+# environment (PythonAnywhere: in ~/.bashrc *and* in the WSGI file); never
+# commit the token.
+#
+#   TELEGRAM_BOT_TOKEN        BotFather token for the bot
+#   TELEGRAM_WEBHOOK_SECRET   any long random string; it's the secret in the
+#                             webhook URL path and the setWebhook secret_token
+#   TELEGRAM_WEBHOOK_BASE_URL public https origin, e.g.
+#                             https://toolbox.pythonanywhere.com (used by the
+#                             set_telegram_webhook command)
+#
+# After setting them, register the webhook once:  python manage.py set_telegram_webhook
+TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+TELEGRAM_WEBHOOK_SECRET = os.environ.get('TELEGRAM_WEBHOOK_SECRET', '')
+TELEGRAM_WEBHOOK_BASE_URL = os.environ.get(
+    'TELEGRAM_WEBHOOK_BASE_URL', 'https://toolbox.pythonanywhere.com'
+)

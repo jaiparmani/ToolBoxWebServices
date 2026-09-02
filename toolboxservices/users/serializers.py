@@ -1,7 +1,29 @@
+import re
+
 from rest_framework import serializers
 from django.contrib.auth.models import User
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError
+
+from .models import UserProfile, validate_mpin
+
+
+def normalize_phone(value):
+    """Validate a mobile number and return it normalized (digits, optional
+    leading '+'). Raises serializers.ValidationError on anything that isn't a
+    plausible mobile number. Shared so registration and profile edits agree."""
+    raw = (value or '').strip()
+    if not raw:
+        raise serializers.ValidationError("Mobile number is required.")
+    # Keep a single leading '+' plus digits; drop spaces, dashes, parens.
+    cleaned = re.sub(r'[\s\-().]', '', raw)
+    plus = cleaned.startswith('+')
+    digits = cleaned[1:] if plus else cleaned
+    if not digits.isdigit():
+        raise serializers.ValidationError("Enter a valid mobile number.")
+    if not (7 <= len(digits) <= 15):
+        raise serializers.ValidationError("Enter a valid mobile number.")
+    return ('+' + digits) if plus else digits
 
 
 class UserRegistrationSerializer(serializers.ModelSerializer):
@@ -17,11 +39,16 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
         write_only=True,
         style={'input_type': 'password'}
     )
-    phone = serializers.CharField(required=False, allow_blank=True, max_length=20)
+    # Mobile number is mandatory at sign-up and validated below.
+    phone = serializers.CharField(required=True, allow_blank=False, max_length=20)
+    # A 6-digit sign-in PIN is set at registration, so the account can MPIN-login
+    # immediately. Stored hashed via the profile's set_mpin (same mechanism as
+    # the MPIN login/reset flow).
+    mpin = serializers.CharField(required=True, write_only=True, max_length=6)
 
     class Meta:
         model = User
-        fields = ('id', 'username', 'email', 'first_name', 'last_name', 'phone', 'password', 'password_confirm', 'date_joined')
+        fields = ('id', 'username', 'email', 'first_name', 'last_name', 'phone', 'mpin', 'password', 'password_confirm', 'date_joined')
         read_only_fields = ('id', 'date_joined')
 
     def validate_username(self, value):
@@ -39,6 +66,17 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
         if User.objects.filter(email=value).exists():
             raise serializers.ValidationError("A user with this email already exists.")
         return value
+
+    def validate_phone(self, value):
+        """Mobile number is mandatory and must look like a real number."""
+        return normalize_phone(value)
+
+    def validate_mpin(self, value):
+        """A 6-digit, non-trivial PIN (same rules as the MPIN login/reset flow)."""
+        err = validate_mpin(value)
+        if err:
+            raise serializers.ValidationError(err)
+        return str(value).strip()
 
     def validate(self, data):
         """
@@ -67,6 +105,7 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
         """
         validated_data.pop('password_confirm')  # Remove password_confirm from data
         phone = validated_data.pop('phone', '')
+        mpin = validated_data.pop('mpin')
 
         user = User.objects.create_user(
             username=validated_data['username'],
@@ -75,14 +114,13 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
             first_name=validated_data.get('first_name', ''),
             last_name=validated_data.get('last_name', '')
         )
-        if phone:
-            # The post_save signal already created the profile (best-effort).
-            try:
-                profile = user.profile
-                profile.phone = phone.strip()
-                profile.save(update_fields=['phone'])
-            except Exception:
-                pass  # profile store unavailable — registration still succeeds
+        # The post_save signal already created the profile (best-effort). Store
+        # the mandatory phone and set the sign-in PIN so the account can
+        # MPIN-login right after registering.
+        profile, _ = UserProfile.objects.get_or_create(user=user)
+        profile.phone = phone.strip()
+        profile.save(update_fields=['phone'])
+        profile.set_mpin(mpin)
         return user
 
 
