@@ -7,11 +7,13 @@ from django_filters.rest_framework import DjangoFilterBackend
 from django.db.models import Sum, Count, Q
 from django.utils import timezone
 from django.core.exceptions import ObjectDoesNotExist
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from decimal import Decimal, InvalidOperation
+import calendar
 import django_filters
 
 from .models import Expense, ExpenseCategory, ExpenseSplit, ExpenseTag, Person, SplitGroup, RecurringRule, Notification, notify
+from .net_spending import net_spending
 from .serializers import (
     ExpenseSerializer, ExpenseCreateSerializer, ExpenseListSerializer,
     ExpenseCategorySerializer, ExpenseTagSerializer, ExpenseSummarySerializer,
@@ -111,7 +113,7 @@ class ExpenseViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         """Only the authenticated user's expenses."""
-        return Expense.objects.filter(user=self.request.user)
+        return Expense.objects.filter(user=self.request.user).prefetch_related('splits')
 
     def get_serializer_class(self):
         """Return appropriate serializer based on action"""
@@ -127,7 +129,12 @@ class ExpenseViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'])
     def summary(self, request):
-        """Get expense summary statistics for the authenticated user."""
+        """Expense summary — spending is the user's own share only.
+
+        Expenses (and the category breakdown / net balance built on them) use
+        net_spending, so lending is not counted as spent. Income/debt/credit are
+        unaffected.
+        """
         queryset = self.get_queryset()
 
         # Date range filter
@@ -139,33 +146,28 @@ class ExpenseViewSet(viewsets.ModelViewSet):
         if date_to:
             queryset = queryset.filter(date__lte=date_to)
 
-        # Calculate totals by transaction type
+        # Income/debt/credit are unaffected by splitting; expenses use your share.
         totals = queryset.aggregate(
-            total_expenses=Sum('amount', filter=Q(transaction_type='expense')),
             total_income=Sum('amount', filter=Q(transaction_type='income')),
             total_debt=Sum('amount', filter=Q(transaction_type='debt')),
             total_credit=Sum('amount', filter=Q(transaction_type='credit'))
         )
 
-        # Calculate net balance
+        ns = net_spending(request.user, date_from, date_to)
+        expense_total = ns['total']
+
+        # Calculate net balance on your true spend
         income_total = totals.get('total_income') or 0
         credit_total = totals.get('total_credit') or 0
-        expense_total = totals.get('total_expenses') or 0
         debt_total = totals.get('total_debt') or 0
 
-        net_balance = (income_total + credit_total) - (expense_total + debt_total)
+        net_balance = (float(income_total) + float(credit_total)) - (expense_total + float(debt_total))
 
-        # Category breakdown for expenses
-        category_breakdown = {}
-        expense_categories = queryset.filter(transaction_type='expense').values(
-            'category__name'
-        ).annotate(total=Sum('amount')).order_by('-total')
-
-        for cat in expense_categories:
-            category_breakdown[cat['category__name']] = cat['total']
+        # Category breakdown for expenses — share-only, keyed by name as before
+        category_breakdown = {c['category__name']: c['total'] for c in ns['category_totals']}
 
         summary_data = {
-            'total_expenses': totals.get('total_expenses') or 0,
+            'total_expenses': expense_total,
             'total_income': totals.get('total_income') or 0,
             'total_debt': totals.get('total_debt') or 0,
             'total_credit': totals.get('total_credit') or 0,
@@ -222,38 +224,27 @@ class ExpenseViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'])
     def monthly_report(self, request):
-        """Get monthly expense report for the authenticated user."""
+        """Monthly expense report — spending is the user's own share only.
+
+        Split bills contribute your share, not the full amount: money others owe
+        you is netted out and your share of bills someone else paid is added in.
+        See expenses.net_spending for the exact rule.
+        """
         user = request.user
-        year = request.query_params.get('year', timezone.now().year)
-        month = request.query_params.get('month', timezone.now().month)
+        year = int(request.query_params.get('year', timezone.now().year))
+        month = int(request.query_params.get('month', timezone.now().month))
 
-        monthly_expenses = self.get_queryset().filter(
-            date__year=year,
-            date__month=month
-        )
-
-        # Group by day
-        daily_totals = monthly_expenses.values('date').annotate(
-            total=Sum('amount'),
-            count=Count('id')
-        ).order_by('date')
-
-        # Calculate monthly totals by category. category__id is included so the
-        # client can drill from a category into its actual transactions.
-        category_totals = monthly_expenses.values(
-            'category__id', 'category__name', 'category__color'
-        ).annotate(
-            total=Sum('amount'),
-            count=Count('id')
-        ).order_by('-total')
+        first = date(year, month, 1)
+        last = date(year, month, calendar.monthrange(year, month)[1])
+        ns = net_spending(user, first, last)
 
         report_data = {
-            'year': int(year),
-            'month': int(month),
-            'daily_totals': daily_totals,
-            'category_totals': category_totals,
-            'total_amount': monthly_expenses.aggregate(total=Sum('amount'))['total'] or 0,
-            'total_count': monthly_expenses.count()
+            'year': year,
+            'month': month,
+            'daily_totals': ns['daily_totals'],
+            'category_totals': ns['category_totals'],
+            'total_amount': ns['total'],
+            'total_count': ns['count'],
         }
 
         return Response(report_data)

@@ -63,7 +63,26 @@ class ExpenseTagSerializer(serializers.ModelSerializer):
         return value
 
 
-class ExpenseListSerializer(serializers.ModelSerializer):
+class SplitShareMixin(serializers.Serializer):
+    """Adds your_share / owed_to_you to an expense.
+
+    owed_to_you is what your split participants owe on this bill; your_share is
+    the remainder you actually spent. On an unsplit expense your_share == amount
+    and owed_to_you == 0.
+    """
+    your_share = serializers.SerializerMethodField()
+    owed_to_you = serializers.SerializerMethodField()
+
+    def get_your_share(self, obj):
+        from .net_spending import expense_share_fields
+        return expense_share_fields(obj)[0]
+
+    def get_owed_to_you(self, obj):
+        from .net_spending import expense_share_fields
+        return expense_share_fields(obj)[1]
+
+
+class ExpenseListSerializer(SplitShareMixin, serializers.ModelSerializer):
     """Serializer for listing expenses with summary data"""
     category = ExpenseCategorySerializer(read_only=True)
     tags = ExpenseTagSerializer(many=True, read_only=True)
@@ -75,6 +94,7 @@ class ExpenseListSerializer(serializers.ModelSerializer):
         model = Expense
         fields = ['id', 'amount', 'amount_display', 'transaction_type', 'category',
                  'description', 'date', 'tags', 'is_recent', 'balance_effect',
+                 'your_share', 'owed_to_you',
                  'created_at', 'updated_at']
         read_only_fields = ['id', 'created_at', 'updated_at']
 
@@ -146,7 +166,7 @@ class ExpenseCreateSerializer(serializers.ModelSerializer):
         return expense
 
 
-class ExpenseSerializer(serializers.ModelSerializer):
+class ExpenseSerializer(SplitShareMixin, serializers.ModelSerializer):
     """Full serializer for Expense CRUD operations with nested data"""
     category = ExpenseCategorySerializer(read_only=True)
     tags = ExpenseTagSerializer(many=True, read_only=True)
@@ -171,6 +191,7 @@ class ExpenseSerializer(serializers.ModelSerializer):
                  'related_expense', 'lender_borrower', 'receipt_image', 'location',
                  'payment_method', 'is_recurring', 'recurring_interval',
                  'is_recent', 'is_debt_related', 'balance_effect',
+                 'your_share', 'owed_to_you',
                  'created_at', 'updated_at']
         read_only_fields = ['id', 'user', 'created_at', 'updated_at']
 
