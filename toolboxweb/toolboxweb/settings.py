@@ -47,6 +47,7 @@ INSTALLED_APPS = [
     "health",
     "insights",
     "llm",
+    "telegrambot",
 ]
 
 MIDDLEWARE = [
@@ -236,6 +237,27 @@ ANTHROPIC_MAX_TOKENS = int(os.environ.get('ANTHROPIC_MAX_TOKENS', '8000'))
 #   export OPENROUTER_API_KEY="sk-or-v1-..."
 OPENROUTER_API_KEY = os.environ.get('OPENROUTER_API_KEY', '')
 OPENROUTER_MODEL = os.environ.get('OPENROUTER_MODEL', 'openrouter/free')
+
+# ── Telegram bot (telegrambot app) ───────────────────────────────────────────
+# The bot runs as a webhook inside this web app, so it's up whenever the backend
+# is up — no separate long-polling process to keep alive (which is why the old
+# standalone script kept going down on PythonAnywhere). Set these in the
+# environment (PythonAnywhere: in ~/.bashrc *and* in the WSGI file); never
+# commit the token.
+#
+#   TELEGRAM_BOT_TOKEN        BotFather token for the bot
+#   TELEGRAM_WEBHOOK_SECRET   any long random string; it's the secret in the
+#                             webhook URL path and the setWebhook secret_token
+#   TELEGRAM_WEBHOOK_BASE_URL public https origin, e.g.
+#                             https://toolbox.pythonanywhere.com (used by the
+#                             set_telegram_webhook command)
+#
+# After setting them, register the webhook once:  python manage.py set_telegram_webhook
+TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+TELEGRAM_WEBHOOK_SECRET = os.environ.get('TELEGRAM_WEBHOOK_SECRET', '')
+TELEGRAM_WEBHOOK_BASE_URL = os.environ.get(
+    'TELEGRAM_WEBHOOK_BASE_URL', 'https://toolbox.pythonanywhere.com'
+)
 
 # ── Password-reset email (Gmail SMTP) ────────────────────────────────────────
 # Where the reset link points (the frontend origin, no trailing slash). MUST be
