@@ -1,6 +1,10 @@
 __pycache__/
 *.pyc
 
+# Database — NEVER track; git reset --hard on a deploy target wipes production data
+*.sqlite3
+db.sqlite3
+
 # Local secrets / env — never commit
 telegram.env
 .env
