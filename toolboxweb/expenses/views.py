@@ -113,8 +113,17 @@ class ExpenseViewSet(viewsets.ModelViewSet):
     search_fields = ['description', 'location', 'payment_method']
 
     def get_queryset(self):
-        """Only the authenticated user's expenses."""
-        return Expense.objects.filter(user=self.request.user).prefetch_related('splits')
+        """Only the authenticated user's expenses.
+
+        split_only bills (money fronted purely to collect from others) live only
+        in Splits — kept out of the list and every spending aggregate, but still
+        reachable by id for retrieve/update/delete so the Splits page can flip one
+        into a real expense ("add to expenses").
+        """
+        qs = Expense.objects.filter(user=self.request.user).prefetch_related('splits')
+        if self.action not in ('retrieve', 'update', 'partial_update', 'destroy'):
+            qs = qs.exclude(split_only=True)
+        return qs
 
     def get_serializer_class(self):
         """Return appropriate serializer based on action"""
@@ -516,10 +525,13 @@ class ExpenseViewSet(viewsets.ModelViewSet):
                 {'transaction_type': 'expense', 'category_name': data.get('category_name') or 'Shared'})
 
         expense_date = _coerce_date_value(data.get('date')) or timezone.now().date()
+        # add_to_expenses=False → the bill is a pure collection: it stays in
+        # Splits and never touches the user's expense list / spending totals.
+        add_to_expenses = bool(data.get('add_to_expenses', True))
         expense = Expense.objects.create(
             user=user, amount=amount, transaction_type='expense',
             category=category, description=description, date=expense_date,
-            group=group,
+            group=group, split_only=not add_to_expenses,
         )
         # Anyone split with inside a group belongs to it from then on, so the
         # membership list can't drift from who actually shares the bills.

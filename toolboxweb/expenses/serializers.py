@@ -94,7 +94,7 @@ class ExpenseListSerializer(SplitShareMixin, serializers.ModelSerializer):
         model = Expense
         fields = ['id', 'amount', 'amount_display', 'transaction_type', 'category',
                  'description', 'date', 'tags', 'is_recent', 'balance_effect',
-                 'your_share', 'owed_to_you',
+                 'your_share', 'owed_to_you', 'split_only',
                  'created_at', 'updated_at']
         read_only_fields = ['id', 'created_at', 'updated_at']
 
@@ -191,7 +191,7 @@ class ExpenseSerializer(SplitShareMixin, serializers.ModelSerializer):
                  'related_expense', 'lender_borrower', 'receipt_image', 'location',
                  'payment_method', 'is_recurring', 'recurring_interval',
                  'is_recent', 'is_debt_related', 'balance_effect',
-                 'your_share', 'owed_to_you',
+                 'your_share', 'owed_to_you', 'split_only',
                  'created_at', 'updated_at']
         read_only_fields = ['id', 'user', 'created_at', 'updated_at']
 
@@ -275,10 +275,13 @@ class ExpenseSplitSerializer(serializers.ModelSerializer):
     date = serializers.DateField(source='expense.date', read_only=True)
     expense_total = serializers.DecimalField(
         source='expense.amount', max_digits=10, decimal_places=2, read_only=True)
+    # True when this bill is collection-only (not in the payer's expenses); the
+    # Splits page uses it to offer "add to expenses".
+    expense_split_only = serializers.BooleanField(source='expense.split_only', read_only=True)
 
     class Meta:
         model = ExpenseSplit
-        fields = ['id', 'expense', 'expense_total', 'person', 'person_name', 'paid_by',
+        fields = ['id', 'expense', 'expense_total', 'expense_split_only', 'person', 'person_name', 'paid_by',
                   'description', 'date', 'amount', 'is_settled', 'settled_at']
         read_only_fields = fields
 

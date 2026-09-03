@@ -45,12 +45,16 @@ def net_spending(user, date_from=None, date_to=None):
     ``category_totals`` omits categories that net to nothing (e.g. a pure loan),
     and both totals are clamped at zero so a fully-lent bill never reads negative.
     """
-    own = Expense.objects.filter(user=user, transaction_type="expense")
+    # split_only bills are pure collections (a receivable), never the user's own
+    # spend — excluded here so they don't affect any spending total or breakdown.
+    own = Expense.objects.filter(user=user, transaction_type="expense").exclude(split_only=True)
     own = _apply_dates(own, date_from, date_to)
 
-    # money others owe you, on expenses you paid — subtract (lent, not spent)
+    # money others owe you, on expenses you paid — subtract (lent, not spent).
+    # Skip split_only expenses: they aren't in `own`, so their owed side must not
+    # be subtracted either (or the total would go negative).
     owed = ExpenseSplit.objects.filter(
-        expense__user=user, expense__transaction_type="expense"
+        expense__user=user, expense__transaction_type="expense", expense__split_only=False,
     )
     owed = _apply_dates(owed, date_from, date_to, field="expense__date")
 
