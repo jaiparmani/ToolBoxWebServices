@@ -19,10 +19,7 @@ jobs:
     with:
       pa_working_dir: /home/toolbox/toolboxservices
       pa_domain: toolbox.pythonanywhere.com
-      # Migrating from the deploy is off again: enabling it turned a green
-      # deploy red (6f458e3), and a broken pipeline is worse than the problem
-      # it solved. The migrate output in that run's log will say whether the
-      # command itself failed or the failure detection was too eager.
-      # pa_migrate_dir: /home/toolbox/toolboxservices/toolboxservices
-      # pa_python: python3.12
+      # Temporarily enabled to apply expenses 0008+0009 (split_only, paid_by_person).
+      pa_migrate_dir: /home/toolbox/toolboxservices/toolboxservices
+      pa_python: python3.12
     secrets: inherit
