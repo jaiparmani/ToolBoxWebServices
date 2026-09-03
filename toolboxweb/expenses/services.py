@@ -73,10 +73,16 @@ SYSTEM_PROMPT = (
     "\n"
     + _TAG_RULES + "\n"
     "\n"
+    "The note may say WHEN it happened, often relatively (\"yesterday\", \"2 days ago\", "
+    "\"last friday\", \"on the 3rd\"). Resolve it to a real calendar date in YYYY-MM-DD "
+    "against the \"Today is ...\" date given in the user message; use null when the note "
+    "gives no time at all (the caller then treats it as today). Never return a future date.\n"
+    "\n"
     "Respond with ONLY a single JSON object - no markdown fences, no commentary - with "
     "exactly these keys: \"amount\" (positive number), \"transaction_type\" (one of "
     "\"expense\", \"income\", \"debt\", \"credit\"), \"description\" (short string), "
-    "\"category_name\" (string), \"tags\" (array of 0-3 short lowercase strings)."
+    "\"category_name\" (string), \"date\" (YYYY-MM-DD or null), "
+    "\"tags\" (array of 0-3 short lowercase strings)."
 )
 
 BATCH_SYSTEM_PROMPT = (
@@ -266,6 +272,7 @@ def parse_expense_text(text, known_tags=()):
         raise ExpenseParseNotPossible("No text provided.")
 
     user_content = (
+        f"Today is {date.today().isoformat()}.\n"
         f"Existing categories: {json.dumps(_category_context())}\n"
         f"Existing tags: {json.dumps(list(known_tags))}\n\n"
         f"Note: \"{text}\""
@@ -274,7 +281,7 @@ def parse_expense_text(text, known_tags=()):
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_content},
     ]
-    return _translate_errors(
+    result = _translate_errors(
         call_json,
         messages,
         validate=_validate_item,
@@ -283,9 +290,13 @@ def parse_expense_text(text, known_tags=()):
             "That was not usable. Reply with ONLY a JSON object, no prose and no code "
             "fences, with exactly these keys: amount (positive number), transaction_type "
             "(one of \"expense\", \"income\", \"debt\", \"credit\"), description (string), "
-            "category_name (string)."
+            "category_name (string), date (YYYY-MM-DD or null)."
         ),
     )
+    # Resolve the model's date to a real date (or None → caller uses today).
+    if isinstance(result, dict):
+        result['date'] = _coerce_date(result.get('date'))
+    return result
 
 
 def parse_expense_batch(text, known_tags=()):

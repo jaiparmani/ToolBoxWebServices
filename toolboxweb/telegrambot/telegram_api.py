@@ -69,3 +69,22 @@ def send_message(chat_id, text, parse_mode=None, disable_preview=True):
 
 def send_chat_action(chat_id, action="typing"):
     return call("sendChatAction", {"chat_id": chat_id, "action": action})
+
+
+def notify_user(user, text, parse_mode=None):
+    """Push a message to a user's linked Telegram chat, if they have one.
+
+    Used to reach a person outside the request/response loop — e.g. telling the
+    other party a split was added against them. A no-op when the user has no
+    Telegram link or the bot isn't configured, and never raises (a notification
+    failure must not break the action that triggered it).
+    """
+    if user is None or not is_configured():
+        return
+    try:
+        from .models import TelegramLink
+        link = TelegramLink.objects.filter(user=user).first()
+        if link:
+            send_message(link.chat_id, text, parse_mode=parse_mode)
+    except Exception:  # pragma: no cover - best-effort side channel
+        logger.exception("notify_user failed")

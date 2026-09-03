@@ -20,9 +20,14 @@ logger = logging.getLogger(__name__)
 
 WELCOME = (
     "I log your money and answer questions about it — the same AI as the app.\n\n"
-    "<b>Log</b>\n"
+    "<b>Log an expense</b>\n"
     "  20 vada pav 100 chai      - logs both\n"
+    "  had 250 lunch yesterday    - dates work too\n"
     "  /import  (then paste a chat log in the next message)\n\n"
+    "<b>Split a bill</b>\n"
+    "  /split 1200 dinner with raj and mira\n"
+    "  (or just: split 1200 dinner with raj) — everyone you split with who\n"
+    "  has linked Telegram gets pinged.\n\n"
     "<b>Analyse your spending</b>\n"
     "  /ask how much on food last month\n"
     "  /ask where did my money go this month\n"
@@ -30,6 +35,8 @@ WELCOME = (
     "<b>Lending &amp; splits</b>\n"
     "  /lending who owes me the most?\n"
     "  /lending how much do I owe raj?\n\n"
+    "<b>Other</b>\n"
+    "  /help          - show this again\n\n"
     "You can also just ask a question in plain text — if it looks like a "
     "question I'll answer it instead of logging it.\n\n"
     "Spending figures count only your own share: money others owe you on a "
@@ -271,6 +278,42 @@ def looks_like_analysis_question(text):
     if t.endswith("?"):
         return True
     return t.startswith(_ANALYSIS_STARTERS)
+
+
+def handle_split(user, text):
+    """Split a bill from chat: 'split 1200 dinner with raj and mira'.
+
+    Runs the same split_add action the app uses (LLM parses who/how much), so
+    shares and people resolve identically. Anyone you split with who has linked
+    Telegram gets pinged automatically (see expenses.views).
+    """
+    text = (text or "").strip()
+    if not text:
+        return "Tell me the split, e.g. /split 1200 dinner with raj and mira", None
+
+    ok, data = _call_expense_action("split_add", user, {"text": text})
+    if not ok:
+        return data, None
+
+    expense = data.get("expense") or {}
+    splits = data.get("splits") or []
+    who = ", ".join(
+        f"{html.escape(str(s.get('person_name') or 'someone'))} {_rupees(s.get('amount'))}"
+        for s in splits
+    ) or "them"
+    lines = [
+        f"Split logged: <b>{_rupees(expense.get('amount'))}</b> "
+        f"{html.escape(str(expense.get('description', '')))}",
+        f"Your share <b>{_rupees(data.get('your_share'))}</b> · "
+        f"you're owed {_rupees(data.get('owed_to_you'))} from {who}",
+    ]
+    return "\n".join(lines), "HTML"
+
+
+def looks_like_split(text):
+    """True for 'split 1200 dinner with raj' — a split typed without the command."""
+    t = (text or "").strip().lower()
+    return t.startswith("split ") and " with " in t
 
 
 def handle_import(link):
