@@ -182,11 +182,27 @@ def _handle_update(update):
         send_chat_action(chat_id)
         reply, mode = handlers.handle_ask(user, args)
         return send_message(chat_id, reply, parse_mode=mode)
+    if command in ("/review", "/insight", "/spending"):
+        send_chat_action(chat_id)
+        reply, mode = handlers.handle_review(user)
+        return send_message(chat_id, reply, parse_mode=mode)
+    if command == "/lending":
+        send_chat_action(chat_id)
+        reply, mode = handlers.handle_lending(user, args)
+        return send_message(chat_id, reply, parse_mode=mode)
     if command == "/import":
         reply, mode = handlers.handle_import(link)
         return send_message(chat_id, reply, parse_mode=mode)
     if command.startswith("/"):
         return send_message(chat_id, "Unknown command. Send /help.")
+
+    # Plain text that reads as a spending question is answered, not logged — so a
+    # user doesn't have to remember /ask. A leading number or a paste is still a
+    # transaction to log (see looks_like_analysis_question).
+    if not link.awaiting_import and handlers.looks_like_analysis_question(text):
+        send_chat_action(chat_id)
+        reply, mode = handlers.handle_ask(user, text)
+        return send_message(chat_id, reply, parse_mode=mode)
 
     # Plain text → log it.
     send_chat_action(chat_id)

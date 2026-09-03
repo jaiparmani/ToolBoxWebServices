@@ -175,12 +175,38 @@ def _run_search(user, question):
             applied['search'] = applied.get('search') or category_name
     qs = ExpenseFilter(applied, queryset=qs).qs
     totals = qs.aggregate(total=Sum('amount'), count=Count('id'))
+    gross_total = float(totals['total'] or 0)
+
+    # Spending is your own share only: money others owe you on these bills is
+    # lending, not spending. Net it out so the assistant agrees with the summary
+    # / monthly_report views (see expenses.net_spending). Splits only exist on
+    # expenses, so income/debt/credit questions are unaffected.
+    from .net_spending import owed_to_you_total
+    owed_to_you = float(owed_to_you_total(qs))
+    net_total = gross_total - owed_to_you
+    if net_total < 0:
+        net_total = 0.0
+
     return {
         'interpretation': parsed['interpretation'],
-        'total': float(totals['total'] or 0),
+        'total': net_total,
+        'gross_total': gross_total,
+        'owed_to_you': owed_to_you,
         'count': totals['count'] or 0,
         'results': ExpenseListSerializer(qs.order_by('-date')[:20], many=True).data,
     }
+
+
+def spending_review(user):
+    """The spending review the in-app AI produces for 'review my spending'.
+
+    A thin public wrapper over the same insight path (explain_spending), so other
+    surfaces — the Telegram bot's /review — get the identical analysis without
+    reaching into a private helper or re-running the router. Returns the typed
+    insight dict (or a plain 'answer' dict when there is nothing to analyse), and
+    raises the same ExpenseParse* errors the router paths raise.
+    """
+    return _run_insight(user, 'expense', "Here's how your spending looks.")
 
 
 def _run_insight(user, scope, reply):
