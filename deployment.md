@@ -1,0 +1,2 @@
+1. git pull on the console - https://www.pythonanywhere.com/user/jaiparmani/consoles/42834159/
+2. Reload web server at - https://www.pythonanywhere.com/user/jaiparmani/webapps/#tab_id_jaiparmani_pythonanywhere_com

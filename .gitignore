@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+
+# Local secrets / env — never commit
+telegram.env
+.env
+.env.*
+*.env.local
+telegrambottoken.txt
+toolboxtoken.txt
+api_key.txt
