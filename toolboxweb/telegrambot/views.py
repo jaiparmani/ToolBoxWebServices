@@ -20,13 +20,68 @@ from django.conf import settings
 from django.http import HttpResponse, HttpResponseForbidden, JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 
+from rest_framework import status
 from rest_framework.authtoken.models import Token
+from rest_framework.decorators import api_view, permission_classes
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
 
 from . import handlers
 from .models import TelegramLink
 from .telegram_api import send_chat_action, send_message
 
 logger = logging.getLogger(__name__)
+
+
+def _link_state(user):
+    """Serialise the signed-in user's Telegram link for the settings screen."""
+    link = TelegramLink.objects.filter(user=user).first()
+    if not link:
+        return {"linked": False, "telegram_id": None, "username": ""}
+    return {"linked": True, "telegram_id": link.chat_id, "username": link.username}
+
+
+@api_view(["GET", "POST", "DELETE"])
+@permission_classes([IsAuthenticated])
+def telegram_link(request):
+    """Link/unlink the signed-in ToolBox account to a Telegram chat from Settings.
+
+    GET    -> current link state.
+    POST   {telegram_id} -> link this account to that Telegram chat id (for a
+             private chat, the chat id is the same as the user's Telegram id).
+             The bot replies with this id when an unlinked chat messages it.
+    DELETE -> unlink.
+
+    A telegram id already tied to a *different* account is rejected, so one
+    person can't silently redirect another's chat to their books.
+    """
+    if request.method == "GET":
+        return Response(_link_state(request.user))
+
+    if request.method == "DELETE":
+        TelegramLink.objects.filter(user=request.user).delete()
+        return Response(_link_state(request.user))
+
+    raw = request.data.get("telegram_id")
+    try:
+        chat_id = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return Response(
+            {"error": "Enter your numeric Telegram ID (message the bot and it will reply with it)."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    clash = TelegramLink.objects.filter(chat_id=chat_id).exclude(user=request.user).first()
+    if clash is not None:
+        return Response(
+            {"error": "That Telegram ID is already linked to another account."},
+            status=status.HTTP_409_CONFLICT,
+        )
+
+    TelegramLink.objects.update_or_create(
+        user=request.user, defaults={"chat_id": chat_id},
+    )
+    return Response(_link_state(request.user))
 
 
 def _secret_ok(request, secret):
@@ -106,9 +161,15 @@ def _handle_update(update):
 
     link = _link_for_chat(chat_id)
     if link is None:
-        if command in ("/start", "/help"):
-            return send_message(chat_id, handlers.LINK_HELP)
-        return send_message(chat_id, handlers.LINK_HELP)
+        # Unlinked: tell them their Telegram id so they can paste it into
+        # Money OS → Settings → Connect Telegram (or link with a token here).
+        help_text = (
+            "👋 Let's connect your account.\n\n"
+            f"Your Telegram ID: {chat_id}\n\n"
+            "Open Money OS → Settings → Connect Telegram and paste this ID.\n\n"
+            "(Or send /link <your ToolBox API token>.)"
+        )
+        return send_message(chat_id, help_text)
 
     user = link.user
 
