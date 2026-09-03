@@ -438,6 +438,69 @@ def parse_search_query(question):
 
 
 # --------------------------------------------------------------------------
+# Lending Q&A — answer a question about splits/lending, grounded in real figures.
+# Kept separate from spending analysis on purpose: this reasons ONLY over who
+# owes whom, never over what the user spent.
+# --------------------------------------------------------------------------
+
+LENDING_SYSTEM_PROMPT = (
+    "You answer a person's questions about their lending and borrowing — money "
+    "split with friends. You are given a JSON summary of their splits: who owes "
+    "them, who they owe, per-person balances, settled vs unsettled amounts, and "
+    "recent split activity. All amounts are in Indian rupees (₹).\n"
+    "\n"
+    "Answer ONLY from the figures provided. Never invent a number, a name or a "
+    "date that is not in the data. Quote the actual amounts and people involved. "
+    "If the data does not contain what was asked, say so plainly.\n"
+    "\n"
+    "This is about lending, not spending — do not comment on the person's overall "
+    "spending or budgets. Be direct and concrete; 1-4 short sentences is plenty.\n"
+    "\n"
+    "Respond with ONLY a JSON object: {\"answer\": \"...\"} — no prose outside it, "
+    "no code fences."
+)
+
+
+def _validate_lending_answer(parsed):
+    if not isinstance(parsed, dict):
+        raise LLMError("The model did not return a JSON object.")
+    answer = parsed.get('answer')
+    if not isinstance(answer, str) or not answer.strip():
+        raise LLMError("The model's response has no \"answer\" string.")
+    return answer.strip()
+
+
+def answer_lending_question(question, context):
+    """Answer a lending/splits question from a pre-computed context dict.
+
+    ``context`` is the deterministic lending summary built by the view (totals,
+    per-person balances, recent splits) — the model only phrases an answer over
+    figures we computed, so it can't get the arithmetic wrong. Returns the answer
+    string. Raises the same ExpenseParse* errors as the other parsers.
+    """
+    question = (question or '').strip()
+    if not question:
+        raise ExpenseParseNotPossible("No question provided.")
+
+    user_content = (
+        f"Today's date is {date.today().isoformat()}.\n"
+        f"Lending summary:\n{json.dumps(context, indent=2, default=str)}\n\n"
+        f"Question: \"{question}\""
+    )
+    messages = [
+        {"role": "system", "content": LENDING_SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
+    return _translate_errors(
+        call_json, messages, validate=_validate_lending_answer, expect_key='answer',
+        retry_instruction=(
+            "That was not usable. Reply with ONLY a JSON object shaped "
+            "{\"answer\": \"...\"}, no prose and no code fences."
+        ),
+    )
+
+
+# --------------------------------------------------------------------------
 # "Can I afford it?" - pull an amount and a date out of a plain question.
 #
 # The maths is done against the projection in Python; the model only reads the

@@ -13,7 +13,7 @@ import calendar
 import django_filters
 
 from .models import Expense, ExpenseCategory, ExpenseSplit, ExpenseTag, Person, SplitGroup, RecurringRule, Notification, notify
-from .net_spending import net_spending
+from .net_spending import net_spending, owed_to_you_total, ZERO
 from .serializers import (
     ExpenseSerializer, ExpenseCreateSerializer, ExpenseListSerializer,
     ExpenseCategorySerializer, ExpenseTagSerializer, ExpenseSummarySerializer,
@@ -23,6 +23,7 @@ from .serializers import (
 from .services import (
     compute_shares,
     ExpenseParseError, ExpenseParseNotPossible, ExpenseParseRateLimited,
+    answer_lending_question,
     parse_expense_batch, parse_expense_text, parse_search_query, parse_split_text,
     validate_supplied_items,
 )
@@ -694,14 +695,155 @@ class ExpenseViewSet(viewsets.ModelViewSet):
         queryset = ExpenseFilter(applied, queryset=queryset).qs
 
         totals = queryset.aggregate(total=Sum('amount'), count=Count('id'))
+        gross_total = totals['total'] or 0
+
+        # Spending is your own share only: money others owe you on these bills is
+        # lending, not spending. Net it out so 'how much did I spend' agrees with
+        # the summary/monthly_report views (see expenses.net_spending). Splits
+        # only exist on expenses, so income/debt/credit questions are unaffected.
+        owed_to_you = owed_to_you_total(queryset)
+        net_total = gross_total - owed_to_you
+        if net_total < 0:
+            net_total = 0
+
         serializer = ExpenseListSerializer(queryset.order_by('-date')[:50], many=True)
         return Response({
             'question': question.strip(),
             'interpretation': parsed['interpretation'],
             'filters': filters,
-            'total': totals['total'] or 0,
+            'total': net_total,
+            'gross_total': gross_total,
+            'owed_to_you': owed_to_you,
             'count': totals['count'] or 0,
             'results': serializer.data,
+        })
+
+    @staticmethod
+    def _lending_context(user):
+        """A deterministic summary of the user's lending/splits for the LLM.
+
+        Built from the same ExpenseSplit rows the splits/balances view reads, from
+        both ends: a split is 'owed to you' for the person who paid, and 'you owe'
+        for the account a person is linked to. Nothing about spending is included —
+        this is strictly the lending ledger.
+        """
+        # Money owed TO you, by person, split settled vs unsettled.
+        owed_rows = (ExpenseSplit.objects
+                     .filter(expense__user=user)
+                     .values('person__name', 'is_settled')
+                     .annotate(total=Sum('amount'), items=Count('id')))
+        by_person = {}
+        for r in owed_rows:
+            name = r['person__name']
+            slot = by_person.setdefault(name, {
+                'name': name, 'unsettled': ZERO, 'unsettled_count': 0,
+                'settled': ZERO, 'lifetime': ZERO,
+            })
+            amt = r['total'] or ZERO
+            slot['lifetime'] += amt
+            if r['is_settled']:
+                slot['settled'] += amt
+            else:
+                slot['unsettled'] += amt
+                slot['unsettled_count'] += r['items']
+        people_who_owe_you = sorted(
+            ({'name': p['name'],
+              'owed_unsettled': float(p['unsettled']),
+              'unsettled_count': p['unsettled_count'],
+              'settled_total': float(p['settled']),
+              'lifetime_total': float(p['lifetime'])}
+             for p in by_person.values()),
+            key=lambda p: -p['owed_unsettled'])
+
+        # Money YOU owe: splits pointing at you, on bills someone else paid.
+        debt_rows = (ExpenseSplit.objects
+                     .filter(person__linked_user=user, is_settled=False)
+                     .exclude(expense__user=user)
+                     .values('expense__user__username')
+                     .annotate(total=Sum('amount'), items=Count('id')))
+        you_owe = sorted(
+            ({'name': d['expense__user__username'],
+              'owed_unsettled': float(d['total'] or ZERO),
+              'unsettled_count': d['items']}
+             for d in debt_rows),
+            key=lambda d: -d['owed_unsettled'])
+
+        total_owed_to_you = sum((p['owed_unsettled'] for p in people_who_owe_you), 0.0)
+        total_you_owe = sum((d['owed_unsettled'] for d in you_owe), 0.0)
+
+        # Recent split activity, both directions, newest first — for "over time".
+        recent = (ExpenseSplit.objects
+                  .filter(Q(expense__user=user) | Q(person__linked_user=user))
+                  .select_related('expense', 'person', 'expense__user')
+                  .order_by('-expense__date', '-created_at')[:30])
+        recent_splits = []
+        for s in recent:
+            you_paid = s.expense.user_id == user.id
+            recent_splits.append({
+                'date': s.expense.date.isoformat(),
+                'description': s.expense.description,
+                'amount': float(s.amount),
+                'direction': 'owed_to_you' if you_paid else 'you_owe',
+                'counterparty': s.person.name if you_paid else s.expense.user.username,
+                'settled': s.is_settled,
+            })
+
+        return {
+            'currency': 'INR',
+            'totals': {
+                'owed_to_you_unsettled': round(total_owed_to_you, 2),
+                'you_owe_unsettled': round(total_you_owe, 2),
+                'net_position': round(total_owed_to_you - total_you_owe, 2),
+            },
+            'people_who_owe_you': people_who_owe_you,
+            'you_owe': you_owe,
+            'recent_splits': recent_splits,
+        }
+
+    @action(detail=False, methods=['post'])
+    def ask_lending(self, request):
+        """Answer a question about the user's LENDING/splits only.
+
+        Body: {"question": "who owes me the most?"}
+        Returns: {"answer": "..."} plus the raw totals used.
+
+        Distinct from `ask` (which analyses spending): this reasons strictly over
+        ExpenseSplit rows — who owes you, what you owe, per-person balances,
+        settled vs unsettled, over time. The figures are computed here; the model
+        only phrases them, mirroring the auth/error handling of `ask`.
+        """
+        user, error = self._resolve_user(request)
+        if error:
+            return error
+
+        question = request.data.get('question', '')
+        if not question or not question.strip():
+            return Response({'error': 'question is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        context = self._lending_context(user)
+
+        # Nothing to reason over — answer without spending a model call.
+        if not context['people_who_owe_you'] and not context['you_owe']:
+            return Response({
+                'question': question.strip(),
+                'answer': "You have no lending activity yet — no splits where "
+                          "someone owes you or you owe them.",
+                'totals': context['totals'],
+            })
+
+        try:
+            answer = answer_lending_question(question, context)
+        except ExpenseParseNotPossible as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except ExpenseParseRateLimited as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_429_TOO_MANY_REQUESTS)
+        except ExpenseParseError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+
+        return Response({
+            'question': question.strip(),
+            'answer': answer,
+            'totals': context['totals'],
         })
 
     @action(detail=True, methods=['post'])

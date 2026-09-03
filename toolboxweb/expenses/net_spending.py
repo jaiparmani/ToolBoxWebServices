@@ -132,6 +132,23 @@ def net_spending(user, date_from=None, date_to=None):
     }
 
 
+def owed_to_you_total(expense_qs):
+    """What your split participants owe on the expenses in ``expense_qs``.
+
+    This is money you laid out and will get back — lending, not spending. Netting
+    it out of a raw ``Sum('amount')`` gives your true spend on a filtered set of
+    expenses (the same rule ``net_spending`` applies over a date window, here
+    applied to an arbitrary queryset so the ``ask``/search paths agree with it).
+
+    Splits only exist on expense rows, so this returns zero for income/debt/credit
+    filters and never over-subtracts.
+    """
+    owed = ExpenseSplit.objects.filter(
+        expense__in=expense_qs, expense__transaction_type="expense"
+    ).aggregate(t=Sum("amount"))["t"]
+    return owed or ZERO
+
+
 def expense_share_fields(expense):
     """(your_share, owed_to_you) for a single expense you own, as floats.
 
