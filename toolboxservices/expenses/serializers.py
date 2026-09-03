@@ -89,12 +89,13 @@ class ExpenseListSerializer(SplitShareMixin, serializers.ModelSerializer):
     amount_display = serializers.CharField(read_only=True)
     is_recent = serializers.BooleanField(read_only=True)
     balance_effect = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
+    paid_by_person_name = serializers.CharField(source='paid_by_person.name', read_only=True, default=None)
 
     class Meta:
         model = Expense
         fields = ['id', 'amount', 'amount_display', 'transaction_type', 'category',
                  'description', 'date', 'tags', 'is_recent', 'balance_effect',
-                 'your_share', 'owed_to_you',
+                 'your_share', 'owed_to_you', 'split_only', 'paid_by_person', 'paid_by_person_name',
                  'created_at', 'updated_at']
         read_only_fields = ['id', 'created_at', 'updated_at']
 
@@ -174,6 +175,7 @@ class ExpenseSerializer(SplitShareMixin, serializers.ModelSerializer):
     is_recent = serializers.BooleanField(read_only=True)
     is_debt_related = serializers.BooleanField(read_only=True)
     balance_effect = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
+    paid_by_person_name = serializers.CharField(source='paid_by_person.name', read_only=True, default=None)
 
     # Write fields
     category_id = serializers.IntegerField(write_only=True, required=False)
@@ -191,7 +193,7 @@ class ExpenseSerializer(SplitShareMixin, serializers.ModelSerializer):
                  'related_expense', 'lender_borrower', 'receipt_image', 'location',
                  'payment_method', 'is_recurring', 'recurring_interval',
                  'is_recent', 'is_debt_related', 'balance_effect',
-                 'your_share', 'owed_to_you',
+                 'your_share', 'owed_to_you', 'split_only', 'paid_by_person', 'paid_by_person_name',
                  'created_at', 'updated_at']
         read_only_fields = ['id', 'user', 'created_at', 'updated_at']
 
@@ -270,17 +272,36 @@ class PersonSerializer(serializers.ModelSerializer):
 class ExpenseSplitSerializer(serializers.ModelSerializer):
     """One person's share of one expense, with enough of the expense to read it."""
     person_name = serializers.CharField(source='person.name', read_only=True)
-    paid_by = serializers.CharField(source='expense.user.username', read_only=True)
+    paid_by = serializers.SerializerMethodField()
     description = serializers.CharField(source='expense.description', read_only=True)
     date = serializers.DateField(source='expense.date', read_only=True)
     expense_total = serializers.DecimalField(
         source='expense.amount', max_digits=10, decimal_places=2, read_only=True)
+    expense_split_only = serializers.BooleanField(source='expense.split_only', read_only=True)
 
     class Meta:
         model = ExpenseSplit
-        fields = ['id', 'expense', 'expense_total', 'person', 'person_name', 'paid_by',
+        fields = ['id', 'expense', 'expense_total', 'expense_split_only', 'person', 'person_name', 'paid_by',
                   'description', 'date', 'amount', 'is_settled', 'settled_at']
         read_only_fields = fields
+
+    def get_paid_by(self, obj):
+        if obj.expense.paid_by_person_id:
+            return obj.expense.paid_by_person.name
+        return obj.expense.user.username
+
+
+class ExpenseSplitUpdateSerializer(serializers.ModelSerializer):
+    """Writable serializer for updating a split's amount."""
+
+    class Meta:
+        model = ExpenseSplit
+        fields = ['amount']
+
+    def validate_amount(self, value):
+        if value <= 0:
+            raise serializers.ValidationError('Amount must be greater than zero.')
+        return value
 
 
 class SplitGroupSerializer(serializers.ModelSerializer):

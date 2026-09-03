@@ -619,26 +619,25 @@ def parse_afford_query(question):
 SPLIT_SYSTEM_PROMPT = (
     "You read a note about a shared expense and report who it was shared with.\n"
     "\n"
-    "The person writing paid the bill. List the OTHER people it was split with, by "
-    "name, in \"people\". Do not include the writer themselves - no \"me\", \"myself\" or "
-    "their own name. Reuse a spelling from the known people list when it plainly refers "
+    "By default the person writing paid the bill. List the OTHER people it was "
+    "split with, by name, in \"people\". Do not include the writer themselves.\n"
+    "\n"
+    "If the note says someone ELSE paid (\"raj paid\", \"paid by priya\", "
+    "\"priya got this\"), set \"paid_by\" to that person's name. That person "
+    "should still appear in \"people\" (they are a participant). When no one "
+    "else is named as the payer, omit \"paid_by\" (the writer paid).\n"
+    "\n"
+    "Reuse a spelling from the known people list when it plainly refers "
     "to the same person, so \"raj\" and \"Raj\" don't become two people.\n"
     "\n"
     "Set \"split_with_me\" to true when the writer is one of the people sharing the cost, "
     "and false only when they clearly just paid on someone else's behalf. Sharing is by "
-    "far the common case: a meal, a cab or a trip described as being \"with\" someone was "
-    "used by the writer too. Read \"for\" plus another person's possession as paying on "
-    "their behalf.\n"
+    "far the common case.\n"
     "\n"
-    "  \"split 1200 dinner with raj and priya\" -> people [raj, priya], split_with_me true "
-    "(three ways, 400 each)\n"
-    "  \"1000 cab with raj and priya\"         -> people [raj, priya], split_with_me true "
-    "(three ways)\n"
-    "  \"900 lunch with raj\"                  -> people [raj], split_with_me true "
-    "(two ways, 450 each)\n"
-    "  \"paid 500 for raj's ticket\"           -> people [raj], split_with_me false "
-    "(raj owes all 500)\n"
-    "  \"lent priya 300\"                      -> people [priya], split_with_me false\n"
+    "  \"split 1200 dinner with raj and priya\"       -> people [raj, priya], split_with_me true\n"
+    "  \"900 lunch with raj, raj paid\"                -> people [raj], split_with_me true, paid_by \"raj\"\n"
+    "  \"1000 cab with raj and priya, priya paid\"     -> people [raj, priya], split_with_me true, paid_by \"priya\"\n"
+    "  \"paid 500 for raj's ticket\"                   -> people [raj], split_with_me false\n"
     "\n"
     "If the note gives explicit amounts per person, put them in \"shares\" as an object "
     "mapping name to number. Otherwise omit shares and the cost will be divided equally.\n"
@@ -648,7 +647,8 @@ SPLIT_SYSTEM_PROMPT = (
     "Respond with ONLY a JSON object - no prose, no code fences - with these keys: "
     "\"amount\" (the full bill, positive number), \"description\" (short string), "
     "\"category_name\" (string), \"people\" (array of names), \"split_with_me\" (boolean), "
-    "and optionally \"shares\" (object of name to number)."
+    "optionally \"shares\" (object of name to number), and optionally \"paid_by\" "
+    "(string, only when someone other than the writer paid)."
 )
 
 
@@ -694,6 +694,13 @@ def _validate_split(parsed):
     parsed['shares'] = shares if isinstance(shares, dict) else None
     parsed['transaction_type'] = 'expense'
     parsed['tags'] = _clean_tags(parsed.get('tags'))
+
+    paid_by = parsed.get('paid_by')
+    if isinstance(paid_by, str) and paid_by.strip() and paid_by.strip().lower() not in {'me', 'myself', 'i'}:
+        parsed['paid_by'] = paid_by.strip()
+    else:
+        parsed['paid_by'] = None
+
     return parsed
 
 
