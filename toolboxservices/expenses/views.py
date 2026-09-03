@@ -298,7 +298,9 @@ class ExpenseViewSet(viewsets.ModelViewSet):
             transaction_type=parsed['transaction_type'],
             category=self._resolve_category(parsed),
             description=parsed['description'],
-            date=timezone.now().date(),
+            # The parser resolves relative dates ("yesterday", "last friday");
+            # falls back to today when the note carries no date.
+            date=parsed.get('date') or timezone.now().date(),
         )
         expense.tags.set(self._resolve_tags(user, parsed.get('tags')))
 
@@ -541,12 +543,19 @@ class ExpenseViewSet(viewsets.ModelViewSet):
                f"{expense.description} — ₹{expense.amount}. You're owed ₹{owed_total} from {who}.",
                kind='split', link='/splits')
         creator_name = (expense.user.get_full_name() or expense.user.username).strip()
+        from telegrambot.telegram_api import notify_user as _tg_notify
         for s in splits:
             if s.person.linked_user and s.amount:
                 notify(s.person.linked_user,
                        f"{creator_name} split a bill with you",
                        f"{expense.description} — you owe ₹{s.amount}.",
                        kind='split', link='/splits')
+                # Also ping them on Telegram if they've linked it.
+                _tg_notify(
+                    s.person.linked_user,
+                    f"💸 {creator_name} split \"{expense.description}\" (₹{expense.amount}) with you "
+                    f"— you owe ₹{s.amount}. Open Money OS → Splits to settle.",
+                )
 
         return Response({
             'expense': ExpenseSerializer(expense).data,
@@ -635,12 +644,19 @@ class ExpenseViewSet(viewsets.ModelViewSet):
                f"{expense.description} — ₹{expense.amount}. You're owed ₹{owed_total} from {who}.",
                kind='split', link='/splits')
         creator_name = (expense.user.get_full_name() or expense.user.username).strip()
+        from telegrambot.telegram_api import notify_user as _tg_notify
         for s in splits:
             if s.person.linked_user and s.amount:
                 notify(s.person.linked_user,
                        f"{creator_name} split a bill with you",
                        f"{expense.description} — you owe ₹{s.amount}.",
                        kind='split', link='/splits')
+                # Also ping them on Telegram if they've linked it.
+                _tg_notify(
+                    s.person.linked_user,
+                    f"💸 {creator_name} split \"{expense.description}\" (₹{expense.amount}) with you "
+                    f"— you owe ₹{s.amount}. Open Money OS → Splits to settle.",
+                )
 
         return Response({
             'expense': ExpenseSerializer(expense).data,

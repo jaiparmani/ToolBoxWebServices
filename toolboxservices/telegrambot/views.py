@@ -190,6 +190,10 @@ def _handle_update(update):
         send_chat_action(chat_id)
         reply, mode = handlers.handle_lending(user, args)
         return send_message(chat_id, reply, parse_mode=mode)
+    if command == "/split":
+        send_chat_action(chat_id)
+        reply, mode = handlers.handle_split(user, args)
+        return send_message(chat_id, reply, parse_mode=mode)
     if command == "/import":
         reply, mode = handlers.handle_import(link)
         return send_message(chat_id, reply, parse_mode=mode)
@@ -202,6 +206,12 @@ def _handle_update(update):
     if not link.awaiting_import and handlers.looks_like_analysis_question(text):
         send_chat_action(chat_id)
         reply, mode = handlers.handle_ask(user, text)
+        return send_message(chat_id, reply, parse_mode=mode)
+
+    # "split 1200 dinner with raj and mira" → a split, without the slash command.
+    if not link.awaiting_import and handlers.looks_like_split(text):
+        send_chat_action(chat_id)
+        reply, mode = handlers.handle_split(user, text)
         return send_message(chat_id, reply, parse_mode=mode)
 
     # Plain text → log it.
