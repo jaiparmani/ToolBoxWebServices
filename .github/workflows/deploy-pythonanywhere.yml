@@ -20,6 +20,6 @@ jobs:
       pa_working_dir: /home/toolbox/toolboxservices
       pa_domain: toolbox.pythonanywhere.com
       # Temporarily enabled to apply expenses 0008+0009 (split_only, paid_by_person).
-      pa_migrate_dir: /home/toolbox/toolboxservices/toolboxservices
+      pa_migrate_dir: /home/toolbox/toolboxservices
       pa_python: python3.12
     secrets: inherit
