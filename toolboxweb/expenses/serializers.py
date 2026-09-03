@@ -291,6 +291,19 @@ class ExpenseSplitSerializer(serializers.ModelSerializer):
         return obj.expense.user.username
 
 
+class ExpenseSplitUpdateSerializer(serializers.ModelSerializer):
+    """Writable serializer for updating a split's amount."""
+
+    class Meta:
+        model = ExpenseSplit
+        fields = ['amount']
+
+    def validate_amount(self, value):
+        if value <= 0:
+            raise serializers.ValidationError('Amount must be greater than zero.')
+        return value
+
+
 class SplitGroupSerializer(serializers.ModelSerializer):
     """A group, with enough about its members to render a list without a second call."""
     members = PersonSerializer(many=True, read_only=True)

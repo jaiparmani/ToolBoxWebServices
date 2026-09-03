@@ -17,7 +17,7 @@ from .net_spending import net_spending, owed_to_you_total, ZERO
 from .serializers import (
     ExpenseSerializer, ExpenseCreateSerializer, ExpenseListSerializer,
     ExpenseCategorySerializer, ExpenseTagSerializer, ExpenseSummarySerializer,
-    ExpenseSplitSerializer, PersonSerializer, SplitGroupSerializer, RecurringRuleSerializer,
+    ExpenseSplitSerializer, ExpenseSplitUpdateSerializer, PersonSerializer, SplitGroupSerializer, RecurringRuleSerializer,
     CopilotCardSerializer
 )
 from .services import (
@@ -947,6 +947,19 @@ def _resolve_split_user(request):
     return request.user, None
 
 
+
+def _split_party_users(expense, exclude=None):
+    """Every user involved in an expense's splits: the expense owner and all
+    persons with linked accounts. Optionally exclude one user (the actor)."""
+    users = {expense.user}
+    for s in expense.splits.select_related('person__linked_user').all():
+        if s.person.linked_user_id:
+            users.add(s.person.linked_user)
+    if exclude:
+        users.discard(exclude)
+    return users
+
+
 class PersonViewSet(viewsets.ModelViewSet):
     """People the user splits expenses with."""
     serializer_class = PersonSerializer
@@ -993,23 +1006,128 @@ class PersonViewSet(viewsets.ModelViewSet):
         ])
 
 
-class SplitViewSet(viewsets.ReadOnlyModelViewSet):
+class SplitViewSet(viewsets.ModelViewSet):
     """Shared expenses: what each person owes, and settling up."""
     serializer_class = ExpenseSplitSerializer
     pagination_class = StandardResultsSetPagination
+
+
+    def get_serializer_class(self):
+        if self.action in ('update', 'partial_update'):
+            return ExpenseSplitUpdateSerializer
+        return ExpenseSplitSerializer
+
+    def update(self, request, *args, **kwargs):
+        """Use the write serializer for validation, but return the full read
+        serializer so the client gets all the nested expense fields back."""
+        partial = kwargs.pop('partial', False)
+        instance = self.get_object()
+        serializer = self.get_serializer(instance, data=request.data, partial=partial)
+        serializer.is_valid(raise_exception=True)
+        self.perform_update(serializer)
+        # Re-fetch to pick up the updated expense total.
+        instance.refresh_from_db()
+        return Response(ExpenseSplitSerializer(instance).data)
 
     def get_queryset(self):
         uid = self.request.user.id
         # Splits you are party to, whichever end you are on.
         queryset = ExpenseSplit.objects.filter(
             Q(expense__user_id=uid) | Q(person__linked_user_id=uid)
-        ).select_related('person', 'expense')
+        ).select_related('person', 'expense', 'person__linked_user',
+                         'expense__user', 'expense__paid_by_person')
         if self.request.GET.get('settled') == 'false':
             queryset = queryset.filter(is_settled=False)
         person = self.request.GET.get('person')
         if person:
             queryset = queryset.filter(person_id=person)
         return queryset
+
+    def create(self, request, *args, **kwargs):
+        """Splits are created through the expense split endpoints."""
+        return Response(
+            {'detail': 'Splits are created through the expense split endpoints.'},
+            status=status.HTTP_405_METHOD_NOT_ALLOWED)
+
+    def perform_update(self, serializer):
+        """Update a split amount and adjust the parent expense total."""
+        split = serializer.instance
+        old_amount = split.amount
+        new_amount = serializer.validated_data['amount']
+
+        serializer.save()
+
+        # Adjust the parent expense total by the difference, so the owner's
+        # implicit share stays the same.
+        expense = split.expense
+        delta = new_amount - old_amount
+        expense.amount = expense.amount + delta
+        expense.save(update_fields=['amount', 'updated_at'])
+
+        # Notify everyone involved
+        actor = self.request.user
+        actor_name = (actor.get_full_name() or actor.username).strip()
+        description = expense.description
+        body = (f"{split.person.name}'s share for \"{description}\" "
+                f"changed from \u20b9{old_amount} to \u20b9{new_amount}.")
+
+        try:
+            from telegrambot.telegram_api import notify_user as _tg_notify
+        except Exception:
+            _tg_notify = None
+
+        for user in _split_party_users(expense, exclude=actor):
+            notify(user, f'{actor_name} edited a split', body,
+                   kind='split', link='/splits')
+            if _tg_notify:
+                try:
+                    _tg_notify(user,
+                               f"\u270f\ufe0f {actor_name} edited a split: "
+                               f"{split.person.name}'s share for \"{description}\" "
+                               f"\u20b9{old_amount} \u2192 \u20b9{new_amount}.")
+                except Exception:
+                    pass
+
+    def perform_destroy(self, instance):
+        """Delete a split, adjust or remove the parent expense, and notify."""
+        expense = instance.expense
+        person_name = instance.person.name
+        old_amount = instance.amount
+        description = expense.description
+
+        # Gather parties before the delete removes relationships.
+        actor = self.request.user
+        actor_name = (actor.get_full_name() or actor.username).strip()
+        parties = _split_party_users(expense, exclude=actor)
+
+        instance.delete()
+
+        # If no splits remain, delete the parent expense entirely.
+        remaining = expense.splits.count()
+        if remaining == 0:
+            expense.delete()
+        else:
+            expense.amount = expense.amount - old_amount
+            expense.save(update_fields=['amount', 'updated_at'])
+
+        body = (f"{person_name}'s split for \"{description}\" "
+                f"(\u20b9{old_amount}) was removed.")
+
+        try:
+            from telegrambot.telegram_api import notify_user as _tg_notify
+        except Exception:
+            _tg_notify = None
+
+        for user in parties:
+            notify(user, f'{actor_name} removed a split', body,
+                   kind='split', link='/splits')
+            if _tg_notify:
+                try:
+                    _tg_notify(user,
+                               f"\U0001f5d1 {actor_name} removed a split: "
+                               f"{person_name}'s \u20b9{old_amount} for \"{description}\".")
+                except Exception:
+                    pass
 
     @action(detail=False, methods=['get'])
     def balances(self, request):
