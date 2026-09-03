@@ -92,6 +92,15 @@ class Expense(models.Model):
     # flips it on from the Splits page ("add to expenses").
     split_only = models.BooleanField(default=False)
 
+    # Who actually fronted the money. null = the logged-in user paid (the
+    # default and the only option before this field existed). When set to a
+    # Person, the split semantics stay the same but the UI shows "Paid by
+    # <name>" instead of "Paid by you".
+    paid_by_person = models.ForeignKey(
+        'Person', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='paid_expenses',
+    )
+
     # Recurring transactions
     is_recurring = models.BooleanField(default=False)
     recurring_interval = models.CharField(max_length=20, blank=True, null=True)  # daily, weekly, monthly, yearly

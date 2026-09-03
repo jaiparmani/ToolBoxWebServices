@@ -525,16 +525,28 @@ class ExpenseViewSet(viewsets.ModelViewSet):
                 {'transaction_type': 'expense', 'category_name': data.get('category_name') or 'Shared'})
 
         expense_date = _coerce_date_value(data.get('date')) or timezone.now().date()
-        # add_to_expenses=False → the bill is a pure collection: it stays in
-        # Splits and never touches the user's expense list / spending totals.
         add_to_expenses = bool(data.get('add_to_expenses', True))
+
+        # "Who paid?" — resolve to a Person when someone other than the
+        # creator fronted the bill. Accepts person_id or a plain name.
+        paid_by_person = None
+        paid_by_raw = data.get('paid_by')
+        if paid_by_raw:
+            if isinstance(paid_by_raw, int) or (isinstance(paid_by_raw, str) and paid_by_raw.isdigit()):
+                paid_by_person = Person.objects.filter(id=int(paid_by_raw), user=user).first()
+            else:
+                paid_by_person = Person.objects.filter(user=user, name__iexact=str(paid_by_raw)).first()
+                if not paid_by_person:
+                    paid_by_person = Person.objects.create(
+                        user=user, name=str(paid_by_raw).strip(),
+                        linked_user=match_account(str(paid_by_raw).strip()))
+
         expense = Expense.objects.create(
             user=user, amount=amount, transaction_type='expense',
             category=category, description=description, date=expense_date,
             group=group, split_only=not add_to_expenses,
+            paid_by_person=paid_by_person,
         )
-        # Anyone split with inside a group belongs to it from then on, so the
-        # membership list can't drift from who actually shares the bills.
         if group:
             group.members.add(*resolved)
 
@@ -548,24 +560,23 @@ class ExpenseViewSet(viewsets.ModelViewSet):
 
         owed_total = sum(s.amount for s in splits)
 
-        # Notify: a record for you, and a heads-up in the feed of anyone you
-        # split with who has an account here.
         who = ', '.join(s.person.name for s in splits) or 'someone'
+        payer_label = paid_by_person.name if paid_by_person else 'You'
         notify(expense.user, 'Split added',
-               f"{expense.description} — ₹{expense.amount}. You're owed ₹{owed_total} from {who}.",
+               f"{expense.description} — ₹{expense.amount} (paid by {payer_label}). Owed ₹{owed_total} from {who}.",
                kind='split', link='/splits')
         creator_name = (expense.user.get_full_name() or expense.user.username).strip()
         from telegrambot.telegram_api import notify_user as _tg_notify
         for s in splits:
             if s.person.linked_user and s.amount:
+                paid_note = f" (paid by {paid_by_person.name})" if paid_by_person else ""
                 notify(s.person.linked_user,
                        f"{creator_name} split a bill with you",
-                       f"{expense.description} — you owe ₹{s.amount}.",
+                       f"{expense.description}{paid_note} — you owe ₹{s.amount}.",
                        kind='split', link='/splits')
-                # Also ping them on Telegram if they've linked it.
                 _tg_notify(
                     s.person.linked_user,
-                    f"💸 {creator_name} split \"{expense.description}\" (₹{expense.amount}) with you "
+                    f"💸 {creator_name} split \"{expense.description}\" (₹{expense.amount}){paid_note} with you "
                     f"— you owe ₹{s.amount}. Open Money OS → Splits to settle.",
                 )
 
@@ -614,6 +625,15 @@ class ExpenseViewSet(viewsets.ModelViewSet):
         except ExpenseParseError as exc:
             return Response({'error': str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
 
+        paid_by_person = None
+        paid_by_name = parsed.get('paid_by')
+        if paid_by_name:
+            paid_by_person = Person.objects.filter(user=user, name__iexact=paid_by_name).first()
+            if not paid_by_person:
+                paid_by_person = Person.objects.create(
+                    user=user, name=paid_by_name,
+                    linked_user=match_account(paid_by_name))
+
         expense = Expense.objects.create(
             user=user,
             amount=parsed['amount'],
@@ -622,21 +642,17 @@ class ExpenseViewSet(viewsets.ModelViewSet):
             description=parsed['description'],
             date=timezone.now().date(),
             group=group,
+            paid_by_person=paid_by_person,
         )
         expense.tags.set(self._resolve_tags(user, parsed.get('tags')))
 
         splits = []
         for name, share in parsed['owed'].items():
-            # Match an existing person case-insensitively so "raj" and "Raj"
-            # stay one balance rather than two.
             person = Person.objects.filter(user=user, name__iexact=name).first()
             if not person:
-                # Link to an account with this username when there is one, so the
-                # split appears in their panel too.
                 person = Person.objects.create(user=user, name=name,
                                                linked_user=match_account(name))
             elif person.linked_user_id is None:
-                # A person added before they had an account picks the link up now.
                 account = match_account(person.name)
                 if account:
                     person.linked_user = account
@@ -649,24 +665,23 @@ class ExpenseViewSet(viewsets.ModelViewSet):
 
         owed_total = sum(s.amount for s in splits)
 
-        # Notify: a record for you, and a heads-up in the feed of anyone you
-        # split with who has an account here.
         who = ', '.join(s.person.name for s in splits) or 'someone'
+        payer_label = paid_by_person.name if paid_by_person else 'You'
         notify(expense.user, 'Split added',
-               f"{expense.description} — ₹{expense.amount}. You're owed ₹{owed_total} from {who}.",
+               f"{expense.description} — ₹{expense.amount} (paid by {payer_label}). Owed ₹{owed_total} from {who}.",
                kind='split', link='/splits')
         creator_name = (expense.user.get_full_name() or expense.user.username).strip()
         from telegrambot.telegram_api import notify_user as _tg_notify
         for s in splits:
             if s.person.linked_user and s.amount:
+                paid_note = f" (paid by {paid_by_person.name})" if paid_by_person else ""
                 notify(s.person.linked_user,
                        f"{creator_name} split a bill with you",
-                       f"{expense.description} — you owe ₹{s.amount}.",
+                       f"{expense.description}{paid_note} — you owe ₹{s.amount}.",
                        kind='split', link='/splits')
-                # Also ping them on Telegram if they've linked it.
                 _tg_notify(
                     s.person.linked_user,
-                    f"💸 {creator_name} split \"{expense.description}\" (₹{expense.amount}) with you "
+                    f"💸 {creator_name} split \"{expense.description}\" (₹{expense.amount}){paid_note} with you "
                     f"— you owe ₹{s.amount}. Open Money OS → Splits to settle.",
                 )
 
