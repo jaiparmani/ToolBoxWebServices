@@ -155,6 +155,7 @@ REST_FRAMEWORK = {
     # authenticated (and start enforcing CSRF on the frontend's writes).
     'DEFAULT_AUTHENTICATION_CLASSES': [
         'rest_framework.authentication.TokenAuthentication',
+        'users.authentication.ApiKeyAuthentication',
     ],
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
     'PAGE_SIZE': 20,

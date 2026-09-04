@@ -454,6 +454,53 @@ class MpinResetConfirmView(APIView):
                          'user': _user_payload(user)}, status=status.HTTP_200_OK)
 
 
+class ShortcutAPIKeyListCreateView(APIView):
+    """List the caller's shortcut API keys (masked) or create a new one.
+
+    POST returns the full key exactly once — subsequent GETs only show the
+    masked version, so the user must copy it at creation time.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from .models import ShortcutAPIKey
+        keys = ShortcutAPIKey.objects.filter(user=request.user)
+        return Response([
+            {
+                'id': k.id,
+                'masked': k.masked,
+                'label': k.label,
+                'created_at': k.created_at.isoformat(),
+                'last_used_at': k.last_used_at.isoformat() if k.last_used_at else None,
+            }
+            for k in keys
+        ])
+
+    def post(self, request):
+        from .models import ShortcutAPIKey
+        label = (request.data.get('label') or '').strip()[:120]
+        obj, raw_key = ShortcutAPIKey.generate(request.user, label=label)
+        return Response({
+            'id': obj.id,
+            'key': raw_key,
+            'masked': obj.masked,
+            'label': obj.label,
+            'created_at': obj.created_at.isoformat(),
+        }, status=status.HTTP_201_CREATED)
+
+
+class ShortcutAPIKeyDeleteView(APIView):
+    """Revoke (delete) one of the caller's API keys."""
+    permission_classes = [IsAuthenticated]
+
+    def delete(self, request, pk):
+        from .models import ShortcutAPIKey
+        deleted, _ = ShortcutAPIKey.objects.filter(id=pk, user=request.user).delete()
+        if not deleted:
+            return Response({'error': 'Key not found.'}, status=status.HTTP_404_NOT_FOUND)
+        return Response({'detail': 'Key revoked.'}, status=status.HTTP_200_OK)
+
+
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def get_csrf_token(request):
