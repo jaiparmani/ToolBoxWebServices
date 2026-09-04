@@ -454,6 +454,47 @@ class MpinResetConfirmView(APIView):
                          'user': _user_payload(user)}, status=status.HTTP_200_OK)
 
 
+class ShortcutAPIKeyListCreateView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from .models import ShortcutAPIKey
+        keys = ShortcutAPIKey.objects.filter(user=request.user)
+        return Response([
+            {
+                'id': k.id,
+                'masked': k.masked,
+                'label': k.label,
+                'created_at': k.created_at.isoformat(),
+                'last_used_at': k.last_used_at.isoformat() if k.last_used_at else None,
+            }
+            for k in keys
+        ])
+
+    def post(self, request):
+        from .models import ShortcutAPIKey
+        label = (request.data.get('label') or '').strip()[:120]
+        obj, raw = ShortcutAPIKey.generate(request.user, label=label)
+        return Response({
+            'id': obj.id,
+            'key': raw,
+            'masked': obj.masked,
+            'label': obj.label,
+            'created_at': obj.created_at.isoformat(),
+        }, status=status.HTTP_201_CREATED)
+
+
+class ShortcutAPIKeyDeleteView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def delete(self, request, pk):
+        from .models import ShortcutAPIKey
+        deleted, _ = ShortcutAPIKey.objects.filter(pk=pk, user=request.user).delete()
+        if not deleted:
+            return Response({'error': 'Key not found.'}, status=status.HTTP_404_NOT_FOUND)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def get_csrf_token(request):

@@ -101,6 +101,43 @@ def ensure_profile(sender, instance, created, **kwargs):
         except Exception:
             pass
 
+class ShortcutAPIKey(models.Model):
+    KEY_LENGTH = 48
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
+        related_name='shortcut_api_keys',
+    )
+    key = models.CharField(max_length=56, unique=True, db_index=True)
+    label = models.CharField(max_length=120, blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+    last_used_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"APIKey {self.prefix} ({self.label or 'unlabeled'}) for {self.user_id}"
+
+    @property
+    def prefix(self):
+        return self.key[:12] if self.key else ''
+
+    @property
+    def masked(self):
+        return f"{self.key[:12]}…{self.key[-4:]}" if self.key else ''
+
+    @classmethod
+    def generate(cls, user, label=''):
+        raw = f"tbk_{secrets.token_hex(cls.KEY_LENGTH // 2)}"
+        obj = cls.objects.create(user=user, key=raw, label=label)
+        return obj, raw
+
+    def touch(self):
+        self.last_used_at = timezone.now()
+        self.save(update_fields=['last_used_at'])
+
+
 OTP_TTL_MINUTES = 10       # how long a code stays usable
 OTP_MAX_ATTEMPTS = 5       # wrong guesses before a code is burned
 OTP_RESEND_SECONDS = 30    # throttle: don't email a fresh code more often than this
