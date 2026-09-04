@@ -21,6 +21,6 @@ jobs:
       pa_domain: toolbox.pythonanywhere.com
       # Migrate on deploy: enable when new migrations need to run on PA, then
       # turn off again once they've been applied.
-      pa_migrate_dir: /home/toolbox/toolboxservices
-      pa_python: python3.12
+      # pa_migrate_dir: /home/toolbox/toolboxservices
+      # pa_python: python3.12
     secrets: inherit
