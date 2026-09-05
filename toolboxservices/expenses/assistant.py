@@ -104,10 +104,13 @@ def _draft_from_parsed(p):
 def run(user, message):
     """Classify the message and hand it to the right tool. Returns a typed dict.
 
-    Read intents (search/insight) resolve inline; write intents come back as a
-    preview to confirm. If a tool can't make sense of the message it degrades to
-    a plain answer rather than erroring.
+    Write intents (expense/batch/split) are saved immediately and the response
+    includes the saved ids so the frontend can offer a delete/undo button. Read
+    intents resolve inline. If a tool can't make sense of the message it
+    degrades to a plain answer rather than erroring.
     """
+    from .serializers import ExpenseSerializer
+
     message = (message or '').strip()
     if not message:
         raise ExpenseParseNotPossible("Say something and I'll help.")
@@ -118,24 +121,36 @@ def run(user, message):
     try:
         if intent == 'add_expense':
             p = parse_expense_text(message, known_tags=known_tag_names(user))
-            return {'type': 'expense_preview', 'reply': reply, 'draft': _draft_from_parsed(p)}
+            draft = _draft_from_parsed(p)
+            expense = _create_expense(user, draft)
+            return {'type': 'expense_added', 'reply': reply,
+                    'expense': ExpenseSerializer(expense).data}
 
         if intent == 'add_batch':
             items = parse_expense_batch(message, known_tags=known_tag_names(user))
             if not items:
                 return {'type': 'answer', 'reply': "I couldn't find any transactions in that."}
-            return {'type': 'batch_preview', 'reply': reply,
-                    'drafts': [{**_draft_from_parsed(i), 'date': i.get('date')} for i in items]}
+            from .views import _coerce_date_value
+            created = []
+            for i in items:
+                on = i.get('date')
+                created.append(_create_expense(user, _draft_from_parsed(i),
+                               on_date=_coerce_date_value(on) if on else None))
+            return {'type': 'batch_added', 'reply': reply,
+                    'expenses': [ExpenseSerializer(e).data for e in created],
+                    'count': len(created)}
 
         if intent == 'add_split':
             p = parse_split_text(message, known_people=_known_people(user), known_tags=known_tag_names(user))
             owed = [{'name': n, 'amount': float(a)} for n, a in p['owed'].items()]
             your_share = float(Decimal(str(p['amount'])) - sum((Decimal(str(o['amount'])) for o in owed), Decimal('0')))
-            return {'type': 'split_preview', 'reply': reply, 'split': {
+            split_data = {
                 'amount': float(p['amount']), 'description': p['description'],
                 'category_name': p['category_name'], 'split_with_me': p['split_with_me'],
                 'owed': owed, 'your_share': your_share,
-            }}
+            }
+            result = _create_split(user, split_data)
+            return {'type': 'split_added', 'reply': reply, **result}
 
         if intent == 'search':
             return {'type': 'search', 'reply': reply, **_run_search(user, message)}

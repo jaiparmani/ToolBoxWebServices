@@ -13,7 +13,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.decorators import api_view, permission_classes
 from django.views.decorators.csrf import get_token
-from django.http import JsonResponse
+from django.http import HttpResponse, JsonResponse
 from .serializers import (
     UserRegistrationSerializer,
     UserProfileSerializer,
@@ -493,6 +493,175 @@ class ShortcutAPIKeyDeleteView(APIView):
         if not deleted:
             return Response({'error': 'Key not found.'}, status=status.HTTP_404_NOT_FOUND)
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class ShortcutFileView(APIView):
+    permission_classes = [AllowAny]
+
+    def _authenticate_or_403(self, request):
+        from rest_framework.authtoken.models import Token as DRFToken
+        user = getattr(request, 'user', None)
+        if user and user.is_authenticated:
+            return user
+        token_key = request.query_params.get('token', '')
+        if token_key:
+            try:
+                return DRFToken.objects.select_related('user').get(key=token_key).user
+            except DRFToken.DoesNotExist:
+                pass
+        return None
+
+    SHORTCUTS = {
+        'log-expense': {
+            'name': 'Log Expense',
+            'glyph': 59470,
+            'color': 4282601983,
+            'has_input': True,
+            'prompt': 'What did you spend? (e.g. "50 chai" or "split 200 dinner with raj")',
+        },
+        'review-spending': {
+            'name': 'Review Spending',
+            'glyph': 59493,
+            'color': 463140863,
+            'has_input': False,
+            'message': 'review my spending this month',
+        },
+    }
+
+    def get(self, request, pk, shortcut_type):
+        import plistlib
+        import uuid
+
+        user = self._authenticate_or_403(request)
+        if not user:
+            return Response({'error': 'Authentication required.'}, status=status.HTTP_401_UNAUTHORIZED)
+
+        from .models import ShortcutAPIKey
+        try:
+            api_key = ShortcutAPIKey.objects.get(pk=pk, user=user)
+        except ShortcutAPIKey.DoesNotExist:
+            return Response({'error': 'Key not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        spec = self.SHORTCUTS.get(shortcut_type)
+        if not spec:
+            return Response(
+                {'error': f'Unknown shortcut type. Choose from: {", ".join(self.SHORTCUTS)}'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        auth_value = f"Api-Key {api_key.key}"
+        url = 'https://toolbox.pythonanywhere.com/api/assistant/'
+
+        def _text(s):
+            return {'Value': {'string': s}, 'WFSerializationType': 'WFTextTokenString'}
+
+        def _dict_item(key, value):
+            return {'WFItemType': 0, 'WFKey': _text(key), 'WFValue': _text(value)}
+
+        headers = {
+            'Value': {
+                'WFDictionaryFieldValueItems': [
+                    _dict_item('Authorization', auth_value),
+                    _dict_item('Content-Type', 'application/json'),
+                ]
+            },
+            'WFSerializationType': 'WFDictionaryFieldValue',
+        }
+
+        actions = []
+
+        if spec['has_input']:
+            actions.append({
+                'WFWorkflowActionIdentifier': 'is.workflow.actions.ask',
+                'WFWorkflowActionParameters': {
+                    'WFAskActionDefaultAnswer': '',
+                    'WFAskActionPrompt': spec['prompt'],
+                },
+            })
+            actions.append({
+                'WFWorkflowActionIdentifier': 'is.workflow.actions.setvariable',
+                'WFWorkflowActionParameters': {'WFVariableName': 'ExpenseText'},
+            })
+            message_value = {
+                'Value': {
+                    'attachmentsByRange': {
+                        '{0, 1}': {'Type': 'Variable', 'VariableName': 'ExpenseText'},
+                    },
+                    'string': '￼',
+                },
+                'WFSerializationType': 'WFTextTokenString',
+            }
+        else:
+            message_value = _text(spec['message'])
+
+        body_items = {
+            'Value': {
+                'WFDictionaryFieldValueItems': [
+                    {'WFItemType': 0, 'WFKey': _text('message'), 'WFValue': message_value},
+                ]
+            },
+            'WFSerializationType': 'WFDictionaryFieldValue',
+        }
+
+        actions.append({
+            'WFWorkflowActionIdentifier': 'is.workflow.actions.downloadurl',
+            'WFWorkflowActionParameters': {
+                'WFHTTPBodyType': 'Json',
+                'WFHTTPHeaders': headers,
+                'WFHTTPMethod': 'POST',
+                'WFJSONValues': body_items,
+                'WFURL': url,
+            },
+        })
+
+        output_uuid = str(uuid.uuid4()).upper()
+        actions.append({
+            'WFWorkflowActionIdentifier': 'is.workflow.actions.getvalueforkey',
+            'WFWorkflowActionParameters': {'WFDictionaryKey': 'reply'},
+        })
+        actions.append({
+            'WFWorkflowActionIdentifier': 'is.workflow.actions.showresult',
+            'WFWorkflowActionParameters': {
+                'Text': {
+                    'Value': {
+                        'attachmentsByRange': {
+                            '{0, 1}': {
+                                'OutputName': 'Value',
+                                'OutputUUID': output_uuid,
+                                'Type': 'ActionOutput',
+                            }
+                        },
+                        'string': '￼',
+                    },
+                    'WFSerializationType': 'WFTextTokenString',
+                }
+            },
+        })
+
+        plist = {
+            'WFWorkflowActions': actions,
+            'WFWorkflowClientVersion': '2612.0.4',
+            'WFWorkflowHasOutputFallback': False,
+            'WFWorkflowHasShortcutInputVariables': False,
+            'WFWorkflowIcon': {
+                'WFWorkflowIconGlyphNumber': spec['glyph'],
+                'WFWorkflowIconStartColor': spec['color'],
+            },
+            'WFWorkflowImportQuestions': [],
+            'WFWorkflowInputContentItemClasses': (
+                ['WFStringContentItem'] if spec['has_input'] else []
+            ),
+            'WFWorkflowMinimumClientVersion': 900,
+            'WFWorkflowMinimumClientVersionString': '900',
+            'WFWorkflowOutputContentItemClasses': [],
+            'WFWorkflowTypes': ['NCWidget', 'WatchKit'],
+        }
+
+        data = plistlib.dumps(plist, fmt=plistlib.FMT_BINARY)
+        filename = f"{spec['name']}.shortcut"
+        response = HttpResponse(data, content_type='application/octet-stream')
+        response['Content-Disposition'] = f'attachment; filename="{filename}"'
+        return response
 
 
 @api_view(['GET'])

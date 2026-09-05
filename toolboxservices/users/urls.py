@@ -5,7 +5,7 @@ from .views import (
     PasswordResetRequestView, PasswordResetConfirmView,
     OTPRequestView, OTPVerifyView,
     MpinSetView, MpinLoginView, MpinResetRequestView, MpinResetConfirmView,
-    ShortcutAPIKeyListCreateView, ShortcutAPIKeyDeleteView,
+    ShortcutAPIKeyListCreateView, ShortcutAPIKeyDeleteView, ShortcutFileView,
 )
 
 # Create a router for the UserViewSet
@@ -40,6 +40,7 @@ urlpatterns = [
     # Shortcut API keys (for Apple Shortcuts and headless clients)
     path('api-keys/', ShortcutAPIKeyListCreateView.as_view(), name='shortcut-apikey-list'),
     path('api-keys/<int:pk>/', ShortcutAPIKeyDeleteView.as_view(), name='shortcut-apikey-delete'),
+    path('api-keys/<int:pk>/shortcut/<str:shortcut_type>/', ShortcutFileView.as_view(), name='shortcut-file'),
 
     # CSRF token endpoint
     path('csrf/', get_csrf_token, name='csrf-token'),
