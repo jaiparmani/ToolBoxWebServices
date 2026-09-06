@@ -1392,14 +1392,16 @@ class SplitGroupViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['get'])
     def balances(self, request, pk=None):
-        """What each member owes for this group's expenses only.
+        """What each member owes for this group's expenses.
 
-        The member rows are the owner's reading of the group: who owes them.
-        Somebody looking in from the other side is not a party to what a third
-        member owes, so they get their own row only - enough to answer "what do
-        I still owe into the flat" without turning a group into a way to read
-        other people's balances. ``viewer_is_owner`` tells the client which
-        sentence to write: "still to come back to you", or "you still owe".
+        A group is a shared context - a flat, a trip - so everybody in it reads
+        the same ledger: all members, all outstanding amounts. Joining somebody's
+        flat means seeing what the flat owes, which is the whole point of having
+        the group rather than a pile of one-to-one debts. Membership is still the
+        wall: get_queryset admits only the owner and linked members, so this is
+        never a way to read the balances of a group you are not in.
+        ``viewer_is_owner`` tells the client which sentence to write: "still to
+        come back to you", or "you still owe".
         """
         group = self.get_object()
         viewer_is_owner = group.owner_id == request.user.id
@@ -1411,8 +1413,6 @@ class SplitGroupViewSet(viewsets.ModelViewSet):
         owed = {r['person_id']: r for r in rows}
 
         people = group.members.all()
-        if not viewer_is_owner:
-            people = people.filter(linked_user=request.user)
 
         members = []
         for person in people:
@@ -1435,11 +1435,7 @@ class SplitGroupViewSet(viewsets.ModelViewSet):
                       .exclude(expense__user=request.user)
                       .aggregate(t=Sum('amount'))['t'] or 0)
 
-        if viewer_is_owner:
-            spend = group.expenses.aggregate(total=Sum('amount'), count=Count('id'))
-        else:
-            spend = (group.expenses.filter(splits__person__linked_user=request.user)
-                     .distinct().aggregate(total=Sum('amount'), count=Count('id', distinct=True)))
+        spend = group.expenses.aggregate(total=Sum('amount'), count=Count('id'))
         return Response({
             'group': self.get_serializer(group).data,
             'viewer_is_owner': viewer_is_owner,
@@ -1455,15 +1451,13 @@ class SplitGroupViewSet(viewsets.ModelViewSet):
     def expenses(self, request, pk=None):
         """This group's expenses, most recent first.
 
-        For a member looking in from the other side, only the bills they are
-        actually on: being in somebody's group does not make every bill in it
-        theirs to read.
+        The whole group's bills, for every member - the shared ledger the group
+        exists to provide, not just the rows you happen to be named on.
+        Membership is enforced by get_queryset before this runs.
         """
         group = self.get_object()
-        queryset = group.expenses.select_related('category')
-        if group.owner_id != request.user.id:
-            queryset = queryset.filter(splits__person__linked_user=request.user).distinct()
-        queryset = queryset.order_by('-date', '-created_at')[:50]
+        queryset = (group.expenses.select_related('category')
+                    .order_by('-date', '-created_at')[:50])
         return Response(ExpenseListSerializer(queryset, many=True).data)
 
 

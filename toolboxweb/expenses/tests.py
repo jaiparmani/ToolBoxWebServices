@@ -240,7 +240,9 @@ class GroupVisibilityTests(APITestCase):
         self.group = SplitGroup.objects.create(owner=self.ashok, name='Flat')
         self.jai_person = Person.objects.create(
             user=self.ashok, name='jai', linked_user=self.jai)
-        self.group.members.add(self.jai_person)
+        self.priya_person = Person.objects.create(
+            user=self.ashok, name='priya', linked_user=self.priya)
+        self.group.members.add(self.jai_person, self.priya_person)
 
         expense = Expense.objects.create(
             user=self.ashok, amount=Decimal('900.00'), transaction_type='expense',
@@ -248,6 +250,8 @@ class GroupVisibilityTests(APITestCase):
             group=self.group)
         ExpenseSplit.objects.create(
             expense=expense, person=self.jai_person, amount=Decimal('450.00'))
+        ExpenseSplit.objects.create(
+            expense=expense, person=self.priya_person, amount=Decimal('300.00'))
 
     def auth(self, user):
         self.client.credentials(
@@ -258,20 +262,38 @@ class GroupVisibilityTests(APITestCase):
         groups = self.client.get('/api/expenses/groups/').data
         self.assertEqual([g['name'] for g in groups], ['Flat'])
 
-    def test_member_balances_are_their_own_side_only(self):
+    def test_member_sees_the_whole_group_ledger(self):
+        """A group is a shared context: members read the same ledger as the owner."""
         self.auth(self.jai)
         data = self.client.get(f'/api/expenses/groups/{self.group.id}/balances/').data
         self.assertFalse(data['viewer_is_owner'])
         self.assertEqual(data['owner_username'], 'ashok')
+        # Their own side is still called out separately...
         self.assertEqual(Decimal(data['your_share_outstanding']), Decimal('450.00'))
-        self.assertEqual([m['name'] for m in data['members']], ['jai'])
-        self.assertTrue(data['members'][0]['is_you'])
+        # ...but every member is visible, not just themselves.
+        self.assertEqual(sorted(m['name'] for m in data['members']), ['jai', 'priya'])
+        self.assertEqual(Decimal(data['total_outstanding']), Decimal('750.00'))
+        # The group total, not only the bills they are named on.
+        self.assertEqual(Decimal(data['total_spent']), Decimal('900.00'))
+        you = [m for m in data['members'] if m['is_you']]
+        self.assertEqual([m['name'] for m in you], ['jai'])
+
+    def test_member_sees_every_group_expense(self):
+        """Including a bill they are not personally split on."""
+        Expense.objects.create(
+            user=self.ashok, amount=Decimal('200.00'), transaction_type='expense',
+            category=self.category, description='wifi', date='2026-01-02',
+            group=self.group)
+        self.auth(self.jai)
+        rows = self.client.get(f'/api/expenses/groups/{self.group.id}/expenses/').data
+        self.assertEqual(sorted(r['description'] for r in rows), ['rent', 'wifi'])
+
 
     def test_owner_balances_show_everyone(self):
         self.auth(self.ashok)
         data = self.client.get(f'/api/expenses/groups/{self.group.id}/balances/').data
         self.assertTrue(data['viewer_is_owner'])
-        self.assertEqual(Decimal(data['total_outstanding']), Decimal('450.00'))
+        self.assertEqual(Decimal(data['total_outstanding']), Decimal('750.00'))
         self.assertEqual(Decimal(data['your_share_outstanding']), Decimal('0'))
 
     def test_member_cannot_restructure_someone_elses_group(self):
@@ -286,12 +308,18 @@ class GroupVisibilityTests(APITestCase):
             f'/api/expenses/groups/{self.group.id}/').status_code, 403)
 
     def test_stranger_sees_no_group(self):
-        self.auth(self.priya)
+        """Widening the ledger to members must not widen it past them."""
+        outsider = User.objects.create_user('outsider', password='x')
+        Token.objects.get_or_create(user=outsider)
+        self.auth(outsider)
         self.assertEqual(self.client.get('/api/expenses/groups/').data, [])
         self.assertEqual(self.client.get(
             f'/api/expenses/groups/{self.group.id}/balances/').status_code, 404)
+        self.assertEqual(self.client.get(
+            f'/api/expenses/groups/{self.group.id}/expenses/').status_code, 404)
 
-    def test_member_only_sees_group_bills_they_are_on(self):
+    def test_owner_sees_every_group_bill(self):
+        """The owner's own view is unchanged by the widening."""
         other = Person.objects.create(user=self.ashok, name='sam')
         self.group.members.add(other)
         theirs = Expense.objects.create(
@@ -300,10 +328,11 @@ class GroupVisibilityTests(APITestCase):
             group=self.group)
         ExpenseSplit.objects.create(expense=theirs, person=other, amount=Decimal('150.00'))
 
-        self.auth(self.jai)
-        listed = self.client.get(f'/api/expenses/groups/{self.group.id}/expenses/').data
-        self.assertEqual([e['description'] for e in listed], ['rent'])
-
         self.auth(self.ashok)
+        listed = self.client.get(f'/api/expenses/groups/{self.group.id}/expenses/').data
+        self.assertEqual(sorted(e['description'] for e in listed), ['rent', 'sam only'])
+
+        # And the member now reads that same bill, which is the change.
+        self.auth(self.jai)
         listed = self.client.get(f'/api/expenses/groups/{self.group.id}/expenses/').data
         self.assertEqual(sorted(e['description'] for e in listed), ['rent', 'sam only'])
