@@ -1,3 +1,5 @@
+import re
+
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.contrib.auth.password_validation import validate_password
@@ -6,7 +8,7 @@ from django.core.exceptions import ValidationError
 from django.core.mail import send_mail
 from django.utils.encoding import force_bytes, force_str
 from django.utils.http import urlsafe_base64_decode, urlsafe_base64_encode
-from rest_framework import viewsets, status, generics
+from rest_framework import viewsets, status, generics, serializers
 from rest_framework.authtoken.models import Token
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
@@ -17,7 +19,8 @@ from django.http import HttpResponse, JsonResponse
 from .serializers import (
     UserRegistrationSerializer,
     UserProfileSerializer,
-    PasswordChangeSerializer
+    PasswordChangeSerializer,
+    normalize_phone,
 )
 
 
@@ -126,35 +129,48 @@ def logout_view(request):
     return Response({'detail': 'Logged out.'}, status=status.HTTP_200_OK)
 
 
-def _resolve_login_identifier(identifier):
-    """Map an email / username / phone to one active user, or None.
+def _looks_like_phone(value):
+    """True for something a person would type as a mobile number.
 
-    Email is detected by '@', an all-digit string is treated as a phone (matched
-    against the profile phone once that exists), otherwise it's a username. An
-    ambiguous match resolves to nobody, so a code is never sent to the wrong
-    person.
+    Separators people actually use are stripped first, so "98765-43210" and
+    "(987) 654 3210" are recognised as phones rather than falling through to a
+    username lookup that can never match.
+    """
+    cleaned = re.sub(r'[\s\-().]', '', value or '')
+    if cleaned.startswith('+'):
+        cleaned = cleaned[1:]
+    return bool(cleaned) and cleaned.isdigit()
+
+
+def _resolve_login_identifier(identifier):
+    """Map an email / username / mobile number to one active user, or None.
+
+    Email is detected by '@', anything that reads as a phone number is matched
+    against the profile's stored mobile, otherwise it's a username. An ambiguous
+    match resolves to nobody, so a code is never sent to the wrong person.
+
+    Phones are normalised through the same `normalize_phone` registration uses,
+    because the two sides have to agree: the number is stored cleaned at
+    sign-up, so comparing it against a raw typed string only matched when the
+    user happened to type it in exactly the stored form. A leading country-code
+    '+' is also matched either way, since whether people type it is a coin
+    flip and the digits alone still identify one account.
     """
     identifier = (identifier or '').strip()
     if not identifier:
         return None
     if '@' in identifier:
         qs = User.objects.filter(email__iexact=identifier, is_active=True)
-    elif identifier.replace('+', '').isdigit():
-        # Phone lookup — no phone field on accounts yet, so this finds nobody
-        # until phone numbers are stored. The channel (SMS) is a separate step.
-        digits = identifier.replace(' ', '')
-        qs = User.objects.filter(profile__phone=digits, is_active=True) if _has_profile_phone() else User.objects.none()
+    elif _looks_like_phone(identifier):
+        try:
+            phone = normalize_phone(identifier)
+        except serializers.ValidationError:
+            return None
+        variants = {phone, phone.lstrip('+')} if phone.startswith('+') else {phone, '+' + phone}
+        qs = User.objects.filter(profile__phone__in=variants, is_active=True)
     else:
         qs = User.objects.filter(username__iexact=identifier, is_active=True)
     return qs.first() if qs.count() == 1 else None
-
-
-def _has_profile_phone():
-    try:
-        from .models import UserProfile  # noqa: F401
-        return True
-    except Exception:
-        return False
 
 
 class OTPRequestView(APIView):
