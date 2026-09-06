@@ -270,7 +270,15 @@ class PersonSerializer(serializers.ModelSerializer):
 
 
 class ExpenseSplitSerializer(serializers.ModelSerializer):
-    """One person's share of one expense, with enough of the expense to read it."""
+    """One person's share of one expense, with enough of the expense to read it.
+
+    The same row is read from both ends - "owed to me" for whoever paid, "I owe"
+    for the account the person is linked to - so ``direction`` says which side
+    the *requesting* user is on rather than leaving the client to guess from
+    names. Without a request in the context (the split_add/create_split
+    responses build this serializer bare) the payer's reading is used, which is
+    correct there: those endpoints only ever answer the person who just paid.
+    """
     person_name = serializers.CharField(source='person.name', read_only=True)
     paid_by = serializers.SerializerMethodField()
     description = serializers.CharField(source='expense.description', read_only=True)
@@ -278,17 +286,47 @@ class ExpenseSplitSerializer(serializers.ModelSerializer):
     expense_total = serializers.DecimalField(
         source='expense.amount', max_digits=10, decimal_places=2, read_only=True)
     expense_split_only = serializers.BooleanField(source='expense.split_only', read_only=True)
+    direction = serializers.SerializerMethodField()
+    counterparty = serializers.SerializerMethodField()
+    payer_user_id = serializers.IntegerField(source='expense.user_id', read_only=True)
+    can_edit = serializers.SerializerMethodField()
 
     class Meta:
         model = ExpenseSplit
         fields = ['id', 'expense', 'expense_total', 'expense_split_only', 'person', 'person_name', 'paid_by',
-                  'description', 'date', 'amount', 'is_settled', 'settled_at']
+                  'description', 'date', 'amount', 'is_settled', 'settled_at',
+                  'direction', 'counterparty', 'payer_user_id', 'can_edit']
         read_only_fields = fields
+
+    def _viewer(self):
+        request = self.context.get('request')
+        return getattr(request, 'user', None)
 
     def get_paid_by(self, obj):
         if obj.expense.paid_by_person_id:
             return obj.expense.paid_by_person.name
         return obj.expense.user.username
+
+    def get_direction(self, obj):
+        """'owed_to_you' when the viewer paid, 'you_owe' when the viewer owes."""
+        viewer = self._viewer()
+        if viewer is not None and getattr(viewer, 'is_authenticated', False):
+            if obj.person.linked_user_id == viewer.id and obj.expense.user_id != viewer.id:
+                return 'you_owe'
+        return 'owed_to_you'
+
+    def get_counterparty(self, obj):
+        """The other party's name, from the viewer's side of the row."""
+        if self.get_direction(obj) == 'you_owe':
+            return self.get_paid_by(obj)
+        return obj.person.name
+
+    def get_can_edit(self, obj):
+        """Both parties may change a split - see SplitViewSet for why."""
+        viewer = self._viewer()
+        if viewer is None or not getattr(viewer, 'is_authenticated', False):
+            return True
+        return obj.expense.user_id == viewer.id or obj.person.linked_user_id == viewer.id
 
 
 class ExpenseSplitUpdateSerializer(serializers.ModelSerializer):
@@ -299,8 +337,15 @@ class ExpenseSplitUpdateSerializer(serializers.ModelSerializer):
         fields = ['amount']
 
     def validate_amount(self, value):
+        # This guards the split ROW - what one *other* person owes - and a row
+        # of zero says nothing, so it stays rejected. It is not the guard on the
+        # payer's own share: the payer has no row at all, their share is the
+        # bill total minus every row, and that residual is allowed to reach zero
+        # (see SplitViewSet.perform_update).
         if value <= 0:
-            raise serializers.ValidationError('Amount must be greater than zero.')
+            raise serializers.ValidationError(
+                "A person's share must be more than zero. To cover it for them, "
+                "remove their split or raise it to the whole bill.")
         return value
 
 
@@ -311,15 +356,28 @@ class SplitGroupSerializer(serializers.ModelSerializer):
         many=True, write_only=True, required=False,
         queryset=Person.objects.all(), source='members')
     member_count = serializers.SerializerMethodField()
+    # A group is now readable from both ends, so a client has to be able to tell
+    # "my flat" from "a flat somebody put me in" - only the owner can rename it,
+    # add people or archive it.
+    is_owner = serializers.SerializerMethodField()
+    owner_username = serializers.CharField(source='owner.username', read_only=True)
 
     class Meta:
         model = SplitGroup
         fields = ['id', 'name', 'emoji', 'members', 'member_ids', 'member_count',
-                  'is_archived', 'created_at']
-        read_only_fields = ['id', 'members', 'member_count', 'created_at']
+                  'is_owner', 'owner_username', 'is_archived', 'created_at']
+        read_only_fields = ['id', 'members', 'member_count', 'is_owner',
+                            'owner_username', 'created_at']
 
     def get_member_count(self, obj):
         return obj.members.count()
+
+    def get_is_owner(self, obj):
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        if user is None or not getattr(user, 'is_authenticated', False):
+            return True
+        return obj.owner_id == user.id
 
     def validate_name(self, value):
         """Names are unique per owner. Without this the DB constraint fires as

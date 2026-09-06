@@ -2,6 +2,7 @@ from rest_framework import viewsets, status, filters, serializers
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.response import Response
 from rest_framework.permissions import AllowAny
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.pagination import PageNumberPagination
 from django_filters.rest_framework import DjangoFilterBackend
 from django.db.models import Sum, Count, Q
@@ -504,6 +505,9 @@ class ExpenseViewSet(viewsets.ModelViewSet):
                                     status=status.HTTP_400_BAD_REQUEST)
                 explicit[person.name] = share
 
+        # More than the bill is a typo; exactly the bill is not. Covering
+        # somebody's whole share is a real thing to do, and it leaves the payer
+        # owing nothing on this expense - a residual of zero, not an error.
         if explicit and sum(explicit.values()) > amount:
             return Response(
                 {'error': "The shares add up to more than the bill."},
@@ -1007,7 +1011,20 @@ class PersonViewSet(viewsets.ModelViewSet):
 
 
 class SplitViewSet(viewsets.ModelViewSet):
-    """Shared expenses: what each person owes, and settling up."""
+    """Shared expenses: what each person owes, and settling up.
+
+    Every read and write here is scoped to the two parties of a split and to
+    nobody else: whoever paid (``expense.user``) and the account the person is
+    linked to (``person.linked_user``). One row, read from both ends - so when
+    Ashok splits a bill with Jai, the row Ashok sees as "owed to me" is the row
+    Jai sees as "I owe", and it is never written twice.
+
+    Both parties can also *change* a split, not just read it. That is a
+    deliberate trust decision: a split is a shared claim, and the person being
+    billed is usually the one who spots that the figure is wrong. Every edit and
+    removal notifies the other side (see perform_update/perform_destroy), so the
+    change is visible rather than silent.
+    """
     serializer_class = ExpenseSplitSerializer
     pagination_class = StandardResultsSetPagination
 
@@ -1027,11 +1044,14 @@ class SplitViewSet(viewsets.ModelViewSet):
         self.perform_update(serializer)
         # Re-fetch to pick up the updated expense total.
         instance.refresh_from_db()
-        return Response(ExpenseSplitSerializer(instance).data)
+        return Response(ExpenseSplitSerializer(
+            instance, context=self.get_serializer_context()).data)
 
     def get_queryset(self):
         uid = self.request.user.id
-        # Splits you are party to, whichever end you are on.
+        # Splits you are party to, whichever end you are on. Anyone who is
+        # neither the payer nor the linked person matches neither branch, so
+        # this is also what keeps a third account out.
         queryset = ExpenseSplit.objects.filter(
             Q(expense__user_id=uid) | Q(person__linked_user_id=uid)
         ).select_related('person', 'expense', 'person__linked_user',
@@ -1040,7 +1060,15 @@ class SplitViewSet(viewsets.ModelViewSet):
             queryset = queryset.filter(is_settled=False)
         person = self.request.GET.get('person')
         if person:
+            # The owed-to-you side: a Person in your own contact list.
             queryset = queryset.filter(person_id=person)
+        owed_to = self.request.GET.get('owed_to')
+        if owed_to:
+            # The you-owe side. A debtor has no Person id to filter on - the
+            # Person row belongs to the payer's contact list - so they narrow by
+            # the account they owe instead.
+            queryset = queryset.filter(person__linked_user_id=uid,
+                                       expense__user_id=owed_to)
         return queryset
 
     def create(self, request, *args, **kwargs):
@@ -1050,19 +1078,27 @@ class SplitViewSet(viewsets.ModelViewSet):
             status=status.HTTP_405_METHOD_NOT_ALLOWED)
 
     def perform_update(self, serializer):
-        """Update a split amount and adjust the parent expense total."""
+        """Update a split amount, letting the payer's own share absorb it.
+
+        The payer has no split row: their share is the bill total minus every
+        row on it. So a raised share is taken out of that residual first, down
+        to zero - the payer really can cover somebody's whole share and consume
+        none of the bill themselves. Only once the shares would exceed what was
+        actually paid does the bill itself grow, to exactly the sum of the
+        shares; it never grows past that, which is what used to make the payer's
+        residual impossible to reduce by editing.
+        """
         split = serializer.instance
         old_amount = split.amount
         new_amount = serializer.validated_data['amount']
 
         serializer.save()
 
-        # Adjust the parent expense total by the difference, so the owner's
-        # implicit share stays the same.
         expense = split.expense
-        delta = new_amount - old_amount
-        expense.amount = expense.amount + delta
-        expense.save(update_fields=['amount', 'updated_at'])
+        shares_total = expense.splits.aggregate(t=Sum('amount'))['t'] or ZERO
+        if shares_total > expense.amount:
+            expense.amount = shares_total
+            expense.save(update_fields=['amount', 'updated_at'])
 
         # Notify everyone involved
         actor = self.request.user
@@ -1100,11 +1136,17 @@ class SplitViewSet(viewsets.ModelViewSet):
         actor_name = (actor.get_full_name() or actor.username).strip()
         parties = _split_party_users(expense, exclude=actor)
 
+        is_owner = expense.user_id == actor.id
         instance.delete()
 
-        # If no splits remain, delete the parent expense entirely.
+        # Removing a split shrinks the bill by that share, so the payer's own
+        # residual is untouched either way.
         remaining = expense.splits.count()
-        if remaining == 0:
+        if remaining == 0 and is_owner:
+            # Only the payer may take the expense down with the last split - it
+            # is their record. A counterparty deleting the share they owe must
+            # never delete somebody else's expense out from under them, so for
+            # them the bill just shrinks to the payer's own residual and stays.
             expense.delete()
         else:
             expense.amount = expense.amount - old_amount
@@ -1227,7 +1269,8 @@ class SplitViewSet(viewsets.ModelViewSet):
         return Response({
             'settled_count': len(settled),
             'settled_total': total,
-            'splits': ExpenseSplitSerializer(settled, many=True).data,
+            'splits': ExpenseSplitSerializer(
+                settled, many=True, context={'request': request}).data,
         })
 
 
@@ -1252,7 +1295,18 @@ class SplitGroupViewSet(viewsets.ModelViewSet):
     pagination_class = None
 
     def get_queryset(self):
-        queryset = SplitGroup.objects.filter(owner=self.request.user)
+        """Groups you own, plus groups you were put in from the other side.
+
+        A group is somebody's list of the people they split with, so it is
+        owned by one account - but the members with accounts of their own are
+        parties to its bills and could not see the group at all, which made a
+        shared flat or trip readable from exactly one side. They are included
+        here by their linked account. Anyone who is neither the owner nor a
+        linked member still matches nothing.
+        """
+        user = self.request.user
+        queryset = SplitGroup.objects.filter(
+            Q(owner=user) | Q(members__linked_user=user)).distinct()
         if self.request.GET.get('archived') != 'true':
             queryset = queryset.filter(is_archived=False)
         return queryset.prefetch_related('members')
@@ -1263,6 +1317,27 @@ class SplitGroupViewSet(viewsets.ModelViewSet):
             raise serializers.ValidationError({'userid': 'A valid userid is required.'})
         serializer.save(owner=user)
 
+    def _owned_object(self):
+        """The group, but only for its owner.
+
+        Reading a group you are a member of is one thing; renaming it, adding
+        people to somebody else's contact list or archiving it is another. Those
+        stay with the owner.
+        """
+        group = self.get_object()
+        if group.owner_id != self.request.user.id:
+            raise PermissionDenied('Only the person who made this group can change it.')
+        return group
+
+    def perform_update(self, serializer):
+        self._owned_object()
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        if instance.owner_id != self.request.user.id:
+            raise PermissionDenied('Only the person who made this group can delete it.')
+        instance.delete()
+
     @action(detail=True, methods=['post'])
     def add_members(self, request, pk=None):
         """Add people to a group, by person_id, user_id or plain name.
@@ -1270,7 +1345,7 @@ class SplitGroupViewSet(viewsets.ModelViewSet):
         Accepting a name means a group can be built before everyone involved
         has an account; accepting user_id links them properly when they do.
         """
-        group = self.get_object()
+        group = self._owned_object()
         user = group.owner
         added = []
         for entry in request.data.get('members') or []:
@@ -1306,7 +1381,7 @@ class SplitGroupViewSet(viewsets.ModelViewSet):
         Their past splits stay: they really did owe that money, and deleting
         the history to tidy a membership list would quietly change balances.
         """
-        group = self.get_object()
+        group = self._owned_object()
         person_id = request.data.get('person_id')
         person = group.members.filter(id=person_id).first()
         if not person:
@@ -1317,8 +1392,17 @@ class SplitGroupViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['get'])
     def balances(self, request, pk=None):
-        """What each member owes for this group's expenses only."""
+        """What each member owes for this group's expenses only.
+
+        The member rows are the owner's reading of the group: who owes them.
+        Somebody looking in from the other side is not a party to what a third
+        member owes, so they get their own row only - enough to answer "what do
+        I still owe into the flat" without turning a group into a way to read
+        other people's balances. ``viewer_is_owner`` tells the client which
+        sentence to write: "still to come back to you", or "you still owe".
+        """
         group = self.get_object()
+        viewer_is_owner = group.owner_id == request.user.id
 
         rows = (ExpenseSplit.objects
                 .filter(expense__group=group, is_settled=False)
@@ -1326,32 +1410,60 @@ class SplitGroupViewSet(viewsets.ModelViewSet):
                 .annotate(owed=Sum('amount'), items=Count('id')))
         owed = {r['person_id']: r for r in rows}
 
+        people = group.members.all()
+        if not viewer_is_owner:
+            people = people.filter(linked_user=request.user)
+
         members = []
-        for person in group.members.all():
+        for person in people:
             row = owed.get(person.id)
             members.append({
                 'person_id': person.id,
                 'name': person.name,
                 'linked_username': person.linked_user.username if person.linked_user else None,
+                'is_you': person.linked_user_id == request.user.id,
                 'owed': row['owed'] if row else 0,
                 'unsettled_count': row['items'] if row else 0,
             })
         members.sort(key=lambda m: (-(m['owed'] or 0), m['name']))
 
-        spend = group.expenses.aggregate(total=Sum('amount'), count=Count('id'))
+        # What the viewer personally still owes into this group (zero for the
+        # owner, who is owed instead - the same rows read from the other end).
+        your_share = (ExpenseSplit.objects
+                      .filter(expense__group=group, is_settled=False,
+                              person__linked_user=request.user)
+                      .exclude(expense__user=request.user)
+                      .aggregate(t=Sum('amount'))['t'] or 0)
+
+        if viewer_is_owner:
+            spend = group.expenses.aggregate(total=Sum('amount'), count=Count('id'))
+        else:
+            spend = (group.expenses.filter(splits__person__linked_user=request.user)
+                     .distinct().aggregate(total=Sum('amount'), count=Count('id', distinct=True)))
         return Response({
             'group': self.get_serializer(group).data,
+            'viewer_is_owner': viewer_is_owner,
+            'owner_username': group.owner.username,
             'total_spent': spend['total'] or 0,
             'expense_count': spend['count'] or 0,
             'total_outstanding': sum((m['owed'] or 0) for m in members),
+            'your_share_outstanding': your_share,
             'members': members,
         })
 
     @action(detail=True, methods=['get'])
     def expenses(self, request, pk=None):
-        """This group's expenses, most recent first."""
+        """This group's expenses, most recent first.
+
+        For a member looking in from the other side, only the bills they are
+        actually on: being in somebody's group does not make every bill in it
+        theirs to read.
+        """
         group = self.get_object()
-        queryset = group.expenses.select_related('category').order_by('-date', '-created_at')[:50]
+        queryset = group.expenses.select_related('category')
+        if group.owner_id != request.user.id:
+            queryset = queryset.filter(splits__person__linked_user=request.user).distinct()
+        queryset = queryset.order_by('-date', '-created_at')[:50]
         return Response(ExpenseListSerializer(queryset, many=True).data)
 
 
