@@ -209,6 +209,26 @@ class ExpenseSplit(models.Model):
         help_text="What this person owes the payer for this expense")
     is_settled = models.BooleanField(default=False)
     settled_at = models.DateTimeField(null=True, blank=True)
+
+    # How much of `amount` has actually changed hands. Settling used to be
+    # all-or-nothing, so "he gave me 300 of the 500" had nowhere to live and the
+    # only truthful options were to leave the whole debt standing or wipe it.
+    # `is_settled` stays as the derived "nothing left owing" flag - every
+    # existing filter reads it - and this carries the part-payments underneath.
+    settled_amount = models.DecimalField(
+        max_digits=10, decimal_places=2, default=decimal.Decimal('0.00'),
+        help_text='How much of this share has been paid so far')
+
+    # The counterparty's own consent to count this as their spending.
+    #
+    # A split someone else created must not silently land on your books: it is
+    # shared until you say otherwise. Nothing is mirrored to say so - this is a
+    # flag on the one shared row, written only by the account `person` is linked
+    # to. The payer's equivalent is Expense.split_only, on their own expense.
+    include_in_expenses = models.BooleanField(
+        default=False,
+        help_text='The linked account chose to count this share as their own spending')
+
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -223,11 +243,33 @@ class ExpenseSplit(models.Model):
     def __str__(self):
         return f"{self.person.name} owes {self.amount} for {self.expense.description[:30]}"
 
-    def settle(self):
+    @property
+    def outstanding(self):
+        """What is still owed on this share - never negative."""
+        rest = self.amount - (self.settled_amount or decimal.Decimal('0.00'))
+        return rest if rest > decimal.Decimal('0.00') else decimal.Decimal('0.00')
+
+    def settle(self, amount=None):
+        """Record money moving on this share.
+
+        ``amount=None`` settles the whole thing (the old behaviour). A figure
+        pays that much off, capped at what is outstanding so a settlement can
+        never claim more than the debt, and `is_settled` flips only once nothing
+        is left - so a partial payment leaves a real remainder rather than
+        rounding the debt away.
+        """
         from django.utils import timezone as _tz
-        self.is_settled = True
-        self.settled_at = _tz.now()
-        self.save(update_fields=['is_settled', 'settled_at'])
+        paid = self.outstanding if amount is None else min(
+            decimal.Decimal(str(amount)).quantize(decimal.Decimal('0.01')), self.outstanding)
+        if paid <= decimal.Decimal('0.00'):
+            return decimal.Decimal('0.00')
+        self.settled_amount = (self.settled_amount or decimal.Decimal('0.00')) + paid
+        if self.settled_amount >= self.amount:
+            self.settled_amount = self.amount
+            self.is_settled = True
+            self.settled_at = _tz.now()
+        self.save(update_fields=['settled_amount', 'is_settled', 'settled_at'])
+        return paid
 
 
 class SplitGroup(models.Model):

@@ -5,7 +5,7 @@ from rest_framework.permissions import AllowAny
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.pagination import PageNumberPagination
 from django_filters.rest_framework import DjangoFilterBackend
-from django.db.models import Sum, Count, Q
+from django.db.models import Sum, Count, Q, F, DecimalField, ExpressionWrapper
 from django.utils import timezone
 from django.core.exceptions import ObjectDoesNotExist
 from datetime import datetime, timedelta, date
@@ -15,6 +15,15 @@ import django_filters
 
 from .models import Expense, ExpenseCategory, ExpenseSplit, ExpenseTag, Person, SplitGroup, RecurringRule, Notification, notify
 from .net_spending import net_spending, owed_to_you_total, ZERO
+
+# What is still owed on a split: the share minus whatever has already been paid
+# on it. Every "unsettled" total reads this rather than `amount`, so a partial
+# settlement shows up as a smaller balance instead of vanishing or standing
+# whole. Rows are never over-paid (ExpenseSplit.settle caps at the outstanding),
+# so this cannot go negative.
+OUTSTANDING = ExpressionWrapper(
+    F('amount') - F('settled_amount'),
+    output_field=DecimalField(max_digits=10, decimal_places=2))
 from .serializers import (
     ExpenseSerializer, ExpenseCreateSerializer, ExpenseListSerializer,
     ExpenseCategorySerializer, ExpenseTagSerializer, ExpenseSummarySerializer,
@@ -576,12 +585,14 @@ class ExpenseViewSet(viewsets.ModelViewSet):
                 paid_note = f" (paid by {paid_by_person.name})" if paid_by_person else ""
                 notify(s.person.linked_user,
                        f"{creator_name} split a bill with you",
-                       f"{expense.description}{paid_note} — you owe ₹{s.amount}.",
+                       f"{expense.description}{paid_note} — you owe ₹{s.amount}. "
+                       f"It's in Shared; add it to your expenses if you want it counted.",
                        kind='split', link='/splits')
                 _tg_notify(
                     s.person.linked_user,
                     f"💸 {creator_name} split \"{expense.description}\" (₹{expense.amount}){paid_note} with you "
-                    f"— you owe ₹{s.amount}. Open Money OS → Splits to settle.",
+                    f"— you owe ₹{s.amount}. It's waiting in Money OS → Splits; nothing has been "
+                    f"added to your expenses.",
                 )
 
         return Response({
@@ -681,12 +692,14 @@ class ExpenseViewSet(viewsets.ModelViewSet):
                 paid_note = f" (paid by {paid_by_person.name})" if paid_by_person else ""
                 notify(s.person.linked_user,
                        f"{creator_name} split a bill with you",
-                       f"{expense.description}{paid_note} — you owe ₹{s.amount}.",
+                       f"{expense.description}{paid_note} — you owe ₹{s.amount}. "
+                       f"It's in Shared; add it to your expenses if you want it counted.",
                        kind='split', link='/splits')
                 _tg_notify(
                     s.person.linked_user,
                     f"💸 {creator_name} split \"{expense.description}\" (₹{expense.amount}){paid_note} with you "
-                    f"— you owe ₹{s.amount}. Open Money OS → Splits to settle.",
+                    f"— you owe ₹{s.amount}. It's waiting in Money OS → Splits; nothing has been "
+                    f"added to your expenses.",
                 )
 
         return Response({
@@ -778,7 +791,8 @@ class ExpenseViewSet(viewsets.ModelViewSet):
         owed_rows = (ExpenseSplit.objects
                      .filter(expense__user=user)
                      .values('person__name', 'is_settled')
-                     .annotate(total=Sum('amount'), items=Count('id')))
+                     .annotate(total=Sum('amount'), still_owed=Sum(OUTSTANDING),
+                               items=Count('id')))
         by_person = {}
         for r in owed_rows:
             name = r['person__name']
@@ -787,11 +801,15 @@ class ExpenseViewSet(viewsets.ModelViewSet):
                 'settled': ZERO, 'lifetime': ZERO,
             })
             amt = r['total'] or ZERO
+            left = r['still_owed'] or ZERO
             slot['lifetime'] += amt
             if r['is_settled']:
                 slot['settled'] += amt
             else:
-                slot['unsettled'] += amt
+                # Part-paid rows sit here: what has come back counts as settled,
+                # only the remainder is still owed.
+                slot['settled'] += amt - left
+                slot['unsettled'] += left
                 slot['unsettled_count'] += r['items']
         people_who_owe_you = sorted(
             ({'name': p['name'],
@@ -807,7 +825,7 @@ class ExpenseViewSet(viewsets.ModelViewSet):
                      .filter(person__linked_user=user, is_settled=False)
                      .exclude(expense__user=user)
                      .values('expense__user__username')
-                     .annotate(total=Sum('amount'), items=Count('id')))
+                     .annotate(total=Sum(OUTSTANDING), items=Count('id')))
         you_owe = sorted(
             ({'name': d['expense__user__username'],
               'owed_unsettled': float(d['total'] or ZERO),
@@ -1054,10 +1072,23 @@ class SplitViewSet(viewsets.ModelViewSet):
         # this is also what keeps a third account out.
         queryset = ExpenseSplit.objects.filter(
             Q(expense__user_id=uid) | Q(person__linked_user_id=uid)
-        ).select_related('person', 'expense', 'person__linked_user',
-                         'expense__user', 'expense__paid_by_person')
+        ).select_related('person', 'expense', 'expense__category',
+                         'person__linked_user',
+                         'expense__user', 'expense__paid_by_person'
+                         ).prefetch_related('expense__splits__person')
         if self.request.GET.get('settled') == 'false':
             queryset = queryset.filter(is_settled=False)
+        # Which side of the ledger, without needing to name the other account.
+        # "Everything I owe" is what a Shared section asks for, and before this
+        # it could only be requested one counterparty at a time (`owed_to`).
+        direction = self.request.GET.get('direction')
+        if direction == 'you_owe':
+            queryset = queryset.filter(person__linked_user_id=uid).exclude(expense__user_id=uid)
+        elif direction == 'owed_to_you':
+            queryset = queryset.filter(expense__user_id=uid)
+        included = self.request.GET.get('included')
+        if included in ('true', 'false'):
+            queryset = queryset.filter(include_in_expenses=(included == 'true'))
         person = self.request.GET.get('person')
         if person:
             # The owed-to-you side: a Person in your own contact list.
@@ -1077,35 +1108,192 @@ class SplitViewSet(viewsets.ModelViewSet):
             {'detail': 'Splits are created through the expense split endpoints.'},
             status=status.HTTP_405_METHOD_NOT_ALLOWED)
 
-    def perform_update(self, serializer):
-        """Update a split amount, letting the payer's own share absorb it.
+    def _apply_participants(self, expense, entries, edited_split):
+        """Rewrite who is on this bill. Returns a change description, or raises.
 
-        The payer has no split row: their share is the bill total minus every
-        row on it. So a raised share is taken out of that residual first, down
-        to zero - the payer really can cover somebody's whole share and consume
-        none of the bill themselves. Only once the shares would exceed what was
-        actually paid does the bill itself grow, to exactly the sum of the
-        shares; it never grows past that, which is what used to make the payer's
-        residual impossible to reduce by editing.
+        Person rows belong to the payer's own contact list, so only the payer
+        can name somebody new here - the other side has nobody to add. The row
+        being edited must stay in the roster: dropping it is a deletion, and
+        deletion has its own endpoint (which decides what happens to the bill).
+        """
+        payer = expense.user
+        resolved = {}
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise serializers.ValidationError({'participants': 'Each participant must be an object.'})
+            person = None
+            if entry.get('person_id'):
+                person = Person.objects.filter(user=payer, id=entry['person_id']).first()
+            elif entry.get('user_id'):
+                from django.contrib.auth.models import User as AuthUser
+                account = AuthUser.objects.filter(id=entry['user_id'], is_active=True).first()
+                if account and account != payer:
+                    person = Person.objects.filter(user=payer, linked_user=account).first()
+                    if not person:
+                        person = Person.objects.create(user=payer, name=account.username,
+                                                       linked_user=account)
+            elif entry.get('name'):
+                name = str(entry['name']).strip()[:100]
+                person = Person.objects.filter(user=payer, name__iexact=name).first()
+                if not person:
+                    person = Person.objects.create(user=payer, name=name,
+                                                   linked_user=match_account(name))
+            if not person:
+                raise serializers.ValidationError(
+                    {'participants': 'Each participant needs a person_id, user_id or name.'})
+            try:
+                share = Decimal(str(entry.get('amount'))).quantize(Decimal('0.01'))
+            except (TypeError, InvalidOperation):
+                raise serializers.ValidationError(
+                    {'participants': f'{person.name} needs an amount.'})
+            if share <= 0:
+                raise serializers.ValidationError(
+                    {'participants': f"{person.name}'s share must be more than zero."})
+            resolved[person.id] = (person, share)
+
+        if edited_split.person_id not in resolved:
+            raise serializers.ValidationError(
+                {'participants': "You can't drop the share you're editing here - "
+                                 "remove the split instead."})
+
+        added, changed, removed = [], [], []
+        existing = {s.person_id: s for s in expense.splits.select_related('person').all()}
+        for person_id, (person, share) in resolved.items():
+            row = existing.get(person_id)
+            if row is None:
+                ExpenseSplit.objects.create(expense=expense, person=person, amount=share)
+                added.append(person.name)
+            elif row.amount != share:
+                # A share can never fall below what has already been paid on it.
+                if share < (row.settled_amount or ZERO):
+                    raise serializers.ValidationError(
+                        {'participants': f"{person.name} has already paid "
+                                         f"\u20b9{row.settled_amount} on this - "
+                                         f"their share can't go below that."})
+                row.amount = share
+                row.is_settled = row.settled_amount >= share
+                row.save(update_fields=['amount', 'is_settled'])
+                changed.append(person.name)
+        for person_id, row in existing.items():
+            if person_id not in resolved:
+                removed.append(row.person.name)
+                row.delete()
+
+        parts = []
+        if added:
+            parts.append('added ' + ', '.join(added))
+        if removed:
+            parts.append('removed ' + ', '.join(removed))
+        if changed:
+            parts.append('changed ' + ', '.join(changed))
+        return '; '.join(parts)
+
+    def perform_update(self, serializer):
+        """Edit a split, and the bill behind it.
+
+        Every field the create dialog collects can be corrected here - what it
+        was for, when, which category, the bill total and who is on it - because
+        a shared bill entered wrongly otherwise had no way back. All of it is
+        optional; ``{"amount": 500}`` behaves exactly as it did before.
+
+        The share arithmetic is unchanged. The payer has no split row: their
+        share is the bill total minus every row on it. So a raised share is
+        taken out of that residual first, down to zero - the payer really can
+        cover somebody's whole share and consume none of the bill themselves.
+        Only once the shares would exceed what was actually paid does the bill
+        itself grow, to exactly the sum of the shares.
         """
         split = serializer.instance
-        old_amount = split.amount
-        new_amount = serializer.validated_data['amount']
-
-        serializer.save()
-
         expense = split.expense
+        actor = self.request.user
+        vd = serializer.validated_data
+
+        # Pull the bill-level fields off before saving: they belong to the
+        # Expense, and the model serializer would try to set them on the split.
+        description = vd.pop('description', None)
+        new_date = vd.pop('date', None)
+        category_id = vd.pop('category_id', None)
+        expense_amount = vd.pop('expense_amount', None)
+        participants = vd.pop('participants', None)
+        include = vd.pop('include_in_expenses', None)
+
+        old_amount = split.amount
+        new_amount = vd.get('amount', old_amount)
+        notes = []
+
+        # ── the counterparty's consent, and only theirs ────────────────────
+        if include is not None:
+            if not (split.person.linked_user_id == actor.id and expense.user_id != actor.id):
+                raise serializers.ValidationError(
+                    {'include_in_expenses': "Only the person who owes this share can "
+                                            "choose whether it counts as their spending."})
+            split.include_in_expenses = bool(include)
+            split.save(update_fields=['include_in_expenses'])
+            # Consent is a private bookkeeping choice about the reader's own
+            # totals, not a change to the shared claim - so it notifies nobody
+            # and returns before the "someone edited your split" machinery.
+            if not any(v is not None for v in
+                       (description, new_date, category_id, expense_amount, participants)) \
+                    and 'amount' not in vd:
+                return
+
+        # ── the bill itself ────────────────────────────────────────────────
+        expense_fields = []
+        if description is not None and description.strip() and description != expense.description:
+            expense.description = description.strip()
+            expense_fields.append('description')
+            notes.append(f'renamed to "{expense.description}"')
+        if new_date is not None and new_date != expense.date:
+            expense.date = new_date
+            expense_fields.append('date')
+            notes.append(f'moved to {new_date.isoformat()}')
+        if category_id is not None and category_id != expense.category_id:
+            expense.category_id = category_id
+            expense_fields.append('category')
+            notes.append('recategorised')
+        if expense_amount is not None and expense_amount != expense.amount:
+            notes.append(f'bill \u20b9{expense.amount} \u2192 \u20b9{expense_amount}')
+            expense.amount = expense_amount
+            expense_fields.append('amount')
+        if expense_fields:
+            expense.save(update_fields=expense_fields + ['updated_at'])
+
+        # ── this row's share ───────────────────────────────────────────────
+        if 'amount' in vd:
+            if vd['amount'] < (split.settled_amount or ZERO):
+                raise serializers.ValidationError(
+                    {'amount': f"\u20b9{split.settled_amount} has already been paid on this "
+                               f"share - it can't go below that."})
+            # A share reduced to what was already paid is simply settled now.
+            split.is_settled = (split.settled_amount or ZERO) >= vd['amount']
+            serializer.save(is_settled=split.is_settled)
+            if old_amount != new_amount:
+                notes.append(f"{split.person.name}'s share \u20b9{old_amount} "
+                             f"\u2192 \u20b9{new_amount}")
+
+        # ── who is on it ───────────────────────────────────────────────────
+        if participants is not None:
+            if expense.user_id != actor.id:
+                raise serializers.ValidationError(
+                    {'participants': "Only whoever paid can change who is on this bill - "
+                                     "the people on it are in their contact list."})
+            change = self._apply_participants(expense, participants, split)
+            if change:
+                notes.append(change)
+
+        expense.refresh_from_db()
         shares_total = expense.splits.aggregate(t=Sum('amount'))['t'] or ZERO
         if shares_total > expense.amount:
             expense.amount = shares_total
             expense.save(update_fields=['amount', 'updated_at'])
 
+        if not notes:
+            return
+
         # Notify everyone involved
-        actor = self.request.user
         actor_name = (actor.get_full_name() or actor.username).strip()
         description = expense.description
-        body = (f"{split.person.name}'s share for \"{description}\" "
-                f"changed from \u20b9{old_amount} to \u20b9{new_amount}.")
+        body = f"\"{description}\": " + '; '.join(notes) + '.'
 
         try:
             from telegrambot.telegram_api import notify_user as _tg_notify
@@ -1117,10 +1305,7 @@ class SplitViewSet(viewsets.ModelViewSet):
                    kind='split', link='/splits')
             if _tg_notify:
                 try:
-                    _tg_notify(user,
-                               f"\u270f\ufe0f {actor_name} edited a split: "
-                               f"{split.person.name}'s share for \"{description}\" "
-                               f"\u20b9{old_amount} \u2192 \u20b9{new_amount}.")
+                    _tg_notify(user, f"\u270f\ufe0f {actor_name} edited a split \u2014 {body}")
                 except Exception:
                     pass
 
@@ -1141,7 +1326,12 @@ class SplitViewSet(viewsets.ModelViewSet):
 
         # Removing a split shrinks the bill by that share, so the payer's own
         # residual is untouched either way.
-        remaining = expense.splits.count()
+        #
+        # Counted straight off the table rather than through expense.splits:
+        # the list queryset prefetches that relation, and a prefetched manager
+        # answers count() from its cache - which still holds the row we just
+        # deleted, so the last split would never look like the last one.
+        remaining = ExpenseSplit.objects.filter(expense=expense).count()
         if remaining == 0 and is_owner:
             # Only the payer may take the expense down with the last split - it
             # is their record. A counterparty deleting the share they owe must
@@ -1184,11 +1374,13 @@ class SplitViewSet(viewsets.ModelViewSet):
         if error:
             return error
 
-        # Money coming back to you: splits on expenses you paid.
+        # Money coming back to you: splits on expenses you paid. What is owed
+        # is what is *left* on each share - a part-payment has already come
+        # home, and counting the original figure would ask for it twice.
         rows = (ExpenseSplit.objects
                 .filter(expense__user=user, is_settled=False)
                 .values('person_id', 'person__name')
-                .annotate(owed=Sum('amount'), items=Count('id')))
+                .annotate(owed=Sum(OUTSTANDING), items=Count('id')))
         owed_by_person = {r['person_id']: r for r in rows}
 
         balances = []
@@ -1208,7 +1400,7 @@ class SplitViewSet(viewsets.ModelViewSet):
                  .filter(person__linked_user=user, is_settled=False)
                  .exclude(expense__user=user)
                  .values('expense__user_id', 'expense__user__username')
-                 .annotate(owed=Sum('amount'), items=Count('id')))
+                 .annotate(owed=Sum(OUTSTANDING), items=Count('id')))
         you_owe = [{
             'user_id': d['expense__user_id'],
             'name': d['expense__user__username'],
@@ -1259,18 +1451,54 @@ class SplitViewSet(viewsets.ModelViewSet):
             return Response({'error': 'person_id, owed_to_user_id or split_ids is required'},
                             status=status.HTTP_400_BAD_REQUEST)
 
-        settled = list(queryset)
+        settled = list(queryset.order_by('expense__date', 'created_at'))
         if not settled:
             return Response({'error': 'Nothing outstanding to settle.'},
                             status=status.HTTP_400_BAD_REQUEST)
 
-        total = sum(s.amount for s in settled)
-        queryset.update(is_settled=True, settled_at=timezone.now())
+        outstanding_total = sum((s.outstanding for s in settled), ZERO)
+
+        # A part-payment. Money rarely arrives in exactly the shape of the debt,
+        # and the only honest options used to be "leave the whole thing
+        # standing" or "wipe it" - so a figure here is applied oldest bill
+        # first, clearing each in turn and leaving the remainder on the last one
+        # it reaches. Never more than is actually owed.
+        raw_amount = request.data.get('amount')
+        if raw_amount not in (None, ''):
+            try:
+                budget = Decimal(str(raw_amount)).quantize(Decimal('0.01'))
+            except (TypeError, InvalidOperation):
+                return Response({'error': 'That is not a valid amount.'},
+                                status=status.HTTP_400_BAD_REQUEST)
+            if budget <= 0:
+                return Response({'error': 'A payment has to be more than zero.'},
+                                status=status.HTTP_400_BAD_REQUEST)
+            if budget > outstanding_total:
+                return Response(
+                    {'error': f'That is more than the \u20b9{outstanding_total} outstanding.'},
+                    status=status.HTTP_400_BAD_REQUEST)
+        else:
+            budget = outstanding_total
+
+        total = ZERO
+        touched = []
+        for split in settled:
+            if budget <= ZERO:
+                break
+            paid = split.settle(min(budget, split.outstanding))
+            if paid > ZERO:
+                budget -= paid
+                total += paid
+                touched.append(split)
+
+        remaining = outstanding_total - total
         return Response({
-            'settled_count': len(settled),
+            'settled_count': sum(1 for s in touched if s.is_settled),
+            'partial_count': sum(1 for s in touched if not s.is_settled),
             'settled_total': total,
+            'remaining': remaining,
             'splits': ExpenseSplitSerializer(
-                settled, many=True, context={'request': request}).data,
+                touched, many=True, context={'request': request}).data,
         })
 
 
@@ -1409,7 +1637,7 @@ class SplitGroupViewSet(viewsets.ModelViewSet):
         rows = (ExpenseSplit.objects
                 .filter(expense__group=group, is_settled=False)
                 .values('person_id', 'person__name')
-                .annotate(owed=Sum('amount'), items=Count('id')))
+                .annotate(owed=Sum(OUTSTANDING), items=Count('id')))
         owed = {r['person_id']: r for r in rows}
 
         people = group.members.all()
@@ -1433,7 +1661,7 @@ class SplitGroupViewSet(viewsets.ModelViewSet):
                       .filter(expense__group=group, is_settled=False,
                               person__linked_user=request.user)
                       .exclude(expense__user=request.user)
-                      .aggregate(t=Sum('amount'))['t'] or 0)
+                      .aggregate(t=Sum(OUTSTANDING))['t'] or 0)
 
         spend = group.expenses.aggregate(total=Sum('amount'), count=Count('id'))
         return Response({

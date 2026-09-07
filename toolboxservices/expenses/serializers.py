@@ -290,13 +290,47 @@ class ExpenseSplitSerializer(serializers.ModelSerializer):
     counterparty = serializers.SerializerMethodField()
     payer_user_id = serializers.IntegerField(source='expense.user_id', read_only=True)
     can_edit = serializers.SerializerMethodField()
+    # Enough of the bill to reopen the composer on it, rather than a lone
+    # amount box: what it was for, when, which category, and who else is on it.
+    category = serializers.IntegerField(source='expense.category_id', read_only=True)
+    category_name = serializers.CharField(source='expense.category.name', read_only=True, default=None)
+    participants = serializers.SerializerMethodField()
+    # Partial settlement: what has been paid, and what is genuinely left.
+    outstanding = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
+    # The counterparty's consent to count this share as their own spending.
+    # can_include says whether the *viewer* is the side that owns that choice —
+    # the payer's equivalent lives on their expense (split_only), not here.
+    can_include = serializers.SerializerMethodField()
 
     class Meta:
         model = ExpenseSplit
         fields = ['id', 'expense', 'expense_total', 'expense_split_only', 'person', 'person_name', 'paid_by',
-                  'description', 'date', 'amount', 'is_settled', 'settled_at',
-                  'direction', 'counterparty', 'payer_user_id', 'can_edit']
+                  'description', 'date', 'category', 'category_name', 'amount',
+                  'is_settled', 'settled_at', 'settled_amount', 'outstanding',
+                  'include_in_expenses', 'can_include',
+                  'direction', 'counterparty', 'payer_user_id', 'can_edit', 'participants']
         read_only_fields = fields
+
+    def get_participants(self, obj):
+        """Everyone billed on this same expense, so the edit dialog opens on the
+        whole bill rather than one line of it. The payer has no row of their own -
+        their share is the residual - so they are not in this list."""
+        viewer = self._viewer()
+        viewer_id = getattr(viewer, 'id', None)
+        return [{
+            'split_id': s.id,
+            'person_id': s.person_id,
+            'name': s.person.name,
+            'amount': str(s.amount),
+            'is_you': s.person.linked_user_id is not None and s.person.linked_user_id == viewer_id,
+        } for s in obj.expense.splits.all()]
+
+    def get_can_include(self, obj):
+        viewer = self._viewer()
+        if viewer is None or not getattr(viewer, 'is_authenticated', False):
+            return False
+        return (obj.person.linked_user_id == viewer.id
+                and obj.expense.user_id != viewer.id)
 
     def _viewer(self):
         request = self.context.get('request')
@@ -330,11 +364,44 @@ class ExpenseSplitSerializer(serializers.ModelSerializer):
 
 
 class ExpenseSplitUpdateSerializer(serializers.ModelSerializer):
-    """Writable serializer for updating a split's amount."""
+    """Writable serializer for a split, and for the bill it belongs to.
+
+    Editing used to mean the amount and nothing else, so a wrong description, a
+    wrong date or a wrong category on a shared bill had no way to be corrected -
+    the same dialog that created it has to be able to reopen on it. The extra
+    fields are all optional: a payload of ``{"amount": 500}`` behaves exactly as
+    it always did.
+
+    ``participants`` rewrites who is on the bill and is accepted from the payer
+    only - a Person row lives in the payer's own contact list, so the other side
+    has nobody to add. See SplitViewSet.update for how each field is applied.
+    """
+
+    # Bill-level fields, written through to the parent expense.
+    description = serializers.CharField(required=False, allow_blank=False, max_length=500)
+    date = serializers.DateField(required=False)
+    category_id = serializers.IntegerField(required=False)
+    expense_amount = serializers.DecimalField(
+        max_digits=10, decimal_places=2, required=False,
+        help_text="The whole bill's total, when the bill itself was wrong")
+    participants = serializers.ListField(child=serializers.DictField(), required=False)
+    include_in_expenses = serializers.BooleanField(required=False)
 
     class Meta:
         model = ExpenseSplit
-        fields = ['amount']
+        fields = ['amount', 'description', 'date', 'category_id', 'expense_amount',
+                  'participants', 'include_in_expenses']
+        extra_kwargs = {'amount': {'required': False}}
+
+    def validate_expense_amount(self, value):
+        if value <= 0:
+            raise serializers.ValidationError('A bill has to be more than zero.')
+        return value
+
+    def validate_category_id(self, value):
+        if not ExpenseCategory.objects.filter(id=value, is_active=True).exists():
+            raise serializers.ValidationError('Invalid category selected.')
+        return value
 
     def validate_amount(self, value):
         # This guards the split ROW - what one *other* person owes - and a row

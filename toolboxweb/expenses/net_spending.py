@@ -58,10 +58,18 @@ def net_spending(user, date_from=None, date_to=None):
     )
     owed = _apply_dates(owed, date_from, date_to, field="expense__date")
 
-    # your share of bills someone else paid — add (spent, not on your ledger)
+    # your share of bills someone else paid — add (spent, not on your ledger),
+    # but only the ones you opted into.
+    #
+    # A split somebody else created is theirs until you accept it. Counting it
+    # here regardless is what made a bill you never agreed to show up inside
+    # your spending totals while appearing nowhere in your expense list — felt
+    # in the balance, invisible as an item. include_in_expenses is that consent,
+    # set from the Splits page; until then the share lives in Splits only.
     mine = (
         ExpenseSplit.objects.filter(
-            person__linked_user=user, expense__transaction_type="expense"
+            person__linked_user=user, expense__transaction_type="expense",
+            include_in_expenses=True,
         ).exclude(expense__user=user)
     )
     mine = _apply_dates(mine, date_from, date_to, field="expense__date")

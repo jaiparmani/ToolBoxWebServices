@@ -145,7 +145,9 @@ def _split_stale(user):
     by_person = {}
     for s in stale:
         p = by_person.setdefault(s.person_id, {'name': s.person.name, 'total': Decimal('0'), 'oldest': s.expense.date, 'count': 0})
-        p['total'] += _f(s.amount)
+        # What is still owed, not the original share - a part-payment has
+        # already come back and must not be chased twice.
+        p['total'] += _f(s.outstanding)
         p['count'] += 1
         if s.expense.date < p['oldest']:
             p['oldest'] = s.expense.date
