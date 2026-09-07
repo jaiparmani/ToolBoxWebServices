@@ -98,6 +98,10 @@ def _draft_from_parsed(p):
         'description': p['description'],
         'category_name': p['category_name'],
         'tags': p.get('tags') or [],
+        # The parser resolves "yesterday" against today's date. Dropping it here
+        # was why a dated note still landed on today: the value existed and was
+        # simply never carried to the write.
+        'date': p.get('date'),
     }
 
 
@@ -266,13 +270,20 @@ def _run_auto_tag(user, message, reply):
 # ── Commit (writes) ──────────────────────────────────────────────────────────
 
 def _create_expense(user, draft, on_date=None):
+    # A date reaches here by two routes: straight off the parser as a date, or
+    # on a draft that went to the client for confirmation and came back as an
+    # ISO string. Accept either, and only then fall back to today.
+    when = on_date or draft.get('date')
+    if isinstance(when, str):
+        from .views import _coerce_date_value
+        when = _coerce_date_value(when)
     expense = Expense.objects.create(
         user=user,
         amount=Decimal(str(draft['amount'])),
         transaction_type=draft.get('transaction_type', 'expense'),
         category=resolve_category(draft),
         description=draft.get('description', ''),
-        date=on_date or timezone.now().date(),
+        date=when or timezone.now().date(),
     )
     expense.tags.set(resolve_tags(user, draft.get('tags')))
     return expense

@@ -6,6 +6,7 @@ never two mirrored rows. These tests pin that down from three accounts at once:
 the payer (ashok), the counterparty (jai) and a stranger (priya) who must see
 nothing at all.
 """
+from datetime import date, timedelta
 from decimal import Decimal
 
 from django.contrib.auth.models import User
@@ -701,3 +702,49 @@ class SplitFullEditTests(APITestCase):
         response = self.client.patch(f'/api/expenses/splits/{split.id}/',
                                      {'category_id': 99999}, format='json')
         self.assertEqual(response.status_code, 400, response.data)
+
+
+class AssistantDateTests(APITestCase):
+    """"spent 10 yesterday" has to land on yesterday.
+
+    The parser already resolved relative dates; the value was dropped between
+    parsing and writing, so a dated note silently became today's.
+    """
+
+    def setUp(self):
+        self.user = User.objects.create_user('ashok', password='x')
+        Token.objects.get_or_create(user=self.user)
+        ExpenseCategory.objects.create(name='Food', transaction_type='expense')
+
+    def _parsed(self, when):
+        return {
+            'amount': 10, 'transaction_type': 'expense', 'description': 'chai',
+            'category_name': 'Food', 'tags': [], 'date': when,
+        }
+
+    def test_a_relative_date_survives_to_the_written_row(self):
+        from .assistant import _create_expense, _draft_from_parsed
+        yesterday = date.today() - timedelta(days=1)
+        expense = _create_expense(self.user, _draft_from_parsed(self._parsed(yesterday)))
+        self.assertEqual(expense.date, yesterday)
+
+    def test_a_confirmed_draft_keeps_its_date_through_the_round_trip(self):
+        """The draft goes to the client as JSON and comes back as a string."""
+        from .assistant import _create_expense, _draft_from_parsed
+        yesterday = date.today() - timedelta(days=1)
+        draft = _draft_from_parsed(self._parsed(yesterday))
+        draft['date'] = yesterday.isoformat()          # what the client sends back
+        expense = _create_expense(self.user, draft)
+        self.assertEqual(expense.date, yesterday)
+
+    def test_a_note_with_no_date_still_lands_today(self):
+        from .assistant import _create_expense, _draft_from_parsed
+        expense = _create_expense(self.user, _draft_from_parsed(self._parsed(None)))
+        self.assertEqual(expense.date, date.today())
+
+    def test_an_unusable_date_falls_back_to_today_rather_than_failing(self):
+        from .assistant import _create_expense, _draft_from_parsed
+        draft = _draft_from_parsed(self._parsed(None))
+        draft['date'] = 'not-a-date'
+        expense = _create_expense(self.user, draft)
+        self.assertEqual(expense.date, date.today())
