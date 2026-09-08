@@ -271,6 +271,7 @@ def build_expense_context(user, days=30):
     entries = list(
         Expense.objects
         .filter(user=user, date__gte=period_start, date__lte=period_end)
+        .exclude(split_only=True)
         .select_related('category')
         .order_by('date', 'created_at')
     )
