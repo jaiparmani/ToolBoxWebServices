@@ -13,6 +13,7 @@ from .models import Insight
 from .serializers import InsightSerializer
 from .services import (
     InsightGenerationError, InsightNotPossible, InsightRateLimited,
+    build_expense_context, build_health_context,
     generate_expense_insight, generate_health_insight,
 )
 
@@ -131,8 +132,52 @@ class HealthInsightViewSet(BaseInsightViewSet):
     scope = 'health'
     generator = staticmethod(generate_health_insight)
 
+    @action(detail=False, methods=['get'])
+    def preview(self, request):
+        """Return the exact context that would be sent to the LLM — no model call."""
+        user, error = _resolve_user(request)
+        if error:
+            return error
+        try:
+            days = int(request.query_params.get('days', 30))
+        except (TypeError, ValueError):
+            return Response({'error': 'days must be an integer'}, status=status.HTTP_400_BAD_REQUEST)
+        days = max(1, min(days, 180))
+        try:
+            ctx = build_health_context(user, days=days)
+        except InsightNotPossible as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({
+            'period_start': ctx.period_start.isoformat(),
+            'period_end': ctx.period_end.isoformat(),
+            'entry_count': ctx.entry_count,
+            'llm_input': ctx.metrics,
+        })
+
 
 class ExpenseInsightViewSet(BaseInsightViewSet):
     """LLM-written reviews of a period's spending."""
     scope = 'expense'
     generator = staticmethod(generate_expense_insight)
+
+    @action(detail=False, methods=['get'])
+    def preview(self, request):
+        """Return the exact context that would be sent to the LLM — no model call."""
+        user, error = _resolve_user(request)
+        if error:
+            return error
+        try:
+            days = int(request.query_params.get('days', 30))
+        except (TypeError, ValueError):
+            return Response({'error': 'days must be an integer'}, status=status.HTTP_400_BAD_REQUEST)
+        days = max(1, min(days, 180))
+        try:
+            ctx = build_expense_context(user, days=days)
+        except InsightNotPossible as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({
+            'period_start': ctx['period_start'].isoformat(),
+            'period_end': ctx['period_end'].isoformat(),
+            'entry_count': ctx['entry_count'],
+            'llm_input': ctx['data'],
+        })
