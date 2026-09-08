@@ -14,7 +14,8 @@ from django.urls import reverse
 from rest_framework.authtoken.models import Token
 from rest_framework.test import APITestCase
 
-from .models import Expense, ExpenseCategory, ExpenseSplit, Notification, Person, SplitGroup
+from .models import (Expense, ExpenseCategory, ExpenseSplit, ExpenseTag, Notification,
+                     Person, SplitGroup)
 
 
 class TwoSidedSplitTests(APITestCase):
@@ -748,3 +749,193 @@ class AssistantDateTests(APITestCase):
         draft['date'] = 'not-a-date'
         expense = _create_expense(self.user, draft)
         self.assertEqual(expense.date, date.today())
+
+
+class ModelCoinedLabelTests(APITestCase):
+    """A parse may name a category or tag that doesn't exist yet.
+
+    Letting it through is the point - a fixed list can't describe a life. The
+    tests here pin the three things that keep that from turning into litter:
+    an existing name is reused whatever its case, a name that isn't label-shaped
+    never becomes a row, and the list stops growing at a ceiling.
+    """
+
+    def setUp(self):
+        self.user = User.objects.create_user('ashok', password='x')
+        Token.objects.get_or_create(user=self.user)
+
+    def parsed(self, category_name, transaction_type='expense'):
+        return {'amount': 10, 'transaction_type': transaction_type,
+                'description': 'chai', 'category_name': category_name, 'tags': []}
+
+    # ── Creating what's genuinely new ──────────────────────────────────────
+
+    def test_a_brand_new_category_is_created_and_attached(self):
+        from .resolvers import resolve_category
+        category = resolve_category(self.parsed('Pet care'))
+        self.assertEqual(category.name, 'Pet care')
+        self.assertEqual(category.transaction_type, 'expense')
+
+    def test_a_brand_new_tag_is_created_for_the_user(self):
+        from .resolvers import resolve_tags
+        tags = resolve_tags(self.user, ['vet'])
+        self.assertEqual([t.name for t in tags], ['vet'])
+        self.assertEqual(tags[0].user, self.user)
+
+    def test_a_coined_category_reaches_the_saved_expense(self):
+        """End to end through the write path the batch import uses."""
+        from .views import ExpenseViewSet
+        item = self.parsed('Pet care')
+        item['tags'] = ['vet']
+        expense = Expense.objects.create(
+            user=self.user, amount=10, transaction_type='expense',
+            category=ExpenseViewSet._resolve_category(item),
+            description='vet visit', date=date.today())
+        expense.tags.set(ExpenseViewSet._resolve_tags(self.user, item['tags']))
+        self.assertEqual(expense.category.name, 'Pet care')
+        self.assertEqual([t.name for t in expense.tags.all()], ['vet'])
+
+    def test_a_lowercase_coinage_is_stored_with_a_capital(self):
+        from .resolvers import resolve_category
+        self.assertEqual(resolve_category(self.parsed('groceries')).name, 'Groceries')
+
+    # ── Reusing what's already there ───────────────────────────────────────
+
+    def test_a_different_case_reuses_the_existing_category(self):
+        from .resolvers import resolve_category
+        existing = ExpenseCategory.objects.create(name='Food', transaction_type='expense')
+        for name in ('food', 'FOOD', '  Food  '):
+            self.assertEqual(resolve_category(self.parsed(name)).id, existing.id)
+        self.assertEqual(ExpenseCategory.objects.filter(name__iexact='food').count(), 1)
+
+    def test_a_different_case_reuses_the_existing_tag(self):
+        from .resolvers import resolve_tags
+        existing = ExpenseTag.objects.create(name='chai', user=self.user)
+        tags = resolve_tags(self.user, ['Chai'])
+        self.assertEqual([t.id for t in tags], [existing.id])
+        self.assertEqual(ExpenseTag.objects.filter(user=self.user).count(), 1)
+
+    def test_the_same_name_repeated_in_one_list_makes_one_tag(self):
+        from .resolvers import resolve_tags
+        tags = resolve_tags(self.user, ['chai', 'Chai', ' chai '])
+        self.assertEqual(len(tags), 1)
+        self.assertEqual(ExpenseTag.objects.filter(user=self.user).count(), 1)
+
+    def test_a_name_held_by_another_type_is_qualified_not_stolen(self):
+        from .resolvers import resolve_category
+        income = ExpenseCategory.objects.create(name='Salary', transaction_type='income')
+        coined = resolve_category(self.parsed('Salary', transaction_type='expense'))
+        self.assertNotEqual(coined.id, income.id)
+        self.assertEqual(coined.transaction_type, 'expense')
+        income.refresh_from_db()
+        self.assertEqual(income.name, 'Salary')          # untouched
+
+    def test_an_existing_category_is_never_renamed_or_retyped(self):
+        from .resolvers import resolve_category
+        existing = ExpenseCategory.objects.create(name='food', transaction_type='expense')
+        resolve_category(self.parsed('Food'))
+        existing.refresh_from_db()
+        self.assertEqual(existing.name, 'food')
+        self.assertEqual(existing.transaction_type, 'expense')
+
+    # ── Refusing junk ──────────────────────────────────────────────────────
+
+    def test_a_sentence_does_not_become_a_category(self):
+        from .resolvers import resolve_category
+        long_name = 'Dinner at that place with Raj and the others last friday'
+        category = resolve_category(self.parsed(long_name))
+        self.assertEqual(category.name, 'Other')
+        self.assertFalse(ExpenseCategory.objects.filter(name=long_name).exists())
+
+    def test_placeholders_and_punctuation_do_not_become_categories(self):
+        from .resolvers import resolve_category
+        for junk in ('N/A', 'unknown', 'Misc', '???', '   ', '123', '-'):
+            self.assertEqual(resolve_category(self.parsed(junk)).name, 'Other',
+                             f'{junk!r} should not become a category')
+        # One shared bucket, not one per piece of junk.
+        self.assertEqual(ExpenseCategory.objects.filter(transaction_type='expense').count(), 1)
+
+    def test_the_fallback_bucket_is_per_transaction_type(self):
+        from .resolvers import resolve_category
+        self.assertEqual(resolve_category(self.parsed('N/A', 'income')).name, 'Other income')
+
+    def test_junk_tags_are_skipped_rather_than_substituted(self):
+        from .resolvers import resolve_tags
+        tags = resolve_tags(self.user, ['n/a', '???', '', None, 42,
+                                        'a whole sentence about the purchase', 'chai'])
+        self.assertEqual([t.name for t in tags], ['chai'])
+        self.assertEqual(ExpenseTag.objects.filter(user=self.user).count(), 1)
+
+    def test_no_more_than_three_tags_are_attached(self):
+        from .resolvers import resolve_tags
+        tags = resolve_tags(self.user, ['a', 'b', 'c', 'd', 'e'])
+        self.assertEqual(len(tags), 3)
+
+    def test_a_tag_another_account_owns_is_skipped_not_stolen(self):
+        from .resolvers import resolve_tags
+        other = User.objects.create_user('priya', password='x')
+        theirs = ExpenseTag.objects.create(name='chai', user=other)
+        self.assertEqual(resolve_tags(self.user, ['chai']), [])
+        theirs.refresh_from_db()
+        self.assertEqual(theirs.user, other)
+
+    def test_auto_creation_stops_at_the_ceiling(self):
+        from . import resolvers
+        for i in range(resolvers.MAX_AUTO_CATEGORIES_PER_TYPE):
+            ExpenseCategory.objects.create(name=f'Cat {i}', transaction_type='expense')
+        category = resolvers.resolve_category(self.parsed('Pet care'))
+        self.assertEqual(category.name, 'Other')
+        self.assertFalse(ExpenseCategory.objects.filter(name='Pet care').exists())
+
+    def test_the_ceiling_does_not_block_reusing_an_existing_category(self):
+        from . import resolvers
+        for i in range(resolvers.MAX_AUTO_CATEGORIES_PER_TYPE):
+            ExpenseCategory.objects.create(name=f'Cat {i}', transaction_type='expense')
+        self.assertEqual(resolvers.resolve_category(self.parsed('Cat 3')).name, 'Cat 3')
+
+
+class InlineLabelCreationTests(APITestCase):
+    """The composer creates a category/tag over the same endpoints the Labels
+    tab uses - a human typing a name is trusted, so none of the model-output
+    guards apply here."""
+
+    def setUp(self):
+        self.user = User.objects.create_user('ashok', password='x')
+        Token.objects.get_or_create(user=self.user)
+        self.client.credentials(
+            HTTP_AUTHORIZATION=f'Token {Token.objects.get(user=self.user).key}')
+
+    def test_a_category_created_inline_can_be_used_on_an_expense(self):
+        created = self.client.post('/api/expenses/categories/', {
+            'name': 'Pet care', 'color': '#7C5CFF', 'transaction_type': 'expense',
+        }, format='json')
+        self.assertEqual(created.status_code, 201, created.data)
+        saved = self.client.post('/api/expenses/expenses/', {
+            'amount': '250.00', 'transaction_type': 'expense',
+            'category_id': created.data['id'], 'description': 'vet visit',
+            'date': date.today().isoformat(),
+        }, format='json')
+        self.assertEqual(saved.status_code, 201, saved.data)
+
+    def test_an_income_expense_cannot_take_an_expense_category(self):
+        """Why the composer creates the category with the sheet's own type."""
+        created = self.client.post('/api/expenses/categories/', {
+            'name': 'Pet care', 'transaction_type': 'expense'}, format='json')
+        saved = self.client.post('/api/expenses/expenses/', {
+            'amount': '250.00', 'transaction_type': 'income',
+            'category_id': created.data['id'], 'description': 'refund',
+            'date': date.today().isoformat(),
+        }, format='json')
+        self.assertEqual(saved.status_code, 400, saved.data)
+
+    def test_a_duplicate_name_is_refused_so_the_client_must_reuse(self):
+        ExpenseCategory.objects.create(name='Food', transaction_type='expense')
+        response = self.client.post('/api/expenses/categories/', {
+            'name': 'Food', 'transaction_type': 'expense'}, format='json')
+        self.assertEqual(response.status_code, 400, response.data)
+
+    def test_a_tag_created_inline_belongs_to_the_caller(self):
+        response = self.client.post('/api/expenses/tags/', {
+            'name': 'vet', 'color': '#7C5CFF'}, format='json')
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(ExpenseTag.objects.get(name='vet').user, self.user)

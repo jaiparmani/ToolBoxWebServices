@@ -52,7 +52,9 @@ _CLASSIFICATION_RULES = (
     "belongs to - you may only reuse one whose type matches the type you chose AND whose "
     "meaning genuinely fits the note. Otherwise invent a short new category name (1-3 "
     "words) describing the kind of spending, such as \"Groceries\", \"Transport\", "
-    "\"Lending\" or \"Salary\". Never reuse a category just because its name is familiar."
+    "\"Lending\" or \"Salary\". Never reuse a category just because its name is familiar.\n"
+    "A category name is a label, not a sentence and not a placeholder: never answer "
+    "\"Other\", \"Misc\", \"Unknown\" or \"N/A\", and never restate the whole note."
 )
 
 
