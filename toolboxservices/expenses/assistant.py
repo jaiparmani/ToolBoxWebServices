@@ -25,7 +25,8 @@ from django.utils import timezone
 
 from .services import (
     ExpenseParseError, ExpenseParseNotPossible, ExpenseParseRateLimited,
-    _translate_errors, parse_expense_batch, parse_expense_text, parse_search_query,
+    _translate_errors, looks_like_batch,
+    parse_expense_batch, parse_expense_text, parse_search_query,
     parse_split_text, compute_shares,
 )
 from .resolvers import known_tag_names, resolve_category, resolve_tags
@@ -123,6 +124,9 @@ def run(user, message):
     intent, reply = routed['intent'], routed['reply']
 
     try:
+        if intent == 'add_expense' and looks_like_batch(message):
+            intent = 'add_batch'
+
         if intent == 'add_expense':
             p = parse_expense_text(message, known_tags=known_tag_names(user))
             draft = _draft_from_parsed(p)

@@ -267,6 +267,20 @@ def _translate_errors(fn, *args, **kwargs):
         raise ExpenseParseError(str(exc)) from exc
 
 
+def looks_like_batch(text):
+    """True when a single-line note likely contains multiple transactions.
+
+    Detects patterns like "20 chai, 100 vada pav" or "spent 40 samosa and 90 metro"
+    where multiple amounts appear separated by commas, "and", or just whitespace
+    with descriptions between them. A single amount is never a batch.
+    """
+    t = (text or '').strip()
+    if not t or '\n' in t:
+        return False
+    amounts = re.findall(r'(?:^|[\s,]+)(\d+(?:\.\d+)?)\s', ' ' + t + ' ')
+    return len(amounts) >= 2
+
+
 def parse_expense_text(text, known_tags=()):
     """Ask the model to turn one free-text note into an expense dict."""
     text = (text or '').strip()

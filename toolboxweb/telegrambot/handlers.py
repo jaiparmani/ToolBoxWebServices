@@ -118,18 +118,21 @@ def _describe(expense):
 
 def handle_expense(user, text, link):
     """Log a single note (quick_add) or a pasted batch (bulk_add)."""
+    from expenses.services import looks_like_batch
+
     text = (text or "").strip()
     if not text:
         return None, None
 
     # Anything multi-line is almost certainly a paste; so is the message right
-    # after /import. Read either as a batch.
+    # after /import. A single line with multiple amounts ("20 chai, 100 vada
+    # pav") is also a batch. Read all of these as a batch.
     awaiting = link.awaiting_import
     if awaiting:
         link.awaiting_import = False
         link.save(update_fields=["awaiting_import"])
 
-    if awaiting or "\n" in text:
+    if awaiting or "\n" in text or looks_like_batch(text):
         ok, data = _call_expense_action(
             "bulk_add", user, {"text": text, "commit": True}
         )

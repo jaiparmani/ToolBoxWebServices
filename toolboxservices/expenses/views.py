@@ -33,7 +33,7 @@ from .serializers import (
 from .services import (
     compute_shares,
     ExpenseParseError, ExpenseParseNotPossible, ExpenseParseRateLimited,
-    answer_lending_question,
+    answer_lending_question, looks_like_batch,
     parse_expense_batch, parse_expense_text, parse_search_query, parse_split_text,
     validate_supplied_items,
 )
@@ -293,7 +293,12 @@ class ExpenseViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['post'])
     def quick_add(self, request):
-        """Parse a free-text note (e.g. "20 aamras") with an LLM and save it as an expense."""
+        """Parse a free-text note (e.g. "20 aamras") with an LLM and save it as an expense.
+
+        When the text contains multiple amounts ("20 chai, 100 vada pav") it is
+        automatically routed through the batch parser so each transaction is
+        saved separately.
+        """
         user, error = self._resolve_user(request)
         if error:
             return error
@@ -302,8 +307,39 @@ class ExpenseViewSet(viewsets.ModelViewSet):
         if not text or not text.strip():
             return Response({'error': 'text is required'}, status=status.HTTP_400_BAD_REQUEST)
 
+        known_tags = self._known_tag_names(user)
+
+        if looks_like_batch(text):
+            try:
+                items = parse_expense_batch(text, known_tags=known_tags)
+            except ExpenseParseNotPossible as exc:
+                return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+            except ExpenseParseRateLimited as exc:
+                return Response({'error': str(exc)}, status=status.HTTP_429_TOO_MANY_REQUESTS)
+            except ExpenseParseError as exc:
+                return Response({'error': str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+
+            if items and len(items) > 1:
+                created = []
+                for i in items:
+                    on = i.get('date')
+                    expense = Expense.objects.create(
+                        user=user, amount=i['amount'],
+                        transaction_type=i['transaction_type'],
+                        category=self._resolve_category(i),
+                        description=i['description'],
+                        date=(_coerce_date_value(on) if on else None) or timezone.now().date(),
+                    )
+                    expense.tags.set(self._resolve_tags(user, i.get('tags')))
+                    created.append(expense)
+                return Response(
+                    {'count': len(created),
+                     'items': [ExpenseSerializer(e).data for e in created]},
+                    status=status.HTTP_201_CREATED,
+                )
+
         try:
-            parsed = parse_expense_text(text, known_tags=self._known_tag_names(user))
+            parsed = parse_expense_text(text, known_tags=known_tags)
         except ExpenseParseNotPossible as exc:
             return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         except ExpenseParseRateLimited as exc:
@@ -317,8 +353,6 @@ class ExpenseViewSet(viewsets.ModelViewSet):
             transaction_type=parsed['transaction_type'],
             category=self._resolve_category(parsed),
             description=parsed['description'],
-            # The parser resolves relative dates ("yesterday", "last friday");
-            # falls back to today when the note carries no date.
             date=parsed.get('date') or timezone.now().date(),
         )
         expense.tags.set(self._resolve_tags(user, parsed.get('tags')))
