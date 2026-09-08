@@ -3,17 +3,17 @@ from rest_framework.exceptions import AuthenticationFailed
 
 
 class ApiKeyAuthentication(BaseAuthentication):
-    """Authenticate via ``Authorization: Api-Key tbk_…``.
+    """Accept ``Authorization: Api-Key tbk_…`` or ``Authorization: Bearer tbk_…``.
 
-    Used by Apple Shortcuts and other headless clients that can't run a login
-    flow. Each key is tied to one user and looked up directly in the database.
+    The second form lets ChatGPT Custom GPT Actions (which only offer Bearer
+    auth) work without a proxy, while keeping the original ``Api-Key`` scheme
+    for Apple Shortcuts and other headless clients.
     """
-
-    keyword = 'Api-Key'
+    _KEYWORDS = {'Api-Key', 'Bearer'}
 
     def authenticate(self, request):
         auth = request.META.get('HTTP_AUTHORIZATION', '').split()
-        if len(auth) != 2 or auth[0] != self.keyword:
+        if len(auth) != 2 or auth[0] not in self._KEYWORDS:
             return None
 
         key = auth[1]

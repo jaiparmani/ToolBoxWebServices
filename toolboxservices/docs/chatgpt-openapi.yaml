@@ -1,0 +1,261 @@
+openapi: 3.1.0
+info:
+  title: Money OS – Expense Tracker
+  description: >
+    Add expenses, query spending, and list categories/tags for Jai's personal
+    finance app. Authenticate with an API key created from the app's API Keys
+    page. Every expense needs a category_id — list categories first.
+  version: "1.0"
+
+servers:
+  - url: https://toolbox.pythonanywhere.com/api
+
+paths:
+  /expenses/categories/:
+    get:
+      operationId: listCategories
+      summary: List all expense categories
+      description: >
+        Returns every active category with its id, name, and transaction_type.
+        Use the id when creating an expense. Filter by transaction_type if
+        needed (usually "expense").
+      parameters:
+        - name: transaction_type
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [expense]
+          description: Filter to expense categories only.
+      responses:
+        "200":
+          description: Array of categories
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Category"
+
+  /expenses/tags/:
+    get:
+      operationId: listTags
+      summary: List all user tags
+      responses:
+        "200":
+          description: Array of tags
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Tag"
+
+  /expenses/expenses/:
+    post:
+      operationId: createExpense
+      summary: Create an expense
+      description: >
+        Creates a single expense. Requires amount, description, category_id,
+        and date (YYYY-MM-DD). transaction_type defaults to "expense".
+        tag_ids is optional.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExpenseCreate"
+      responses:
+        "201":
+          description: Expense created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Expense"
+        "400":
+          description: Validation error
+
+    get:
+      operationId: listExpenses
+      summary: List recent expenses
+      description: >
+        Returns the user's expenses, newest first. Supports date filtering
+        and search.
+      parameters:
+        - name: date_from
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date
+        - name: date_to
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date
+        - name: search
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Search in description
+        - name: page_size
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 10
+      responses:
+        "200":
+          description: Paginated expense list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count:
+                    type: integer
+                  results:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Expense"
+
+  /expenses/expenses/summary/:
+    get:
+      operationId: getExpenseSummary
+      summary: Get spending summary for a date range
+      description: >
+        Returns total_expenses, transaction_count, and category_breakdown
+        for the given date window (defaults to current month).
+      parameters:
+        - name: date_from
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date
+        - name: date_to
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date
+      responses:
+        "200":
+          description: Summary statistics
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total_expenses:
+                    type: number
+                  transaction_count:
+                    type: integer
+                  category_breakdown:
+                    type: object
+
+  /expenses/copilot/ask/:
+    post:
+      operationId: askAboutSpending
+      summary: Ask a natural-language question about spending
+      description: >
+        Send a question like "how much on food last month" and get back
+        filtered results with a computed total. The model picks filter
+        values; the database does the math.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [question]
+              properties:
+                question:
+                  type: string
+                  description: Natural-language spending question
+      responses:
+        "200":
+          description: Filtered results with totals
+
+components:
+  securitySchemes:
+    apiKey:
+      type: http
+      scheme: bearer
+      bearerFormat: "tbk_..."
+      description: >
+        Use your Money OS API key (starts with tbk_). Sent as
+        Authorization: Bearer tbk_your_key_here
+
+  schemas:
+    Category:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        transaction_type:
+          type: string
+        color:
+          type: string
+        is_active:
+          type: boolean
+
+    Tag:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+
+    ExpenseCreate:
+      type: object
+      required: [amount, description, category_id, date]
+      properties:
+        amount:
+          type: number
+          description: Positive number (e.g. 250.00)
+        description:
+          type: string
+          description: What the expense was for
+        category_id:
+          type: integer
+          description: ID from listCategories
+        date:
+          type: string
+          format: date
+          description: YYYY-MM-DD
+        transaction_type:
+          type: string
+          default: expense
+          enum: [expense]
+        tag_ids:
+          type: array
+          items:
+            type: integer
+          description: Optional tag IDs from listTags
+
+    Expense:
+      type: object
+      properties:
+        id:
+          type: integer
+        amount:
+          type: string
+        description:
+          type: string
+        date:
+          type: string
+        category:
+          $ref: "#/components/schemas/Category"
+        tags:
+          type: array
+          items:
+            $ref: "#/components/schemas/Tag"
+
+security:
+  - apiKey: []
