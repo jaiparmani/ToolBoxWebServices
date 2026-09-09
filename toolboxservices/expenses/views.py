@@ -1526,6 +1526,39 @@ class SplitViewSet(viewsets.ModelViewSet):
                 touched.append(split)
 
         remaining = outstanding_total - total
+
+        # Notify the counterparty that money moved.
+        if touched:
+            actor = user.get_full_name() or user.username
+            fully = sum(1 for s in touched if s.is_settled)
+            partial_n = len(touched) - fully
+            for split in touched:
+                payer = split.expense.user
+                debtor = split.person.linked_user
+                counterparty = debtor if payer == user else payer
+                if not counterparty or counterparty == user:
+                    continue
+                paid_str = f'₹{total:,.0f}'
+                if total == outstanding_total:
+                    body = f'{actor} settled {paid_str} — all square.'
+                else:
+                    body = f'{actor} paid {paid_str}, {f"₹{remaining:,.0f}"} still outstanding.'
+                notify(counterparty, f'{actor} settled up', body, kind='settle', link='/shared')
+                break  # one notification per settle action, not per split
+
+            try:
+                from telegrambot.telegram_api import notify_user as _tg_notify
+                for split in touched:
+                    payer = split.expense.user
+                    debtor = split.person.linked_user
+                    counterparty = debtor if payer == user else payer
+                    if counterparty and counterparty != user:
+                        paid_str = f'₹{total:,.0f}'
+                        _tg_notify(counterparty, f'✅ {actor} settled {paid_str} with you.')
+                        break
+            except Exception:
+                pass
+
         return Response({
             'settled_count': sum(1 for s in touched if s.is_settled),
             'partial_count': sum(1 for s in touched if not s.is_settled),
