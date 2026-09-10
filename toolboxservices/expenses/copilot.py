@@ -20,7 +20,7 @@ from decimal import Decimal
 from django.db.models import Sum
 from django.utils import timezone
 
-from .models import CopilotCard, Expense, ExpenseSplit, RecurringRule
+from .models import CopilotCard, Expense, ExpenseSplit, RecurringRule, notify
 from .projections import build_projection
 
 # Tunables - deliberately conservative so a card means something.
@@ -29,6 +29,8 @@ SPIKE_MIN_ABS = Decimal('500')      # ...and be at least this much, to skip nois
 STALE_SPLIT_DAYS = 14
 RENEWED_WINDOW_DAYS = 3
 LOW_RUNWAY_DAYS = 7
+PRICE_CHANGE_RATIO = Decimal('0.02')  # >2% off the rule's own amount counts as a change
+MATCH_WINDOW_DAYS = 2                 # how close an actual expense must land to the occurrence date
 
 
 def _f(v):
@@ -116,14 +118,52 @@ def _category_spike(user):
     return cards
 
 
+def _matching_expense(user, rule, when):
+    """The one actual expense that looks like this occurrence, if unambiguous.
+
+    There's no FK from a RecurringRule to the Expense it produced, so this is
+    a heuristic: same category, within a few days of the expected date. Two or
+    more candidates (e.g. another same-category purchase that week) means the
+    match isn't safe to trust, so it's treated as no match rather than guessed.
+    """
+    candidates = list(Expense.objects.filter(
+        user=user, transaction_type='expense', category=rule.category,
+        date__gte=when - timedelta(days=MATCH_WINDOW_DAYS),
+        date__lte=when + timedelta(days=MATCH_WINDOW_DAYS),
+    ))
+    return candidates[0] if len(candidates) == 1 else None
+
+
 def _subscription_renewed(user):
     today = timezone.now().date()
     cards = []
     rules = RecurringRule.objects.filter(user=user, is_active=True, transaction_type='expense')
     for rule in rules:
         occ = rule.occurrences(today - timedelta(days=RENEWED_WINDOW_DAYS), today)
-        if occ:
-            when = occ[-1]
+        if not occ:
+            continue
+        when = occ[-1]
+
+        actual = _matching_expense(user, rule, when) if rule.amount > 0 else None
+        changed = (
+            actual is not None
+            and abs(actual.amount - rule.amount) / rule.amount >= PRICE_CHANGE_RATIO
+        )
+
+        if changed:
+            direction = 'up' if actual.amount > rule.amount else 'down'
+            cards.append(_card(
+                'subscription_price_changed', 'watch',
+                title=f"{rule.description} price went {direction}",
+                body=(f"{rule.description} renewed at {_rupees(actual.amount)} on {when.isoformat()}, "
+                      f"versus {_rupees(rule.amount)} before."),
+                dedupe_key=f"subscription_price_changed:{rule.id}:{when.isoformat()}:{actual.amount}",
+                metric_value=_f(actual.amount), metric_label=rule.description,
+                data={'rule_id': rule.id, 'date': when.isoformat(),
+                      'old_amount': float(rule.amount), 'new_amount': float(actual.amount)},
+                action_label='Manage recurring', action_route='/recurring',
+            ))
+        else:
             cards.append(_card(
                 'subscription_renewed', 'info',
                 title=f"{rule.description} renewed",
@@ -196,12 +236,24 @@ def detect(user):
     return cards
 
 
+# Severities worth interrupting the user for, outside the app. `info` cards
+# (a plain subscription renewal, say) stay pull-only - the inbox, not a ping.
+NOTIFY_SEVERITIES = {'urgent'}
+
+
 def refresh(user):
     """Upsert the current candidates and clear cards whose condition has cleared.
 
     Dismissed cards are respected: a still-holding condition keeps its dismissed
     state (won't nag), and a cleared condition is removed regardless of state.
     Returns the live (non-dismissed) cards, most severe first.
+
+    A brand-new urgent card also drops a Notification — refresh() used to only
+    run when someone happened to open the app, so a bill_overdraw or low_runway
+    card generated overnight sat unseen until the next visit. This doesn't
+    change when refresh() runs (see the refresh_copilot_cards management
+    command for that); it just means whenever it does run, a genuinely new
+    urgent condition reaches the feed instead of waiting to be noticed.
     """
     candidates = detect(user)
     by_key = {c['dedupe_key']: c for c in candidates}
@@ -218,7 +270,12 @@ def refresh(user):
                 setattr(card, f, c[f])
             card.save(update_fields=list(fields) + ['updated_at'])
         else:
-            CopilotCard.objects.create(user=user, **c)
+            new_card = CopilotCard.objects.create(user=user, **c)
+            if new_card.severity in NOTIFY_SEVERITIES:
+                notify(user, title=new_card.title, body=new_card.body,
+                       kind='copilot', link=new_card.action_route)
+                from telegrambot.telegram_api import notify_user as _tg_notify
+                _tg_notify(user, f"⚠️ {new_card.title} — {new_card.body}")
 
     # A condition that no longer holds shouldn't linger.
     for key, card in existing.items():

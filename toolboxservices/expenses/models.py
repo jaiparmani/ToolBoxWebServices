@@ -418,6 +418,7 @@ class CopilotCard(models.Model):
         ('bill_overdraw', 'Upcoming bill overdraws safe-to-spend'),
         ('category_spike', 'Unusual category spend'),
         ('subscription_renewed', 'Subscription renewed'),
+        ('subscription_price_changed', 'Subscription price changed'),
         ('split_stale', 'Unsettled split going stale'),
         ('low_runway', 'Low runway'),
     ]

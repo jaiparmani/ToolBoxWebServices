@@ -147,6 +147,42 @@ class ExpenseViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         serializer.save(user=self.request.user)
 
+    def create(self, request, *args, **kwargs):
+        """Save as usual, plus a soft, dismissible duplicate warning.
+
+        Same amount, category and transaction type on the same date as
+        something created moments ago is very likely a double-submit or the
+        same message parsed twice — not a second, deliberate transaction. The
+        save always succeeds either way; the frontend decides what to do with
+        `duplicate_warning`.
+        """
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        self.perform_create(serializer)
+        expense = serializer.instance
+
+        data = dict(serializer.data)
+        recent_duplicate = (
+            Expense.objects.filter(
+                user=request.user, transaction_type=expense.transaction_type,
+                amount=expense.amount, category=expense.category, date=expense.date,
+                created_at__gte=timezone.now() - timedelta(minutes=10),
+            )
+            .exclude(pk=expense.pk)
+            .order_by('-created_at')
+            .first()
+        )
+        if recent_duplicate:
+            data['duplicate_warning'] = {
+                'expense_id': recent_duplicate.id,
+                'description': recent_duplicate.description,
+                'amount': str(recent_duplicate.amount),
+                'date': recent_duplicate.date.isoformat(),
+            }
+
+        headers = self.get_success_headers(serializer.data)
+        return Response(data, status=status.HTTP_201_CREATED, headers=headers)
+
     @action(detail=False, methods=['get'])
     def summary(self, request):
         """Expense summary — spending is the user's own share only.
@@ -154,27 +190,55 @@ class ExpenseViewSet(viewsets.ModelViewSet):
         Expenses (and the category breakdown / net balance built on them) use
         net_spending, so lending is not counted as spent. Income/debt/credit are
         unaffected.
-        """
-        queryset = self.get_queryset()
 
-        # Date range filter
+        Runs the *same* ExpenseFilter the list view uses (date range, category,
+        tags, search, amount range, transaction type) — previously this only
+        ever looked at date_from/date_to, so the SPENT/INCOME/BALANCE header
+        stayed put while a tag or category filter visibly narrowed the list
+        below it. When only the date scope is active, the totals still come
+        from net_spending exactly as before (unchanged behaviour for the
+        common case); a real extra filter switches to netting the filtered
+        rows directly, the same "full amount minus what's owed to you on it"
+        rule net_spending applies over a date window — see owed_to_you_total.
+        """
         date_from = request.query_params.get('date_from')
         date_to = request.query_params.get('date_to')
+        filtered = self.filter_queryset(self.get_queryset())
 
-        if date_from:
-            queryset = queryset.filter(date__gte=date_from)
-        if date_to:
-            queryset = queryset.filter(date__lte=date_to)
+        extra_filter_params = ('category', 'tags', 'search', 'amount_min', 'amount_max', 'transaction_type')
+        has_extra_filters = any(request.query_params.get(p) for p in extra_filter_params)
 
         # Income/debt/credit are unaffected by splitting; expenses use your share.
-        totals = queryset.aggregate(
+        totals = filtered.aggregate(
             total_income=Sum('amount', filter=Q(transaction_type='income')),
             total_debt=Sum('amount', filter=Q(transaction_type='debt')),
             total_credit=Sum('amount', filter=Q(transaction_type='credit'))
         )
 
-        ns = net_spending(request.user, date_from, date_to)
-        expense_total = ns['total']
+        if has_extra_filters:
+            # net_spending only takes a date window, so a category/tag/search/
+            # amount filter needs its own netting over the already-filtered
+            # rows. This doesn't add back "your share of bills someone else
+            # paid" (net_spending's third leg) — those rows live on another
+            # user's expenses and were never part of `filtered` to begin with.
+            expense_qs = filtered.filter(transaction_type='expense')
+            raw_total = expense_qs.aggregate(t=Sum('amount'))['t'] or 0
+            expense_total = max(float(raw_total) - float(owed_to_you_total(expense_qs)), 0.0)
+
+            owed_by_category = {
+                r['expense__category_id']: r['t']
+                for r in ExpenseSplit.objects.filter(expense__in=expense_qs)
+                    .values('expense__category_id').annotate(t=Sum('amount'))
+            }
+            category_breakdown = {}
+            for r in expense_qs.values('category__id', 'category__name').annotate(gross=Sum('amount')):
+                net = float(r['gross'] or 0) - float(owed_by_category.get(r['category__id'], 0) or 0)
+                if net > 0:
+                    category_breakdown[r['category__name']] = net
+        else:
+            ns = net_spending(request.user, date_from, date_to)
+            expense_total = ns['total']
+            category_breakdown = {c['category__name']: c['total'] for c in ns['category_totals']}
 
         # Calculate net balance on your true spend
         income_total = totals.get('total_income') or 0
@@ -183,16 +247,13 @@ class ExpenseViewSet(viewsets.ModelViewSet):
 
         net_balance = (float(income_total) + float(credit_total)) - (expense_total + float(debt_total))
 
-        # Category breakdown for expenses — share-only, keyed by name as before
-        category_breakdown = {c['category__name']: c['total'] for c in ns['category_totals']}
-
         summary_data = {
             'total_expenses': expense_total,
-            'total_income': totals.get('total_income') or 0,
-            'total_debt': totals.get('total_debt') or 0,
-            'total_credit': totals.get('total_credit') or 0,
+            'total_income': income_total,
+            'total_debt': debt_total,
+            'total_credit': credit_total,
             'net_balance': net_balance,
-            'transaction_count': queryset.count(),
+            'transaction_count': filtered.count(),
             'category_breakdown': category_breakdown
         }
 
