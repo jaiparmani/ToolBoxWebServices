@@ -5,7 +5,7 @@ from rest_framework.permissions import AllowAny
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.pagination import PageNumberPagination
 from django_filters.rest_framework import DjangoFilterBackend
-from django.db.models import Sum, Count, Q, F, DecimalField, ExpressionWrapper
+from django.db.models import Sum, Count, Max, Q, F, DecimalField, ExpressionWrapper
 from django.utils import timezone
 from django.core.exceptions import ObjectDoesNotExist
 from datetime import datetime, timedelta, date
@@ -259,6 +259,63 @@ class ExpenseViewSet(viewsets.ModelViewSet):
 
         serializer = ExpenseSummarySerializer(summary_data)
         return Response(serializer.data)
+
+    @action(detail=False, methods=['get'])
+    def entry_suggestions(self, request):
+        """What you typed before, for what you're typing now.
+
+        Given a partial description, the past expenses whose description
+        contains it (most frequent, then most recent, first) plus the single
+        most common category and the couple most common tags among those
+        matches — so the composer can autocomplete the description and
+        pre-fill category/tags from your own history, not a guess. Requires
+        at least 2 characters; a 1-character query would match almost
+        everything and suggest nothing useful.
+        """
+        q = (request.query_params.get('q') or '').strip()
+        ttype = request.query_params.get('type') or 'expense'
+        empty = {'descriptions': [], 'category_id': None, 'tag_ids': []}
+        if len(q) < 2:
+            return Response(empty)
+
+        qs = self.get_queryset().filter(transaction_type=ttype, description__icontains=q)
+        if not qs.exists():
+            return Response(empty)
+
+        desc_rows = (qs.values('description')
+                     .annotate(freq=Count('id'), last=Max('date'))
+                     .order_by('-freq', '-last')[:6])
+        descriptions = [r['description'] for r in desc_rows if r['description']]
+
+        cat_row = (qs.exclude(category__isnull=True)
+                   .values('category_id')
+                   .annotate(freq=Count('id'))
+                   .order_by('-freq')
+                   .first())
+        category_id = cat_row['category_id'] if cat_row else None
+
+        tag_rows = (qs.filter(tags__isnull=False)
+                    .values('tags__id')
+                    .annotate(freq=Count('id'))
+                    .order_by('-freq')[:2])
+        tag_ids = [r['tags__id'] for r in tag_rows]
+
+        return Response({'descriptions': descriptions, 'category_id': category_id, 'tag_ids': tag_ids})
+
+    @action(detail=False, methods=['get'])
+    def label_usage(self, request):
+        """All-time usage counts for this user's categories and tags.
+
+        Powers frequency-sorted pickers in the composer — the categories and
+        tags you actually reach for surface first, instead of a fixed
+        alphabetical/insertion order that never reflects how you use the app.
+        """
+        qs = self.get_queryset()
+        cat_rows = qs.exclude(category__isnull=True).values('category_id').annotate(c=Count('id'))
+        categories = {str(r['category_id']): r['c'] for r in cat_rows}
+        tag_rows = qs.filter(tags__isnull=False).values('tags__id').annotate(c=Count('id'))
+        tags = {str(r['tags__id']): r['c'] for r in tag_rows}
+        return Response({'categories': categories, 'tags': tags})
 
     @action(detail=False, methods=['get'])
     def recent(self, request):
@@ -675,6 +732,7 @@ class ExpenseViewSet(viewsets.ModelViewSet):
                kind='split', link='/splits')
         creator_name = (expense.user.get_full_name() or expense.user.username).strip()
         from telegrambot.telegram_api import notify_user as _tg_notify
+        from whatsappbot.whatsapp_api import notify_user as _wa_notify
         for s in splits:
             if s.person.linked_user and s.amount:
                 paid_note = f" (paid by {paid_by_person.name})" if paid_by_person else ""
@@ -683,12 +741,13 @@ class ExpenseViewSet(viewsets.ModelViewSet):
                        f"{expense.description}{paid_note} — you owe ₹{s.amount}. "
                        f"It's in Shared; add it to your expenses if you want it counted.",
                        kind='split', link='/splits')
-                _tg_notify(
-                    s.person.linked_user,
+                _split_msg = (
                     f"💸 {creator_name} split \"{expense.description}\" (₹{expense.amount}){paid_note} with you "
                     f"— you owe ₹{s.amount}. It's waiting in Money OS → Splits; nothing has been "
-                    f"added to your expenses.",
+                    f"added to your expenses."
                 )
+                _tg_notify(s.person.linked_user, _split_msg)
+                _wa_notify(s.person.linked_user, _split_msg)
 
         return Response({
             'expense': ExpenseSerializer(expense).data,
@@ -782,6 +841,7 @@ class ExpenseViewSet(viewsets.ModelViewSet):
                kind='split', link='/splits')
         creator_name = (expense.user.get_full_name() or expense.user.username).strip()
         from telegrambot.telegram_api import notify_user as _tg_notify
+        from whatsappbot.whatsapp_api import notify_user as _wa_notify
         for s in splits:
             if s.person.linked_user and s.amount:
                 paid_note = f" (paid by {paid_by_person.name})" if paid_by_person else ""
@@ -790,12 +850,13 @@ class ExpenseViewSet(viewsets.ModelViewSet):
                        f"{expense.description}{paid_note} — you owe ₹{s.amount}. "
                        f"It's in Shared; add it to your expenses if you want it counted.",
                        kind='split', link='/splits')
-                _tg_notify(
-                    s.person.linked_user,
+                _split_msg = (
                     f"💸 {creator_name} split \"{expense.description}\" (₹{expense.amount}){paid_note} with you "
                     f"— you owe ₹{s.amount}. It's waiting in Money OS → Splits; nothing has been "
-                    f"added to your expenses.",
+                    f"added to your expenses."
                 )
+                _tg_notify(s.person.linked_user, _split_msg)
+                _wa_notify(s.person.linked_user, _split_msg)
 
         return Response({
             'expense': ExpenseSerializer(expense).data,
@@ -1394,13 +1455,23 @@ class SplitViewSet(viewsets.ModelViewSet):
             from telegrambot.telegram_api import notify_user as _tg_notify
         except Exception:
             _tg_notify = None
+        try:
+            from whatsappbot.whatsapp_api import notify_user as _wa_notify
+        except Exception:
+            _wa_notify = None
 
         for user in _split_party_users(expense, exclude=actor):
             notify(user, f'{actor_name} edited a split', body,
                    kind='split', link='/splits')
+            edit_msg = f"\u270f\ufe0f {actor_name} edited a split \u2014 {body}"
             if _tg_notify:
                 try:
-                    _tg_notify(user, f"\u270f\ufe0f {actor_name} edited a split \u2014 {body}")
+                    _tg_notify(user, edit_msg)
+                except Exception:
+                    pass
+            if _wa_notify:
+                try:
+                    _wa_notify(user, edit_msg)
                 except Exception:
                     pass
 
@@ -1444,15 +1515,26 @@ class SplitViewSet(viewsets.ModelViewSet):
             from telegrambot.telegram_api import notify_user as _tg_notify
         except Exception:
             _tg_notify = None
+        try:
+            from whatsappbot.whatsapp_api import notify_user as _wa_notify
+        except Exception:
+            _wa_notify = None
 
         for user in parties:
             notify(user, f'{actor_name} removed a split', body,
                    kind='split', link='/splits')
+            remove_msg = (
+                f"\U0001f5d1 {actor_name} removed a split: "
+                f"{person_name}'s \u20b9{old_amount} for \"{description}\"."
+            )
             if _tg_notify:
                 try:
-                    _tg_notify(user,
-                               f"\U0001f5d1 {actor_name} removed a split: "
-                               f"{person_name}'s \u20b9{old_amount} for \"{description}\".")
+                    _tg_notify(user, remove_msg)
+                except Exception:
+                    pass
+            if _wa_notify:
+                try:
+                    _wa_notify(user, remove_msg)
                 except Exception:
                     pass
 
@@ -1609,13 +1691,16 @@ class SplitViewSet(viewsets.ModelViewSet):
 
             try:
                 from telegrambot.telegram_api import notify_user as _tg_notify
+                from whatsappbot.whatsapp_api import notify_user as _wa_notify
                 for split in touched:
                     payer = split.expense.user
                     debtor = split.person.linked_user
                     counterparty = debtor if payer == user else payer
                     if counterparty and counterparty != user:
                         paid_str = f'₹{total:,.0f}'
-                        _tg_notify(counterparty, f'✅ {actor} settled {paid_str} with you.')
+                        settle_msg = f'✅ {actor} settled {paid_str} with you.'
+                        _tg_notify(counterparty, settle_msg)
+                        _wa_notify(counterparty, settle_msg)
                         break
             except Exception:
                 pass
