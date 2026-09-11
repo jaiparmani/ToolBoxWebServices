@@ -21,6 +21,7 @@ from django.db.models import Sum
 from django.utils import timezone
 
 from .models import Expense, RecurringRule
+from .net_spending import net_spending
 
 TWO = Decimal('0.01')
 
@@ -34,12 +35,17 @@ def current_balance(user):
 
     Credit/debt/repayment are deliberately left out - they're claims between
     people, not cash position; the splits ledger tracks those separately.
+
+    The expense side is your own share only (net_spending), not a raw sum: a
+    bill you fronted and split with someone else was never fully your money
+    going out, and counting the whole thing understated what's actually on
+    hand.
     """
     agg = Expense.objects.filter(user=user).aggregate(
         income=Sum('amount', filter=_type('income')),
-        expense=Sum('amount', filter=_type('expense')),
     )
-    return Decimal(str(agg['income'] or 0)) - Decimal(str(agg['expense'] or 0))
+    net_expense = Decimal(str(net_spending(user)['total']))
+    return Decimal(str(agg['income'] or 0)) - net_expense
 
 
 def _type(t):
@@ -50,16 +56,16 @@ def _type(t):
 def daily_discretionary(user, lookback=30):
     """Average day-to-day spend, so projection drains at a realistic rate.
 
-    Uses the last `lookback` days of ordinary expenses. Recurring bills are
-    projected separately from their rules, so to avoid counting them twice we
-    exclude days-of-spend that a rule already covers is overkill here; instead
-    we simply average recorded expense and let recurring rules add the known
-    fixed costs on top - a slight over-estimate, which errs toward caution.
+    Uses the last `lookback` days of ordinary expenses, share-only (see
+    current_balance) so a split bill doesn't inflate the daily rate by the
+    part somebody else owes on it. Recurring bills are projected separately
+    from their rules, so to avoid counting them twice we exclude days-of-spend
+    that a rule already covers is overkill here; instead we simply average
+    recorded expense and let recurring rules add the known fixed costs on top
+    - a slight over-estimate, which errs toward caution.
     """
     since = timezone.now().date() - timedelta(days=lookback)
-    total = (Expense.objects
-             .filter(user=user, transaction_type='expense', date__gte=since)
-             .aggregate(t=Sum('amount'))['t'] or 0)
+    total = net_spending(user, since, timezone.now().date())['total']
     return Decimal(str(total)) / Decimal(lookback)
 
 
@@ -69,15 +75,11 @@ def discretionary_mix(user, lookback=30, top=6):
     The projection drains at an average daily rate; this says *where* that drain
     tends to go, so the Cash Flow River can show the composition of the everyday
     outflow, not just the fixed bills. Derived from the last `lookback` days of
-    recorded expenses, top categories kept and the rest grouped as "Other".
+    recorded expenses, share-only (see current_balance), top categories kept
+    and the rest grouped as "Other".
     """
     since = timezone.now().date() - timedelta(days=lookback)
-    rows = (Expense.objects
-            .filter(user=user, transaction_type='expense', date__gte=since)
-            .values('category__id', 'category__name', 'category__color')
-            .annotate(total=Sum('amount'))
-            .order_by('-total'))
-    rows = list(rows)
+    rows = net_spending(user, since, timezone.now().date())['category_totals']
     grand = sum((Decimal(str(r['total'] or 0)) for r in rows), Decimal('0'))
     if grand <= 0:
         return []
@@ -268,9 +270,9 @@ def money_pulse(user):
 
 
 def _spend(user, start, end):
-    return Decimal(str(Expense.objects.filter(
-        user=user, transaction_type='expense', date__gte=start, date__lte=end
-    ).aggregate(t=Sum('amount'))['t'] or 0))
+    """Share-only spend for a window (see current_balance) - so "spending is
+    picking up" isn't tripped by lending out a big bill you'll get back."""
+    return Decimal(str(net_spending(user, start, end)['total']))
 
 
 def affordability(user, amount, on_date):
