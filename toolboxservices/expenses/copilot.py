@@ -12,6 +12,9 @@ Detectors (each cites the number behind it):
   subscription_renewed - a recurring charge just went out
   split_stale          - money owed to you has sat unsettled too long
   low_runway           - the projected balance runs out inside the window
+  inactive_logging     - nothing has been recorded in a few days, for someone
+                         who normally logs often - every other detector here
+                         is only as good as the data actually being entered
 """
 
 from datetime import timedelta
@@ -31,6 +34,8 @@ RENEWED_WINDOW_DAYS = 3
 LOW_RUNWAY_DAYS = 7
 PRICE_CHANGE_RATIO = Decimal('0.02')  # >2% off the rule's own amount counts as a change
 MATCH_WINDOW_DAYS = 2                 # how close an actual expense must land to the occurrence date
+INACTIVE_DAYS = 3                     # this many days since the last entry counts as "gone quiet"
+INACTIVE_MIN_HISTORY = 5              # don't nag a brand-new account that just hasn't started yet
 
 
 def _f(v):
@@ -224,6 +229,36 @@ def _low_runway(user, proj):
     )]
 
 
+def _inactive_logging(user):
+    """Nothing recorded in a while, for someone who otherwise logs often.
+
+    Every other card here is a read on data that has to actually be entered -
+    a quiet stretch doesn't just mean calm spending, it can mean the habit
+    lapsed and the projection, pace, and every other detector are now working
+    from stale information. Gated on a minimum history so a brand-new account
+    that just hasn't started yet isn't immediately told it's "gone quiet".
+    """
+    if Expense.objects.filter(user=user, transaction_type='expense').count() < INACTIVE_MIN_HISTORY:
+        return []
+    last = (Expense.objects.filter(user=user, transaction_type='expense')
+            .order_by('-date').values_list('date', flat=True).first())
+    if not last:
+        return []
+    today = timezone.now().date()
+    gap = (today - last).days
+    if gap < INACTIVE_DAYS:
+        return []
+    return [_card(
+        'inactive_logging', 'info',
+        title=f"Nothing logged in {gap} days",
+        body=f"Your last recorded expense was {last.isoformat()}. A quick catch-up keeps everything else here honest.",
+        dedupe_key=f"inactive_logging:{last.isoformat()}",
+        metric_value=Decimal(gap), metric_label='Days since last entry',
+        data={'last_expense_date': last.isoformat(), 'gap_days': gap},
+        action_label='Add an expense', action_route='/expense-tracker',
+    )]
+
+
 def detect(user):
     """Run every detector and return the candidate card dicts."""
     proj = build_projection(user, days=30)
@@ -233,12 +268,20 @@ def detect(user):
     cards += _category_spike(user)
     cards += _subscription_renewed(user)
     cards += _split_stale(user)
+    cards += _inactive_logging(user)
     return cards
 
 
 # Severities worth interrupting the user for, outside the app. `info` cards
 # (a plain subscription renewal, say) stay pull-only - the inbox, not a ping.
 NOTIFY_SEVERITIES = {'urgent'}
+# Kinds that always notify regardless of severity - inactive_logging is
+# deliberately 'info' (it's not alarming), but the entire point of it is
+# reaching someone who has stopped opening the app, so pull-only would defeat
+# it.
+ALWAYS_NOTIFY_KINDS = {'inactive_logging'}
+NOTIFY_EMOJI = {'inactive_logging': '📝'}
+DEFAULT_NOTIFY_EMOJI = '⚠️'
 
 
 def refresh(user):
@@ -271,11 +314,12 @@ def refresh(user):
             card.save(update_fields=list(fields) + ['updated_at'])
         else:
             new_card = CopilotCard.objects.create(user=user, **c)
-            if new_card.severity in NOTIFY_SEVERITIES:
+            if new_card.severity in NOTIFY_SEVERITIES or new_card.kind in ALWAYS_NOTIFY_KINDS:
                 notify(user, title=new_card.title, body=new_card.body,
                        kind='copilot', link=new_card.action_route)
                 from telegrambot.telegram_api import notify_user as _tg_notify
-                _tg_notify(user, f"⚠️ {new_card.title} — {new_card.body}")
+                emoji = NOTIFY_EMOJI.get(new_card.kind, DEFAULT_NOTIFY_EMOJI)
+                _tg_notify(user, f"{emoji} {new_card.title} — {new_card.body}")
 
     # A condition that no longer holds shouldn't linger.
     for key, card in existing.items():

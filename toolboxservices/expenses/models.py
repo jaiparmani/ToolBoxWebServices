@@ -421,6 +421,7 @@ class CopilotCard(models.Model):
         ('subscription_price_changed', 'Subscription price changed'),
         ('split_stale', 'Unsettled split going stale'),
         ('low_runway', 'Low runway'),
+        ('inactive_logging', 'No recent expense logged'),
     ]
     SEVERITY_CHOICES = [('info', 'Info'), ('watch', 'Watch'), ('urgent', 'Urgent')]
     STATUS_CHOICES = [('new', 'New'), ('seen', 'Seen'), ('dismissed', 'Dismissed'), ('actioned', 'Actioned')]
