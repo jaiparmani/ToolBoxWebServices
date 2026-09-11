@@ -48,6 +48,7 @@ INSTALLED_APPS = [
     "insights",
     "llm",
     "telegrambot",
+    "whatsappbot",
 ]
 
 MIDDLEWARE = [
@@ -268,3 +269,23 @@ TELEGRAM_WEBHOOK_SECRET = os.environ.get('TELEGRAM_WEBHOOK_SECRET', '')
 TELEGRAM_WEBHOOK_BASE_URL = os.environ.get(
     'TELEGRAM_WEBHOOK_BASE_URL', 'https://toolbox.pythonanywhere.com'
 )
+
+# ── WhatsApp bot (whatsappbot app) ──────────────────────────────────────────
+# Same webhook-inside-the-web-app shape as the Telegram bot. Meta's Cloud API
+# has no polling fallback, so local dev needs a public https tunnel (ngrok)
+# to complete the verification handshake. Set these in the environment; never
+# commit them.
+#
+#   WHATSAPP_ACCESS_TOKEN      Bearer token from the Meta App (temporary
+#                               24h token to start, or a System User token)
+#   WHATSAPP_PHONE_NUMBER_ID   the Phone Number ID from WhatsApp → API Setup
+#                               (not the phone number itself)
+#   WHATSAPP_VERIFY_TOKEN      any string you choose; entered as "Verify
+#                               token" in the App's webhook configuration
+#   WHATSAPP_WEBHOOK_SECRET    any long random string; the secret in the
+#                               webhook URL path, e.g.
+#                               https://<domain>/api/whatsapp/webhook/<secret>/
+WHATSAPP_ACCESS_TOKEN = os.environ.get('WHATSAPP_ACCESS_TOKEN', '')
+WHATSAPP_PHONE_NUMBER_ID = os.environ.get('WHATSAPP_PHONE_NUMBER_ID', '')
+WHATSAPP_VERIFY_TOKEN = os.environ.get('WHATSAPP_VERIFY_TOKEN', '')
+WHATSAPP_WEBHOOK_SECRET = os.environ.get('WHATSAPP_WEBHOOK_SECRET', '')

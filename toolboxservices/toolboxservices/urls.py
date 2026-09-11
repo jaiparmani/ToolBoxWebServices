@@ -32,6 +32,7 @@ urlpatterns = [
     path("api/insights/", include("insights.urls")),
     path("api/llm/", include("llm.urls")),
     path("api/telegram/", include("telegrambot.urls")),
+    path("api/whatsapp/", include("whatsappbot.urls")),
     # One brain, one endpoint.
     path("api/assistant/", AssistantView.as_view(), name="assistant"),
     path("", hello)
