@@ -192,15 +192,25 @@ def build_projection(user, days=30):
 
 
 def _runway(balance, discretionary, rules, today, cap_days):
-    """Days until the projected balance would hit zero, capped at cap_days.
+    """Days until the balance would hit zero from expense outflow alone,
+    capped at cap_days.
 
-    None means it never dips to zero inside the window - healthy.
+    Deliberately expense-only: netting upcoming income into this made the
+    runway longer on the strength of a paycheck that hasn't landed yet - a
+    warning that assumes you'll be paid on time isn't much of a warning.
+    Income still shows up as its own real line on the cash-flow projection
+    (build_projection's day-by-day series); it just doesn't get to bail out
+    this specific number.
+
+    None means expense outflow alone never brings it to zero inside the window.
     """
     b = Decimal(str(balance))
     events = {}
     for rule in rules:
+        if rule.transaction_type != 'expense':
+            continue
         for d in rule.occurrences(today + timedelta(days=1), today + timedelta(days=cap_days)):
-            events[d] = events.get(d, Decimal('0')) + rule.signed_amount
+            events[d] = events.get(d, Decimal('0')) + rule.signed_amount  # already negative
     for i in range(1, cap_days + 1):
         day = today + timedelta(days=i)
         b += events.get(day, Decimal('0'))
@@ -214,10 +224,15 @@ def money_pulse(user):
     """A single read on where the user stands, with the numbers behind it.
 
     Four states, chosen in priority order so the most important wins:
-      attention   - balance projected to run out inside the horizon
+      attention   - expense outflow alone would run the balance out inside the horizon
       watchful    - spending is accelerating week on week
-      opportunity - spending unusually low, or sizeable income incoming
+      opportunity - spending unusually low
       calm        - none of the above
+
+    Expense-focused throughout: runway and every headline here are read off
+    spending, never off income arriving on schedule to bail things out.
+    upcoming_income/next_income_date still ride along in `inputs` (nothing
+    here hides a real figure), they just don't drive the headline anymore.
     """
     today = timezone.now().date()
     proj = build_projection(user, days=30)
@@ -241,16 +256,11 @@ def money_pulse(user):
         headline = 'Spending is picking up'
         detail = (f"You've spent ₹{_f(last7):.0f} in the last 7 days versus ₹{_f(prior7):.0f} the week "
                   f"before - about {int((last7/prior7 - 1) * 100)}% more.")
-    elif quiet or proj['upcoming_income'] > proj['current_balance']:
+    elif quiet:
         status = 'opportunity'
-        if proj['upcoming_income'] > 0 and proj['next_income_date']:
-            headline = 'Income on the way'
-            detail = (f"₹{proj['upcoming_income']:.0f} is expected by {proj['next_income_date']}, "
-                      f"and spending has been light lately.")
-        else:
-            headline = 'Quiet spending week'
-            detail = (f"You've spent ₹{_f(last7):.0f} in the last 7 days, well below your usual - "
-                      f"a good week to get ahead.")
+        headline = 'Quiet spending week'
+        detail = (f"You've spent ₹{_f(last7):.0f} in the last 7 days, well below your usual - "
+                  f"a good week to get ahead.")
 
     return {
         'status': status,
