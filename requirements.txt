@@ -20,3 +20,6 @@ requests==2.31.0
 
 # Claude API (insights app)
 anthropic>=0.116.0
+
+# Web push notifications
+pywebpush>=2.0.0
