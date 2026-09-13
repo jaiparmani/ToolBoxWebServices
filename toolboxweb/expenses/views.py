@@ -13,7 +13,7 @@ from decimal import Decimal, InvalidOperation
 import calendar
 import django_filters
 
-from .models import Expense, ExpenseCategory, ExpenseSplit, ExpenseTag, Person, SplitGroup, RecurringRule, Notification, notify
+from .models import Expense, ExpenseCategory, ExpenseSplit, ExpenseTag, Person, SplitGroup, RecurringRule, Notification, PushSubscription, notify
 from .net_spending import net_spending, owed_to_you_total, ZERO
 
 # What is still owed on a split: the share minus whatever has already been paid
@@ -37,6 +37,42 @@ from .services import (
     parse_expense_batch, parse_expense_text, parse_search_query, parse_split_text,
     validate_supplied_items,
 )
+
+
+def _tg_notify_expense(user, expense, note=''):
+    """Best-effort Telegram ping that an expense was recorded.
+
+    Telegram doubles as a confirmation channel here, not just a way to reach
+    the *other* side of a split — whoever added the expense gets pinged too,
+    regardless of whether that happened from the app, quick add, a bulk
+    import, or a split they created. A split-only bill (fronted purely to
+    collect from others, never counted as the user's own spending) is
+    deliberately skipped — nothing was "added" to their books.
+    """
+    if not user or getattr(expense, 'split_only', False):
+        return
+    try:
+        from telegrambot.telegram_api import notify_user as _tg
+    except Exception:
+        return
+    label = expense.get_transaction_type_display()
+    text = f'✅ {label} added: {expense.description} — ₹{expense.amount:,.0f}'
+    if note:
+        text += f' {note}'
+    _tg(user, text)
+
+
+def _tg_notify_expenses_bulk(user, expenses):
+    """One summary ping for a batch of expenses, instead of one per row."""
+    if not user or not expenses:
+        return
+    try:
+        from telegrambot.telegram_api import notify_user as _tg
+    except Exception:
+        return
+    total = sum(e.amount for e in expenses)
+    n = len(expenses)
+    _tg(user, f'✅ {n} {"transaction" if n == 1 else "transactions"} added — ₹{total:,.0f} total')
 
 
 class StandardResultsSetPagination(PageNumberPagination):
@@ -146,6 +182,7 @@ class ExpenseViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         serializer.save(user=self.request.user)
+        _tg_notify_expense(self.request.user, serializer.instance)
 
     @action(detail=False, methods=['get'])
     def summary(self, request):
@@ -332,6 +369,7 @@ class ExpenseViewSet(viewsets.ModelViewSet):
                     )
                     expense.tags.set(self._resolve_tags(user, i.get('tags')))
                     created.append(expense)
+                _tg_notify_expenses_bulk(user, created)
                 return Response(
                     {'count': len(created),
                      'items': [ExpenseSerializer(e).data for e in created]},
@@ -356,6 +394,7 @@ class ExpenseViewSet(viewsets.ModelViewSet):
             date=parsed.get('date') or timezone.now().date(),
         )
         expense.tags.set(self._resolve_tags(user, parsed.get('tags')))
+        _tg_notify_expense(user, expense)
 
         serializer = ExpenseSerializer(expense)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
@@ -437,6 +476,7 @@ class ExpenseViewSet(viewsets.ModelViewSet):
             expense.tags.set(self._resolve_tags(user, item.get('tags')))
             created.append(expense)
 
+        _tg_notify_expenses_bulk(user, created)
         serializer = ExpenseSerializer(created, many=True)
         return Response(
             {'committed': True, 'count': len(created), 'items': serializer.data},
@@ -629,6 +669,8 @@ class ExpenseViewSet(viewsets.ModelViewSet):
                     f"added to your expenses.",
                 )
 
+        _tg_notify_expense(expense.user, expense, note=f'(split with {who})' if splits else '')
+
         return Response({
             'expense': ExpenseSerializer(expense).data,
             'splits': ExpenseSplitSerializer(splits, many=True).data,
@@ -735,6 +777,8 @@ class ExpenseViewSet(viewsets.ModelViewSet):
                     f"— you owe ₹{s.amount}. It's waiting in Money OS → Splits; nothing has been "
                     f"added to your expenses.",
                 )
+
+        _tg_notify_expense(expense.user, expense, note=f'(split with {who})' if splits else '')
 
         return Response({
             'expense': ExpenseSerializer(expense).data,
@@ -1872,3 +1916,35 @@ class CopilotViewSet(viewsets.ViewSet):
         card.status = 'actioned'
         card.save(update_fields=['status', 'updated_at'])
         return Response(CopilotCardSerializer(card).data)
+
+    # ── Web Push ────────────────────────────────────────────────────────────
+
+    @action(detail=False, methods=['get'], url_path='vapid-public-key',
+            permission_classes=[])
+    def vapid_public_key(self, request):
+        from django.conf import settings as s
+        return Response({'key': s.VAPID_PUBLIC_KEY})
+
+    @action(detail=False, methods=['post'], url_path='subscribe')
+    def subscribe(self, request):
+        """Save or refresh a browser's push subscription for this user."""
+        data = request.data
+        endpoint = data.get('endpoint', '')
+        keys = data.get('keys', {})
+        p256dh = keys.get('p256dh', '')
+        auth = keys.get('auth', '')
+        if not (endpoint and p256dh and auth):
+            return Response({'error': 'endpoint, keys.p256dh and keys.auth are required.'}, status=400)
+        PushSubscription.objects.update_or_create(
+            endpoint=endpoint,
+            defaults={'user': request.user, 'p256dh': p256dh, 'auth': auth},
+        )
+        return Response({'ok': True})
+
+    @action(detail=False, methods=['post'], url_path='unsubscribe')
+    def unsubscribe(self, request):
+        """Remove a push subscription (called when permission revoked or tab unsubscribes)."""
+        endpoint = request.data.get('endpoint', '')
+        if endpoint:
+            PushSubscription.objects.filter(user=request.user, endpoint=endpoint).delete()
+        return Response({'ok': True})
