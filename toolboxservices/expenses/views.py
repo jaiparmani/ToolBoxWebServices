@@ -2089,3 +2089,35 @@ class CopilotViewSet(viewsets.ViewSet):
         card.status = 'actioned'
         card.save(update_fields=['status', 'updated_at'])
         return Response(CopilotCardSerializer(card).data)
+
+    # ── Web Push ────────────────────────────────────────────────────────────
+
+    @action(detail=False, methods=['get'], url_path='vapid-public-key',
+            permission_classes=[])
+    def vapid_public_key(self, request):
+        from django.conf import settings as s
+        return Response({'key': s.VAPID_PUBLIC_KEY})
+
+    @action(detail=False, methods=['post'], url_path='subscribe')
+    def subscribe(self, request):
+        from .models import PushSubscription
+        data = request.data
+        endpoint = data.get('endpoint', '')
+        keys = data.get('keys', {})
+        p256dh = keys.get('p256dh', '')
+        auth = keys.get('auth', '')
+        if not (endpoint and p256dh and auth):
+            return Response({'error': 'endpoint, keys.p256dh and keys.auth are required.'}, status=400)
+        PushSubscription.objects.update_or_create(
+            endpoint=endpoint,
+            defaults={'user': request.user, 'p256dh': p256dh, 'auth': auth},
+        )
+        return Response({'ok': True})
+
+    @action(detail=False, methods=['post'], url_path='unsubscribe')
+    def unsubscribe(self, request):
+        from .models import PushSubscription
+        endpoint = request.data.get('endpoint', '')
+        if endpoint:
+            PushSubscription.objects.filter(user=request.user, endpoint=endpoint).delete()
+        return Response({'ok': True})

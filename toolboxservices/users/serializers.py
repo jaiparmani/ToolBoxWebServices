@@ -135,10 +135,15 @@ class UserProfileSerializer(serializers.ModelSerializer):
     # Whether the account has a sign-in PIN set — lets the app show "set up MPIN"
     # vs "change MPIN". Method field so a missing/unmigrated profile can't 500.
     has_mpin = serializers.SerializerMethodField()
+    # Master switch for Telegram pings (expense/split/settle). Same
+    # method-field-plus-manual-write shape as phone, for the same reason: a
+    # profile row that isn't there yet must not 500 the whole read.
+    telegram_notifications_enabled = serializers.SerializerMethodField()
 
     class Meta:
         model = User
-        fields = ('id', 'username', 'email', 'first_name', 'last_name', 'phone', 'has_mpin', 'date_joined')
+        fields = ('id', 'username', 'email', 'first_name', 'last_name', 'phone', 'has_mpin',
+                  'telegram_notifications_enabled', 'date_joined')
         read_only_fields = ('id', 'date_joined', 'has_mpin')
 
     def get_phone(self, obj):
@@ -153,6 +158,12 @@ class UserProfileSerializer(serializers.ModelSerializer):
         except Exception:
             return False
 
+    def get_telegram_notifications_enabled(self, obj):
+        try:
+            return bool(obj.profile.telegram_notifications_enabled)
+        except Exception:
+            return True
+
     def validate_email(self, value):
         """
         Check if email is unique when updating
@@ -163,17 +174,25 @@ class UserProfileSerializer(serializers.ModelSerializer):
         return value
 
     def update(self, instance, validated_data):
-        """Phone lives on the related profile; take it from the raw input (the
-        field is read-only) and save it best-effort, so a profile store that
-        isn't available yet doesn't break editing name/email."""
+        """Phone and the Telegram toggle live on the related profile; take them
+        from the raw input (both fields are read-only here) and save best-effort,
+        so a profile store that isn't available yet doesn't break editing
+        name/email."""
         user = super().update(instance, validated_data)
         phone = self.initial_data.get('phone', None)
-        if phone is not None:
+        telegram_enabled = self.initial_data.get('telegram_notifications_enabled', None)
+        if phone is not None or telegram_enabled is not None:
             try:
                 from .models import UserProfile
                 profile, _ = UserProfile.objects.get_or_create(user=user)
-                profile.phone = (phone or '').strip()
-                profile.save(update_fields=['phone'])
+                update_fields = []
+                if phone is not None:
+                    profile.phone = (phone or '').strip()
+                    update_fields.append('phone')
+                if telegram_enabled is not None:
+                    profile.telegram_notifications_enabled = bool(telegram_enabled)
+                    update_fields.append('telegram_notifications_enabled')
+                profile.save(update_fields=update_fields)
             except Exception:
                 pass
         return user

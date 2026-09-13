@@ -195,6 +195,18 @@ CSRF_TRUSTED_ORIGINS = [
     "https://jaiparmani.github.io",
 ]
 
+# VAPID keys for Web Push notifications.
+VAPID_PRIVATE_KEY = os.environ.get('VAPID_PRIVATE_KEY', """-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgRGPV+R3tzaHCv4Go
+wDO6ReD2aqwmXBaI3U6oqsQeIPGhRANCAARM1WaB+SMYxrhEBRtWLlsJUHW4nG57
+j+A320hAPWyxjbd4KO1iE5UOdIskaj+RaN6S2Mplcq4UJTngZT+Yy15g
+-----END PRIVATE KEY-----""")
+VAPID_PUBLIC_KEY = os.environ.get(
+    'VAPID_PUBLIC_KEY',
+    'BEzVZoH5IxjGuEQFG1YuWwlQdbicbnuP4DfbSEA9bLGNt3go7WITlQ50iyRqP5Fo3pLYymVyrhQlOeBlP5jLXmA',
+)
+VAPID_CLAIMS = {'sub': 'mailto:jaiparmani35@gmail.com'}
+
 # Security settings
 SECURE_BROWSER_XSS_FILTER = True
 SECURE_CONTENT_TYPE_NOSNIFF = True

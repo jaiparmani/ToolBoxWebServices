@@ -25,6 +25,11 @@ class UserProfile(models.Model):
     mpin_hash = models.CharField(max_length=128, blank=True, default='')
     mpin_attempts = models.PositiveIntegerField(default=0)
     mpin_locked_until = models.DateTimeField(null=True, blank=True)
+    # Master switch for the Telegram side-channel (expense/split/settle pings).
+    # Default on: everyone who already has a bot link keeps getting notified
+    # until they turn it off, rather than silently going quiet on this field's
+    # rollout.
+    telegram_notifications_enabled = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

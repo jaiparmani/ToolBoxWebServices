@@ -485,12 +485,57 @@ class Notification(models.Model):
         return f"{self.kind}: {self.title}"
 
 
+class PushSubscription(models.Model):
+    """A browser's Web Push subscription endpoint for one user."""
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
+        related_name='push_subscriptions',
+    )
+    endpoint = models.TextField(unique=True)
+    p256dh = models.TextField()
+    auth = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [models.Index(fields=['user'])]
+
+    def __str__(self):
+        return f"Push({self.user}) {self.endpoint[:60]}"
+
+
+def _send_web_push(subscription, title, body, url='/'):
+    """Fire a single Web Push; silently swallows all errors."""
+    try:
+        from pywebpush import webpush
+        from django.conf import settings as django_settings
+        webpush(
+            subscription_info={
+                'endpoint': subscription.endpoint,
+                'keys': {'p256dh': subscription.p256dh, 'auth': subscription.auth},
+            },
+            data=__import__('json').dumps({'title': title, 'body': body, 'url': url}),
+            vapid_private_key=django_settings.VAPID_PRIVATE_KEY,
+            vapid_claims=django_settings.VAPID_CLAIMS,
+        )
+    except Exception:
+        pass
+
+
 def notify(user, title, body='', kind='split', link=''):
-    """Best-effort feed entry. Never let a notification failure break the action
-    that triggered it (e.g. an un-migrated table on a server mid-deploy)."""
+    """Best-effort feed entry + Web Push. Never lets a notification failure
+    break the action that triggered it (e.g. an un-migrated table)."""
     if not user:
         return None
     try:
-        return Notification.objects.create(user=user, title=title[:160], body=body[:400], kind=kind, link=link[:200])
+        n = Notification.objects.create(
+            user=user, title=title[:160], body=body[:400], kind=kind, link=link[:200],
+        )
     except Exception:
         return None
+    try:
+        subs = PushSubscription.objects.filter(user=user)
+        for sub in subs:
+            _send_web_push(sub, title, body, url=link or '/')
+    except Exception:
+        pass
+    return n
