@@ -1,0 +1,11 @@
+name: Renew PythonAnywhere
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 10 * * *"
+
+jobs:
+  renew:
+    uses: jaiparmani/pa-utilities/.github/workflows/renew-pythonanywhere.yml@main
+    secrets: inherit
