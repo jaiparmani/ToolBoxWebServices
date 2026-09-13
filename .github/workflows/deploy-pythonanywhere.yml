@@ -22,6 +22,6 @@ jobs:
       # pip install runs against pa_working_dir/requirements.txt before migrate.
       pa_pip_dir: /home/toolbox/toolboxservices
       pa_python: python3.12
-      # manage.py lives one level deeper in the toolboxweb subdirectory.
-      pa_migrate_dir: /home/toolbox/toolboxservices/toolboxweb
+      # manage.py is at toolboxservices/manage.py (the prod Django project).
+      pa_migrate_dir: /home/toolbox/toolboxservices/toolboxservices
     secrets: inherit
