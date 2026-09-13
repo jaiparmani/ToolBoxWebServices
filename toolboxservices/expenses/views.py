@@ -39,6 +39,50 @@ from .services import (
 )
 
 
+def _notify_expense_added(user, expense, note='', also_in_app=True):
+    """In-app + Telegram ping that an expense was recorded.
+
+    Whoever added the expense gets pinged, regardless of whether that
+    happened from the app, quick add, a bulk import, or a split they
+    created. A split-only bill (fronted purely to collect from others, never
+    counted as the user's own spending) is deliberately skipped — nothing
+    was "added" to their books. Telegram delivery further respects the
+    user's own on/off preference (see telegrambot.telegram_api.notify_user).
+
+    also_in_app=False for the split-creation callers below: they already
+    raise their own richer "Split added" in-app notification a few lines up,
+    so this would otherwise double it — only the Telegram ping is new there.
+    """
+    if not user or getattr(expense, 'split_only', False):
+        return
+    label = expense.get_transaction_type_display()
+    body = f'{expense.description} — ₹{expense.amount:,.0f}'
+    if note:
+        body += f' {note}'
+    if also_in_app:
+        notify(user, f'{label} added', body, kind='expense', link='/expense-tracker')
+    try:
+        from telegrambot.telegram_api import notify_user as _tg
+        _tg(user, f'✅ {label} added: {body}')
+    except Exception:
+        pass
+
+
+def _notify_expenses_added_bulk(user, expenses):
+    """One summary ping for a batch of expenses, instead of one per row."""
+    if not user or not expenses:
+        return
+    total = sum(e.amount for e in expenses)
+    n = len(expenses)
+    body = f'{n} {"transaction" if n == 1 else "transactions"} — ₹{total:,.0f} total'
+    notify(user, 'Expenses added', body, kind='expense', link='/expense-tracker')
+    try:
+        from telegrambot.telegram_api import notify_user as _tg
+        _tg(user, f'✅ {body}')
+    except Exception:
+        pass
+
+
 class StandardResultsSetPagination(PageNumberPagination):
     """Custom pagination for API responses"""
     page_size = 20
@@ -146,6 +190,7 @@ class ExpenseViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         serializer.save(user=self.request.user)
+        _notify_expense_added(self.request.user, serializer.instance)
 
     def create(self, request, *args, **kwargs):
         """Save as usual, plus a soft, dismissible duplicate warning.
@@ -235,10 +280,28 @@ class ExpenseViewSet(viewsets.ModelViewSet):
                 net = float(r['gross'] or 0) - float(owed_by_category.get(r['category__id'], 0) or 0)
                 if net > 0:
                     category_breakdown[r['category__name']] = net
+
+            # Same netting, grouped by tag instead of category. Tags are a
+            # many-to-many field, so an expense with two tags contributes its
+            # full net amount to each — tag_breakdown is not a partition of
+            # spend the way category_breakdown is, by design (see net_spending).
+            owed_by_tag = {
+                r['expense__tags__id']: r['t']
+                for r in ExpenseSplit.objects.filter(expense__in=expense_qs)
+                    .values('expense__tags__id').annotate(t=Sum('amount'))
+            }
+            tag_breakdown = {}
+            for r in expense_qs.values('tags__id', 'tags__name').annotate(gross=Sum('amount')):
+                if r['tags__id'] is None:
+                    continue
+                net = float(r['gross'] or 0) - float(owed_by_tag.get(r['tags__id'], 0) or 0)
+                if net > 0:
+                    tag_breakdown[r['tags__name']] = net
         else:
             ns = net_spending(request.user, date_from, date_to)
             expense_total = ns['total']
             category_breakdown = {c['category__name']: c['total'] for c in ns['category_totals']}
+            tag_breakdown = {t['tag__name']: t['total'] for t in ns['tag_totals']}
 
         # Calculate net balance on your true spend
         income_total = totals.get('total_income') or 0
@@ -254,7 +317,8 @@ class ExpenseViewSet(viewsets.ModelViewSet):
             'total_credit': credit_total,
             'net_balance': net_balance,
             'transaction_count': filtered.count(),
-            'category_breakdown': category_breakdown
+            'category_breakdown': category_breakdown,
+            'tag_breakdown': tag_breakdown
         }
 
         serializer = ExpenseSummarySerializer(summary_data)
@@ -450,6 +514,7 @@ class ExpenseViewSet(viewsets.ModelViewSet):
                     )
                     expense.tags.set(self._resolve_tags(user, i.get('tags')))
                     created.append(expense)
+                _notify_expenses_added_bulk(user, created)
                 return Response(
                     {'count': len(created),
                      'items': [ExpenseSerializer(e).data for e in created]},
@@ -474,6 +539,7 @@ class ExpenseViewSet(viewsets.ModelViewSet):
             date=parsed.get('date') or timezone.now().date(),
         )
         expense.tags.set(self._resolve_tags(user, parsed.get('tags')))
+        _notify_expense_added(user, expense)
 
         serializer = ExpenseSerializer(expense)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
@@ -555,6 +621,7 @@ class ExpenseViewSet(viewsets.ModelViewSet):
             expense.tags.set(self._resolve_tags(user, item.get('tags')))
             created.append(expense)
 
+        _notify_expenses_added_bulk(user, created)
         serializer = ExpenseSerializer(created, many=True)
         return Response(
             {'committed': True, 'count': len(created), 'items': serializer.data},
@@ -749,6 +816,8 @@ class ExpenseViewSet(viewsets.ModelViewSet):
                 _tg_notify(s.person.linked_user, _split_msg)
                 _wa_notify(s.person.linked_user, _split_msg)
 
+        _notify_expense_added(expense.user, expense, note=f'(split with {who})' if splits else '', also_in_app=False)
+
         return Response({
             'expense': ExpenseSerializer(expense).data,
             'splits': ExpenseSplitSerializer(splits, many=True).data,
@@ -857,6 +926,8 @@ class ExpenseViewSet(viewsets.ModelViewSet):
                 )
                 _tg_notify(s.person.linked_user, _split_msg)
                 _wa_notify(s.person.linked_user, _split_msg)
+
+        _notify_expense_added(expense.user, expense, note=f'(split with {who})' if splits else '', also_in_app=False)
 
         return Response({
             'expense': ExpenseSerializer(expense).data,

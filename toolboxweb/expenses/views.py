@@ -220,8 +220,12 @@ class ExpenseViewSet(viewsets.ModelViewSet):
 
         net_balance = (float(income_total) + float(credit_total)) - (expense_total + float(debt_total))
 
-        # Category breakdown for expenses — share-only, keyed by name as before
+        # Category/tag breakdown for expenses — share-only, keyed by name as before.
+        # A tag breakdown isn't a partition of spend the way categories are (one
+        # expense can carry several tags, each credited its full share), so the
+        # tag figures will not sum back to total_expenses — that's expected.
         category_breakdown = {c['category__name']: c['total'] for c in ns['category_totals']}
+        tag_breakdown = {t['tag__name']: t['total'] for t in ns['tag_totals']}
 
         summary_data = {
             'total_expenses': expense_total,
@@ -230,7 +234,8 @@ class ExpenseViewSet(viewsets.ModelViewSet):
             'total_credit': totals.get('total_credit') or 0,
             'net_balance': net_balance,
             'transaction_count': queryset.count(),
-            'category_breakdown': category_breakdown
+            'category_breakdown': category_breakdown,
+            'tag_breakdown': tag_breakdown
         }
 
         serializer = ExpenseSummarySerializer(summary_data)

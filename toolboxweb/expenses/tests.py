@@ -939,3 +939,98 @@ class InlineLabelCreationTests(APITestCase):
             'name': 'vet', 'color': '#7C5CFF'}, format='json')
         self.assertEqual(response.status_code, 201, response.data)
         self.assertEqual(ExpenseTag.objects.get(name='vet').user, self.user)
+
+
+class TagBreakdownTests(APITestCase):
+    """Same rule as category_breakdown — your share only — applied per tag.
+
+    A tag is many-to-many, not one-per-expense like category, so the two
+    behave differently in one respect: an expense tagged both "Travel" and
+    "Food" contributes its full net amount to *each* tag. tag_breakdown is
+    therefore not a partition of total_expenses the way category_breakdown
+    is — these tests pin down both the split-share netting (identical to
+    category) and that multi-tag, non-partitioning behaviour.
+    """
+
+    def setUp(self):
+        self.ashok = User.objects.create_user('ashok', password='x')
+        self.jai = User.objects.create_user('jai', password='x')
+        for user in (self.ashok, self.jai):
+            Token.objects.get_or_create(user=user)
+        self.category = ExpenseCategory.objects.create(
+            name='Shared', transaction_type='expense')
+
+    def auth(self, user):
+        self.client.credentials(
+            HTTP_AUTHORIZATION=f'Token {Token.objects.get(user=user).key}')
+
+    def summary(self, user, **params):
+        self.auth(user)
+        response = self.client.get('/api/expenses/expenses/summary/', params)
+        self.assertEqual(response.status_code, 200, response.data)
+        return response.data
+
+    def test_an_expense_with_two_tags_credits_both_in_full(self):
+        travel = ExpenseTag.objects.create(name='Travel', user=self.jai)
+        food = ExpenseTag.objects.create(name='Food', user=self.jai)
+        expense = Expense.objects.create(
+            user=self.jai, amount=Decimal('300.00'), transaction_type='expense',
+            category=self.category, description='airport dinner', date=date.today(),
+        )
+        expense.tags.set([travel, food])
+
+        data = self.summary(self.jai)
+        self.assertEqual(Decimal(str(data['tag_breakdown']['Travel'])), Decimal('300.00'))
+        self.assertEqual(Decimal(str(data['tag_breakdown']['Food'])), Decimal('300.00'))
+        # Not a partition: both tags together exceed total_expenses.
+        self.assertEqual(Decimal(str(data['total_expenses'])), Decimal('300.00'))
+
+    def test_an_untagged_expense_creates_no_tag_row(self):
+        Expense.objects.create(
+            user=self.jai, amount=Decimal('50.00'), transaction_type='expense',
+            category=self.category, description='no tag', date=date.today(),
+        )
+        data = self.summary(self.jai)
+        self.assertEqual(data['tag_breakdown'], {})
+
+    def test_a_split_shares_tag_totals_the_same_way_it_shares_category_totals(self):
+        """The exact scenario category_breakdown already covers, mirrored onto tags."""
+        outing = ExpenseTag.objects.create(name='Outing', user=self.ashok)
+        self.auth(self.ashok)
+        response = self.client.post('/api/expenses/expenses/create_split/', {
+            'amount': '1200', 'description': 'dinner', 'category_id': self.category.id,
+            'participants': [{'user_id': self.jai.id}],
+        }, format='json')
+        self.assertEqual(response.status_code, 201, response.data)
+        split = ExpenseSplit.objects.order_by('created_at').last()
+        split.expense.tags.set([outing])
+
+        # Ashok paid in full — his tag total is net of what jai owes him (half).
+        data = self.summary(self.ashok)
+        self.assertEqual(Decimal(str(data['tag_breakdown']['Outing'])), Decimal('600.00'))
+
+        # jai hasn't opted in yet — nothing on his books, so no tag row either.
+        data = self.summary(self.jai)
+        self.assertEqual(data['tag_breakdown'], {})
+
+        # Once jai opts in, his share of the same tag appears on his side too.
+        self.client.patch(f'/api/expenses/splits/{split.id}/',
+                          {'include_in_expenses': True}, format='json')
+        data = self.summary(self.jai)
+        self.assertEqual(Decimal(str(data['tag_breakdown']['Outing'])), Decimal('600.00'))
+
+    def test_tag_breakdown_also_nets_correctly_under_an_extra_filter(self):
+        """Hitting the has_extra_filters branch (category/tags/search/amount)
+        must still net off what's owed, the same as the plain date-window path."""
+        outing = ExpenseTag.objects.create(name='Outing', user=self.ashok)
+        self.auth(self.ashok)
+        response = self.client.post('/api/expenses/expenses/create_split/', {
+            'amount': '1000', 'description': 'trip', 'category_id': self.category.id,
+            'participants': [{'user_id': self.jai.id}],
+        }, format='json')
+        self.assertEqual(response.status_code, 201, response.data)
+        ExpenseSplit.objects.order_by('created_at').last().expense.tags.set([outing])
+
+        # search= is one of the extra_filter_params, forcing the filtered branch.
+        data = self.summary(self.ashok, search='trip')
+        self.assertEqual(Decimal(str(data['tag_breakdown']['Outing'])), Decimal('500.00'))

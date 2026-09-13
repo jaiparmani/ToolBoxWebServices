@@ -40,10 +40,14 @@ def net_spending(user, date_from=None, date_to=None):
 
     ``{'total': float, 'count': int,
        'category_totals': [{category__id, category__name, category__color, total, count}],
+       'tag_totals': [{tag__id, tag__name, tag__color, total, count}],
        'daily_totals': [{date, total, count}]}``
 
-    ``category_totals`` omits categories that net to nothing (e.g. a pure loan),
-    and both totals are clamped at zero so a fully-lent bill never reads negative.
+    ``category_totals``/``tag_totals`` omit rows that net to nothing (e.g. a pure
+    loan), and both totals are clamped at zero so a fully-lent bill never reads
+    negative. An expense with several tags contributes its full share to each of
+    them — tag totals are not a partition of spend the way categories are, so
+    they will not sum back to the overall total, by design.
     """
     # split_only bills are pure collections (a receivable), never the user's own
     # spend — excluded here so they don't affect any spending total or breakdown.
@@ -75,12 +79,24 @@ def net_spending(user, date_from=None, date_to=None):
     mine = _apply_dates(mine, date_from, date_to, field="expense__date")
 
     cat_total, cat_meta, cat_count = {}, {}, {}
+    tag_total, tag_meta, tag_count = {}, {}, {}
     day_total, day_count = {}, {}
 
     def add_cat(cid, name, color, amount, count):
         cat_total[cid] = cat_total.get(cid, ZERO) + amount
         cat_count[cid] = cat_count.get(cid, 0) + count
         cat_meta.setdefault(cid, (name, color))
+
+    def add_tag(tid, name, color, amount, count):
+        # An expense's tags are a many-to-many set — every tag on a bill gets
+        # credited its full share, so a bill tagged both "Travel" and "Food"
+        # contributes to both. Untagged rows (tid is None, from the LEFT OUTER
+        # JOIN the M2M traversal produces) are dropped in the final assembly.
+        if tid is None:
+            return
+        tag_total[tid] = tag_total.get(tid, ZERO) + amount
+        tag_count[tid] = tag_count.get(tid, 0) + count
+        tag_meta.setdefault(tid, (name, color))
 
     def add_day(d, amount, count):
         day_total[d] = day_total.get(d, ZERO) + amount
@@ -91,12 +107,18 @@ def net_spending(user, date_from=None, date_to=None):
         t=Sum("amount"), c=Count("id")
     ):
         add_cat(r["category__id"], r["category__name"], r["category__color"], r["t"] or ZERO, r["c"] or 0)
+    for r in own.values("tags__id", "tags__name", "tags__color").annotate(
+        t=Sum("amount"), c=Count("id")
+    ):
+        add_tag(r["tags__id"], r["tags__name"], r["tags__color"], r["t"] or ZERO, r["c"] or 0)
     for r in own.values("date").annotate(t=Sum("amount"), c=Count("id")):
         add_day(r["date"].isoformat(), r["t"] or ZERO, r["c"] or 0)
 
     # 2) subtract what others owe you (no count change — still your transaction)
     for r in owed.values("expense__category__id").annotate(t=Sum("amount")):
         add_cat(r["expense__category__id"], None, None, -(r["t"] or ZERO), 0)
+    for r in owed.values("expense__tags__id").annotate(t=Sum("amount")):
+        add_tag(r["expense__tags__id"], None, None, -(r["t"] or ZERO), 0)
     for r in owed.values("expense__date").annotate(t=Sum("amount")):
         add_day(r["expense__date"].isoformat(), -(r["t"] or ZERO), 0)
 
@@ -105,6 +127,10 @@ def net_spending(user, date_from=None, date_to=None):
         "expense__category__id", "expense__category__name", "expense__category__color"
     ).annotate(t=Sum("amount"), c=Count("id")):
         add_cat(r["expense__category__id"], r["expense__category__name"], r["expense__category__color"], r["t"] or ZERO, r["c"] or 0)
+    for r in mine.values(
+        "expense__tags__id", "expense__tags__name", "expense__tags__color"
+    ).annotate(t=Sum("amount"), c=Count("id")):
+        add_tag(r["expense__tags__id"], r["expense__tags__name"], r["expense__tags__color"], r["t"] or ZERO, r["c"] or 0)
     for r in mine.values("expense__date").annotate(t=Sum("amount"), c=Count("id")):
         add_day(r["expense__date"].isoformat(), r["t"] or ZERO, r["c"] or 0)
 
@@ -121,6 +147,20 @@ def net_spending(user, date_from=None, date_to=None):
             "count": cat_count.get(cid, 0),
         })
     category_totals.sort(key=lambda x: -x["total"])
+
+    tag_totals = []
+    for tid, tot in tag_total.items():
+        if tot <= ZERO:
+            continue
+        name, color = tag_meta.get(tid, (None, None))
+        tag_totals.append({
+            "tag__id": tid,
+            "tag__name": name,
+            "tag__color": color,
+            "total": float(tot),
+            "count": tag_count.get(tid, 0),
+        })
+    tag_totals.sort(key=lambda x: -x["total"])
 
     daily_totals = [
         {"date": d, "total": float(day_total[d] if day_total[d] > ZERO else ZERO), "count": day_count.get(d, 0)}
@@ -140,6 +180,7 @@ def net_spending(user, date_from=None, date_to=None):
         "total": float(total),
         "count": count,
         "category_totals": category_totals,
+        "tag_totals": tag_totals,
         "daily_totals": daily_totals,
     }
 

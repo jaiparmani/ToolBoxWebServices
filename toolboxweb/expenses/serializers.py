@@ -248,6 +248,7 @@ class ExpenseSummarySerializer(serializers.Serializer):
     net_balance = serializers.DecimalField(max_digits=12, decimal_places=2)
     transaction_count = serializers.IntegerField()
     category_breakdown = serializers.DictField(child=serializers.DecimalField(max_digits=10, decimal_places=2))
+    tag_breakdown = serializers.DictField(child=serializers.DecimalField(max_digits=10, decimal_places=2))
 
 
 class PersonSerializer(serializers.ModelSerializer):
