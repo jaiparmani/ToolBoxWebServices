@@ -270,13 +270,20 @@ class ExpenseViewSet(viewsets.ModelViewSet):
             raw_total = expense_qs.aggregate(t=Sum('amount'))['t'] or 0
             expense_total = max(float(raw_total) - float(owed_to_you_total(expense_qs)), 0.0)
 
+            # .order_by() clears Expense.Meta's default ordering (-date,
+            # -created_at) before grouping. Without it Django silently folds
+            # those two columns into the GROUP BY too — since they're unique
+            # per row, every expense becomes its own "group", and the dict
+            # below keeps only the last one seen per name, quietly dropping
+            # the rest. (Caught while adding tag_breakdown below: two "Food"
+            # expenses under a search filter returned only one of them.)
             owed_by_category = {
                 r['expense__category_id']: r['t']
                 for r in ExpenseSplit.objects.filter(expense__in=expense_qs)
-                    .values('expense__category_id').annotate(t=Sum('amount'))
+                    .order_by().values('expense__category_id').annotate(t=Sum('amount'))
             }
             category_breakdown = {}
-            for r in expense_qs.values('category__id', 'category__name').annotate(gross=Sum('amount')):
+            for r in expense_qs.order_by().values('category__id', 'category__name').annotate(gross=Sum('amount')):
                 net = float(r['gross'] or 0) - float(owed_by_category.get(r['category__id'], 0) or 0)
                 if net > 0:
                     category_breakdown[r['category__name']] = net
@@ -288,10 +295,10 @@ class ExpenseViewSet(viewsets.ModelViewSet):
             owed_by_tag = {
                 r['expense__tags__id']: r['t']
                 for r in ExpenseSplit.objects.filter(expense__in=expense_qs)
-                    .values('expense__tags__id').annotate(t=Sum('amount'))
+                    .order_by().values('expense__tags__id').annotate(t=Sum('amount'))
             }
             tag_breakdown = {}
-            for r in expense_qs.values('tags__id', 'tags__name').annotate(gross=Sum('amount')):
+            for r in expense_qs.order_by().values('tags__id', 'tags__name').annotate(gross=Sum('amount')):
                 if r['tags__id'] is None:
                     continue
                 net = float(r['gross'] or 0) - float(owed_by_tag.get(r['tags__id'], 0) or 0)

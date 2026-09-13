@@ -39,40 +39,48 @@ from .services import (
 )
 
 
-def _tg_notify_expense(user, expense, note=''):
-    """Best-effort Telegram ping that an expense was recorded.
+def _notify_expense_added(user, expense, note='', also_in_app=True):
+    """In-app + Telegram ping that an expense was recorded.
 
-    Telegram doubles as a confirmation channel here, not just a way to reach
-    the *other* side of a split — whoever added the expense gets pinged too,
-    regardless of whether that happened from the app, quick add, a bulk
-    import, or a split they created. A split-only bill (fronted purely to
-    collect from others, never counted as the user's own spending) is
-    deliberately skipped — nothing was "added" to their books.
+    Whoever added the expense gets pinged, regardless of whether that
+    happened from the app, quick add, a bulk import, or a split they
+    created. A split-only bill (fronted purely to collect from others, never
+    counted as the user's own spending) is deliberately skipped — nothing
+    was "added" to their books. Telegram delivery further respects the
+    user's own on/off preference (see telegrambot.telegram_api.notify_user).
+
+    also_in_app=False for the split-creation callers below: they already
+    raise their own richer "Split added" in-app notification a few lines up,
+    so this would otherwise double it — only the Telegram ping is new there.
     """
     if not user or getattr(expense, 'split_only', False):
         return
+    label = expense.get_transaction_type_display()
+    body = f'{expense.description} — ₹{expense.amount:,.0f}'
+    if note:
+        body += f' {note}'
+    if also_in_app:
+        notify(user, f'{label} added', body, kind='expense', link='/expense-tracker')
     try:
         from telegrambot.telegram_api import notify_user as _tg
+        _tg(user, f'✅ {label} added: {body}')
     except Exception:
-        return
-    label = expense.get_transaction_type_display()
-    text = f'✅ {label} added: {expense.description} — ₹{expense.amount:,.0f}'
-    if note:
-        text += f' {note}'
-    _tg(user, text)
+        pass
 
 
-def _tg_notify_expenses_bulk(user, expenses):
+def _notify_expenses_added_bulk(user, expenses):
     """One summary ping for a batch of expenses, instead of one per row."""
     if not user or not expenses:
         return
-    try:
-        from telegrambot.telegram_api import notify_user as _tg
-    except Exception:
-        return
     total = sum(e.amount for e in expenses)
     n = len(expenses)
-    _tg(user, f'✅ {n} {"transaction" if n == 1 else "transactions"} added — ₹{total:,.0f} total')
+    body = f'{n} {"transaction" if n == 1 else "transactions"} — ₹{total:,.0f} total'
+    notify(user, 'Expenses added', body, kind='expense', link='/expense-tracker')
+    try:
+        from telegrambot.telegram_api import notify_user as _tg
+        _tg(user, f'✅ {body}')
+    except Exception:
+        pass
 
 
 class StandardResultsSetPagination(PageNumberPagination):
@@ -182,7 +190,7 @@ class ExpenseViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         serializer.save(user=self.request.user)
-        _tg_notify_expense(self.request.user, serializer.instance)
+        _notify_expense_added(self.request.user, serializer.instance)
 
     @action(detail=False, methods=['get'])
     def summary(self, request):
@@ -374,7 +382,7 @@ class ExpenseViewSet(viewsets.ModelViewSet):
                     )
                     expense.tags.set(self._resolve_tags(user, i.get('tags')))
                     created.append(expense)
-                _tg_notify_expenses_bulk(user, created)
+                _notify_expenses_added_bulk(user, created)
                 return Response(
                     {'count': len(created),
                      'items': [ExpenseSerializer(e).data for e in created]},
@@ -399,7 +407,7 @@ class ExpenseViewSet(viewsets.ModelViewSet):
             date=parsed.get('date') or timezone.now().date(),
         )
         expense.tags.set(self._resolve_tags(user, parsed.get('tags')))
-        _tg_notify_expense(user, expense)
+        _notify_expense_added(user, expense)
 
         serializer = ExpenseSerializer(expense)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
@@ -481,7 +489,7 @@ class ExpenseViewSet(viewsets.ModelViewSet):
             expense.tags.set(self._resolve_tags(user, item.get('tags')))
             created.append(expense)
 
-        _tg_notify_expenses_bulk(user, created)
+        _notify_expenses_added_bulk(user, created)
         serializer = ExpenseSerializer(created, many=True)
         return Response(
             {'committed': True, 'count': len(created), 'items': serializer.data},
@@ -674,7 +682,7 @@ class ExpenseViewSet(viewsets.ModelViewSet):
                     f"added to your expenses.",
                 )
 
-        _tg_notify_expense(expense.user, expense, note=f'(split with {who})' if splits else '')
+        _notify_expense_added(expense.user, expense, note=f'(split with {who})' if splits else '', also_in_app=False)
 
         return Response({
             'expense': ExpenseSerializer(expense).data,
@@ -783,7 +791,7 @@ class ExpenseViewSet(viewsets.ModelViewSet):
                     f"added to your expenses.",
                 )
 
-        _tg_notify_expense(expense.user, expense, note=f'(split with {who})' if splits else '')
+        _notify_expense_added(expense.user, expense, note=f'(split with {who})' if splits else '', also_in_app=False)
 
         return Response({
             'expense': ExpenseSerializer(expense).data,

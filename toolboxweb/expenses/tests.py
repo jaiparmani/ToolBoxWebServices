@@ -1034,3 +1034,30 @@ class TagBreakdownTests(APITestCase):
         # search= is one of the extra_filter_params, forcing the filtered branch.
         data = self.summary(self.ashok, search='trip')
         self.assertEqual(Decimal(str(data['tag_breakdown']['Outing'])), Decimal('500.00'))
+
+    def test_tag_breakdown_sums_every_matching_expense_under_a_filter(self):
+        """Regression: the has_extra_filters branch's grouped-aggregate query
+        was silently dropping all but one expense per tag/category, because
+        Expense.Meta's default ordering (-date, -created_at) leaks into the
+        GROUP BY of a .values().annotate() call unless explicitly cleared —
+        every row became its own "group" once date/created_at joined the key,
+        so the plain-dict assignment kept only the last one seen. Caught with
+        two same-tag, same-category expenses on different dates; a single
+        expense per tag would have passed even with the bug present."""
+        outing = ExpenseTag.objects.create(name='Outing2', user=self.ashok)
+        self.auth(self.ashok)
+        for amount, desc, days_ago in [('300', 'coffee', 3), ('700', 'dinner', 1)]:
+            response = self.client.post('/api/expenses/expenses/', {
+                'amount': amount, 'transaction_type': 'expense',
+                'category_id': self.category.id, 'description': desc,
+                'date': (date.today() - timedelta(days=days_ago)).isoformat(),
+            }, format='json')
+            self.assertEqual(response.status_code, 201, response.data)
+            Expense.objects.get(id=response.data['id']).tags.set([outing])
+
+        # tags= forces the has_extra_filters branch — the exact path that
+        # had the bug — while also being the realistic case: browsing a tag's
+        # total in Labels sends tags=<id> just like this.
+        data = self.summary(self.ashok, tags=str(outing.id))
+        self.assertEqual(Decimal(str(data['tag_breakdown']['Outing2'])), Decimal('1000.00'))
+        self.assertEqual(Decimal(str(data['category_breakdown'][self.category.name])), Decimal('1000.00'))
