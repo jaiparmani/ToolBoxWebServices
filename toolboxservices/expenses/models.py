@@ -551,14 +551,17 @@ def _send_web_push(subscription, title, body, url='/'):
     """Fire a single Web Push; silently swallows all errors."""
     try:
         from pywebpush import webpush
+        from py_vapid import Vapid
         from django.conf import settings as django_settings
+        pem = django_settings.VAPID_PRIVATE_KEY
+        vapid = Vapid.from_pem(pem.encode() if isinstance(pem, str) else pem)
         webpush(
             subscription_info={
                 'endpoint': subscription.endpoint,
                 'keys': {'p256dh': subscription.p256dh, 'auth': subscription.auth},
             },
             data=__import__('json').dumps({'title': title, 'body': body, 'url': url}),
-            vapid_private_key=django_settings.VAPID_PRIVATE_KEY,
+            vapid_private_key=vapid,
             vapid_claims=django_settings.VAPID_CLAIMS,
         )
     except Exception:
