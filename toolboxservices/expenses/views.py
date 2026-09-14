@@ -1331,8 +1331,11 @@ class SplitViewSet(viewsets.ModelViewSet):
                          'person__linked_user',
                          'expense__user', 'expense__paid_by_person'
                          ).prefetch_related('expense__splits__person')
-        if self.request.GET.get('settled') == 'false':
+        settled_param = self.request.GET.get('settled')
+        if settled_param == 'false':
             queryset = queryset.filter(is_settled=False)
+        elif settled_param == 'true':
+            queryset = queryset.filter(is_settled=True)
         # Which side of the ledger, without needing to name the other account.
         # "Everything I owe" is what a Shared section asks for, and before this
         # it could only be requested one counterparty at a time (`owed_to`).
