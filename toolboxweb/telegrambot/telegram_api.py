@@ -76,11 +76,19 @@ def notify_user(user, text, parse_mode=None):
 
     Used to reach a person outside the request/response loop — e.g. telling the
     other party a split was added against them. A no-op when the user has no
-    Telegram link or the bot isn't configured, and never raises (a notification
-    failure must not break the action that triggered it).
+    Telegram link, the bot isn't configured, or the user has turned Telegram
+    notifications off in Settings — checked here so every caller gets that
+    preference for free rather than each remembering to check it. Never
+    raises (a notification failure must not break the action that triggered
+    it).
     """
     if user is None or not is_configured():
         return
+    try:
+        if not getattr(user.profile, 'telegram_notifications_enabled', True):
+            return
+    except Exception:
+        pass  # no profile yet — default to notifying, same as the field's default
     try:
         from .models import TelegramLink
         link = TelegramLink.objects.filter(user=user).first()
