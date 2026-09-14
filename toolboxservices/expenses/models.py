@@ -548,7 +548,9 @@ class PushSubscription(models.Model):
 
 
 def _send_web_push(subscription, title, body, url='/'):
-    """Fire a single Web Push; silently swallows all errors."""
+    """Fire a single Web Push; logs errors but never raises."""
+    import logging
+    logger = logging.getLogger(__name__)
     try:
         from pywebpush import webpush
         from py_vapid import Vapid
@@ -564,8 +566,8 @@ def _send_web_push(subscription, title, body, url='/'):
             vapid_private_key=vapid,
             vapid_claims=django_settings.VAPID_CLAIMS,
         )
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("web push failed for %s: %s", subscription.endpoint[:60], e)
 
 
 def notify(user, title, body='', kind='split', link=''):
