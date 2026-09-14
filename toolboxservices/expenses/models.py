@@ -564,7 +564,11 @@ def _send_web_push(subscription, title, body, url='/'):
             },
             data=__import__('json').dumps({'title': title, 'body': body, 'url': url}),
             vapid_private_key=vapid,
-            vapid_claims=django_settings.VAPID_CLAIMS,
+            # Pass a copy — webpush() mutates the dict to add 'aud' from the
+            # endpoint URL, which would corrupt the shared VAPID_CLAIMS dict for
+            # subsequent subscriptions whose endpoints are on a different origin
+            # (e.g. Chrome FCM vs iOS web.push.apple.com).
+            vapid_claims=dict(django_settings.VAPID_CLAIMS),
         )
     except Exception as e:
         logger.warning("web push failed for %s: %s", subscription.endpoint[:60], e)
