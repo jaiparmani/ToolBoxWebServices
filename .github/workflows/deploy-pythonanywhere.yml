@@ -19,9 +19,9 @@ jobs:
     with:
       pa_working_dir: /home/toolbox/toolboxservices
       pa_domain: toolbox.pythonanywhere.com
-      # pip install runs against pa_working_dir/requirements.txt before migrate.
-      pa_pip_dir: /home/toolbox/toolboxservices
+      # requirements.txt lives at the git root (/home/toolbox), not inside toolboxservices/.
+      pa_pip_dir: /home/toolbox
       pa_python: python3.12
-      # manage.py is at toolboxservices/manage.py (the prod Django project).
-      pa_migrate_dir: /home/toolbox/toolboxservices/toolboxservices
+      # manage.py is at /home/toolbox/toolboxservices/manage.py.
+      pa_migrate_dir: /home/toolbox/toolboxservices
     secrets: inherit
