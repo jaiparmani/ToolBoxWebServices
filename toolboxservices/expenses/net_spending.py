@@ -1,16 +1,17 @@
 """Your true spending — only your own share of every bill.
 
-A split expense is stored in full against whoever paid, with ExpenseSplit rows
-recording what each other person owes. That keeps the ledger simple but makes a
-raw ``Sum('amount')`` overstate what you actually spent: money you laid out and
-will get back (lending) counts as spending.
+A shared bill lives in SharedBill, separate from the personal Expense ledger.
+Counting your side of one as spending means writing a real Expense linked
+back to it - the payer's own copy (SharedBill.linked_expense) or a
+counterparty's own copy of their share (ExpenseSplit.linked_expense) - rather
+than a flag on someone else's row. That means every Expense row this module
+sees IS real personal spending already; the only correction left is money
+lent out on your own bills, which isn't yours to keep counting as spent.
 
-``net_spending`` corrects that. For a user and date window it returns spending
-totals where every bill contributes only the user's share:
+``net_spending`` returns spending totals where every bill contributes only
+the user's share:
 
-    net = own expenses (full)
-        - what others owe you on them   (money lent out, not spent)
-        + your share of bills others paid (your part of someone else's expense)
+    net = own expenses (full) - what others owe you on them (lent, not spent)
 
 Splits count whether or not they are settled — your share is spent the moment
 the bill happens, regardless of when the debt is squared up.
@@ -49,34 +50,23 @@ def net_spending(user, date_from=None, date_to=None):
     them — tag totals are not a partition of spend the way categories are, so
     they will not sum back to the overall total, by design.
     """
-    # split_only bills are pure collections (a receivable), never the user's own
-    # spend — excluded here so they don't affect any spending total or breakdown.
-    own = Expense.objects.filter(user=user, transaction_type="expense").exclude(split_only=True)
+    # Every Expense row here is real personal spending already - a shared bill
+    # only produces one once its side opts in (SharedBill.linked_expense for
+    # the payer, ExpenseSplit.linked_expense for whoever it's owed by), so
+    # there's nothing left to exclude.
+    own = Expense.objects.filter(user=user, transaction_type="expense")
     own = _apply_dates(own, date_from, date_to)
 
-    # money others owe you, on expenses you paid — subtract (lent, not spent).
-    # Skip split_only expenses: they aren't in `own`, so their owed side must not
-    # be subtracted either (or the total would go negative).
+    # Money others owe you, on bills you're counting as your own spending —
+    # subtract it (lent, not spent). `expense` here is the split's SharedBill;
+    # `expense__linked_expense` reaches the payer's own Expense copy of it, if
+    # they made one - a bill they never counted isn't in `own` either, so its
+    # owed side must not be subtracted (or the total would go negative).
     owed = ExpenseSplit.objects.filter(
-        expense__user=user, expense__transaction_type="expense", expense__split_only=False,
+        expense__linked_expense__user=user,
+        expense__linked_expense__transaction_type="expense",
     )
     owed = _apply_dates(owed, date_from, date_to, field="expense__date")
-
-    # your share of bills someone else paid — add (spent, not on your ledger),
-    # but only the ones you opted into.
-    #
-    # A split somebody else created is theirs until you accept it. Counting it
-    # here regardless is what made a bill you never agreed to show up inside
-    # your spending totals while appearing nowhere in your expense list — felt
-    # in the balance, invisible as an item. include_in_expenses is that consent,
-    # set from the Splits page; until then the share lives in Splits only.
-    mine = (
-        ExpenseSplit.objects.filter(
-            person__linked_user=user, expense__transaction_type="expense",
-            include_in_expenses=True,
-        ).exclude(expense__user=user)
-    )
-    mine = _apply_dates(mine, date_from, date_to, field="expense__date")
 
     cat_total, cat_meta, cat_count = {}, {}, {}
     tag_total, tag_meta, tag_count = {}, {}, {}
@@ -114,25 +104,15 @@ def net_spending(user, date_from=None, date_to=None):
     for r in own.values("date").annotate(t=Sum("amount"), c=Count("id")):
         add_day(r["date"].isoformat(), r["t"] or ZERO, r["c"] or 0)
 
-    # 2) subtract what others owe you (no count change — still your transaction)
-    for r in owed.values("expense__category__id").annotate(t=Sum("amount")):
-        add_cat(r["expense__category__id"], None, None, -(r["t"] or ZERO), 0)
-    for r in owed.values("expense__tags__id").annotate(t=Sum("amount")):
-        add_tag(r["expense__tags__id"], None, None, -(r["t"] or ZERO), 0)
-    for r in owed.values("expense__date").annotate(t=Sum("amount")):
-        add_day(r["expense__date"].isoformat(), -(r["t"] or ZERO), 0)
-
-    # 3) add your share of bills others paid
-    for r in mine.values(
-        "expense__category__id", "expense__category__name", "expense__category__color"
-    ).annotate(t=Sum("amount"), c=Count("id")):
-        add_cat(r["expense__category__id"], r["expense__category__name"], r["expense__category__color"], r["t"] or ZERO, r["c"] or 0)
-    for r in mine.values(
-        "expense__tags__id", "expense__tags__name", "expense__tags__color"
-    ).annotate(t=Sum("amount"), c=Count("id")):
-        add_tag(r["expense__tags__id"], r["expense__tags__name"], r["expense__tags__color"], r["t"] or ZERO, r["c"] or 0)
-    for r in mine.values("expense__date").annotate(t=Sum("amount"), c=Count("id")):
-        add_day(r["expense__date"].isoformat(), r["t"] or ZERO, r["c"] or 0)
+    # 2) subtract what others owe you (no count change — still your transaction).
+    # Grouped by the linked Expense's own category/tags/date, not the bill's -
+    # they're edited independently now, and `own` above is grouped the same way.
+    for r in owed.values("expense__linked_expense__category__id").annotate(t=Sum("amount")):
+        add_cat(r["expense__linked_expense__category__id"], None, None, -(r["t"] or ZERO), 0)
+    for r in owed.values("expense__linked_expense__tags__id").annotate(t=Sum("amount")):
+        add_tag(r["expense__linked_expense__tags__id"], None, None, -(r["t"] or ZERO), 0)
+    for r in owed.values("expense__linked_expense__date").annotate(t=Sum("amount")):
+        add_day(r["expense__linked_expense__date"].isoformat(), -(r["t"] or ZERO), 0)
 
     category_totals = []
     for cid, tot in cat_total.items():
@@ -169,12 +149,11 @@ def net_spending(user, date_from=None, date_to=None):
 
     own_total = own.aggregate(t=Sum("amount"))["t"] or ZERO
     owed_total = owed.aggregate(t=Sum("amount"))["t"] or ZERO
-    mine_total = mine.aggregate(t=Sum("amount"))["t"] or ZERO
-    total = own_total - owed_total + mine_total
+    total = own_total - owed_total
     if total < ZERO:
         total = ZERO
 
-    count = own.count() + mine.values("expense_id").distinct().count()
+    count = own.count()
 
     return {
         "total": float(total),
@@ -197,7 +176,7 @@ def owed_to_you_total(expense_qs):
     filters and never over-subtracts.
     """
     owed = ExpenseSplit.objects.filter(
-        expense__in=expense_qs, expense__transaction_type="expense"
+        expense__linked_expense__in=expense_qs, expense__linked_expense__transaction_type="expense"
     ).aggregate(t=Sum("amount"))["t"]
     return owed or ZERO
 
@@ -206,9 +185,13 @@ def expense_share_fields(expense):
     """(your_share, owed_to_you) for a single expense you own, as floats.
 
     ``owed_to_you`` is what your split participants owe on this bill;
-    ``your_share`` is the remainder you actually spent.
+    ``your_share`` is the remainder you actually spent. Zero/zero for a plain
+    expense that was never a shared bill, or for a counterparty's own copy of
+    their share (ExpenseSplit.linked_expense) - there's nothing owed on that,
+    it's just yours.
     """
-    owed = sum((s.amount for s in expense.splits.all()), ZERO)
+    bill = getattr(expense, 'shared_bill', None)
+    owed = sum((s.amount for s in bill.splits.all()), ZERO) if bill else ZERO
     share = expense.amount - owed
     if share < ZERO:
         share = ZERO

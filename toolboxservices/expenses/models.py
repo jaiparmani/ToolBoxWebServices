@@ -86,12 +86,6 @@ class Expense(models.Model):
     group = models.ForeignKey('SplitGroup', on_delete=models.SET_NULL, null=True, blank=True,
                               related_name='expenses')
 
-    # Split-only: the payer fronted this bill purely to collect from others (a
-    # receivable), not because they spent it. When true it lives only in Splits —
-    # hidden from the expense list and never counted as spending — until the user
-    # flips it on from the Splits page ("add to expenses").
-    split_only = models.BooleanField(default=False)
-
     # Who actually fronted the money. null = the logged-in user paid (the
     # default and the only option before this field existed). When set to a
     # Person, the split semantics stay the same but the UI shows "Paid by
@@ -193,15 +187,67 @@ class Person(models.Model):
         return self.name
 
 
-class ExpenseSplit(models.Model):
-    """One person's share of one expense.
+class SharedBill(models.Model):
+    """A shared/split transaction - its own world, separate from the user's
+    personal expense ledger.
 
-    The expense's owner paid the bill; each split is what somebody else owes
-    them for it. Settling marks the split rather than deleting it, so the
-    history of who paid for what survives.
+    Splitting a bill used to mean writing a personal Expense and, if it
+    wasn't really your own spending, hiding it behind `split_only`. That
+    tangled two different things into one row: "this bill exists" and "this
+    bill is mine to count." Now a bill exists here regardless, and counting
+    it as personal spending - for the payer, or for anyone it's owed by - is
+    a separate, later action that writes a real Expense row of its own
+    (`linked_expense` below, and ExpenseSplit.linked_expense for the other
+    side) rather than a flag on this one.
     """
 
-    expense = models.ForeignKey(Expense, on_delete=models.CASCADE, related_name='splits')
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='shared_bills')
+    amount = models.DecimalField(
+        max_digits=10, decimal_places=2,
+        validators=[MinValueValidator(decimal.Decimal('0.01'))])
+    description = models.TextField()
+    date = models.DateField()
+    category = models.ForeignKey(ExpenseCategory, on_delete=models.SET_NULL, null=True, blank=True,
+                                 related_name='shared_bills')
+    tags = models.ManyToManyField(ExpenseTag, blank=True, related_name='shared_bills')
+
+    # Shared spending within a group - same role as Expense.group.
+    group = models.ForeignKey('SplitGroup', on_delete=models.SET_NULL, null=True, blank=True,
+                              related_name='bills')
+
+    # Who actually fronted the money. null = the account owner (`user`) paid.
+    paid_by_person = models.ForeignKey(
+        'Person', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='paid_bills',
+    )
+
+    # The payer's own "count this as my spending" - a real Expense row `user`
+    # owns, not a flag on this one. Its amount/date/category can drift from
+    # the bill's own (editing one needn't touch the other). None means the
+    # payer has not opted this bill into their personal expenses.
+    linked_expense = models.OneToOneField(
+        Expense, on_delete=models.SET_NULL, null=True, blank=True, related_name='shared_bill')
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-date', '-created_at']
+        indexes = [models.Index(fields=['user', 'date'])]
+
+    def __str__(self):
+        return f"{self.user.username} shared {self.amount} - {self.description[:50]}"
+
+
+class ExpenseSplit(models.Model):
+    """One person's share of one shared bill.
+
+    The bill's owner paid it; each split is what somebody else owes them for
+    it. Settling marks the split rather than deleting it, so the history of
+    who paid for what survives.
+    """
+
+    expense = models.ForeignKey(SharedBill, on_delete=models.CASCADE, related_name='splits')
     person = models.ForeignKey(Person, on_delete=models.CASCADE, related_name='splits')
     amount = models.DecimalField(
         max_digits=10, decimal_places=2,
@@ -219,15 +265,13 @@ class ExpenseSplit(models.Model):
         max_digits=10, decimal_places=2, default=decimal.Decimal('0.00'),
         help_text='How much of this share has been paid so far')
 
-    # The counterparty's own consent to count this as their spending.
-    #
-    # A split someone else created must not silently land on your books: it is
-    # shared until you say otherwise. Nothing is mirrored to say so - this is a
-    # flag on the one shared row, written only by the account `person` is linked
-    # to. The payer's equivalent is Expense.split_only, on their own expense.
-    include_in_expenses = models.BooleanField(
-        default=False,
-        help_text='The linked account chose to count this share as their own spending')
+    # The counterparty's own "count this as my spending" - the mirror of
+    # SharedBill.linked_expense, on the other side of the same bill. A split
+    # someone else created must not silently land on your books: it is shared
+    # until you say otherwise, and saying so means a real Expense row of your
+    # own, not a flag on someone else's row.
+    linked_expense = models.OneToOneField(
+        Expense, on_delete=models.SET_NULL, null=True, blank=True, related_name='counted_split')
 
     created_at = models.DateTimeField(auto_now_add=True)
 

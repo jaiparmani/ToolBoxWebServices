@@ -294,18 +294,23 @@ def _create_expense(user, draft, on_date=None):
 
 
 def _create_split(user, split):
-    """Write a shared bill from a confirmed split preview (names + owed amounts)."""
+    """Write a shared bill from a confirmed split preview (names + owed amounts).
+
+    Recorded as a SharedBill first - its own row, not a personal Expense - and
+    then, like split_add, always given a linked Expense too: the assistant's
+    split path has never had a "don't count this as mine" option.
+    """
     from .views import match_account
     from .serializers import ExpenseSerializer, ExpenseSplitSerializer
+    from .models import SharedBill
 
     amount = Decimal(str(split['amount']))
     category = resolve_category({'transaction_type': 'expense',
                                  'category_name': split.get('category_name') or 'Shared'})
-    expense = Expense.objects.create(
-        user=user, amount=amount, transaction_type='expense',
-        category=category, description=split.get('description', 'Shared expense'),
-        date=timezone.now().date(),
-    )
+    description = split.get('description', 'Shared expense')
+    when = timezone.now().date()
+    bill = SharedBill.objects.create(
+        user=user, amount=amount, category=category, description=description, date=when)
     splits = []
     for row in split.get('owed', []):
         name = str(row.get('name') or '').strip()[:100]
@@ -315,7 +320,13 @@ def _create_split(user, split):
         person = Person.objects.filter(user=user, name__iexact=name).first()
         if not person:
             person = Person.objects.create(user=user, name=name, linked_user=match_account(name))
-        splits.append(ExpenseSplit.objects.create(expense=expense, person=person, amount=share))
+        splits.append(ExpenseSplit.objects.create(expense=bill, person=person, amount=share))
+    expense = Expense.objects.create(
+        user=user, amount=amount, transaction_type='expense',
+        category=category, description=description, date=when,
+    )
+    bill.linked_expense = expense
+    bill.save(update_fields=['linked_expense'])
     return {'expense': ExpenseSerializer(expense).data,
             'splits': ExpenseSplitSerializer(splits, many=True).data}
 

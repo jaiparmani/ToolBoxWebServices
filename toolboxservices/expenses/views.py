@@ -13,7 +13,7 @@ from decimal import Decimal, InvalidOperation
 import calendar
 import django_filters
 
-from .models import Expense, ExpenseCategory, ExpenseSplit, ExpenseTag, Person, SplitGroup, RecurringRule, Notification, notify
+from .models import Expense, ExpenseCategory, ExpenseSplit, ExpenseTag, Person, SplitGroup, RecurringRule, Notification, SharedBill, notify
 from .net_spending import net_spending, owed_to_you_total, ZERO
 
 # What is still owed on a split: the share minus whatever has already been paid
@@ -28,7 +28,7 @@ from .serializers import (
     ExpenseSerializer, ExpenseCreateSerializer, ExpenseListSerializer,
     ExpenseCategorySerializer, ExpenseTagSerializer, ExpenseSummarySerializer,
     ExpenseSplitSerializer, ExpenseSplitUpdateSerializer, PersonSerializer, SplitGroupSerializer, RecurringRuleSerializer,
-    CopilotCardSerializer
+    CopilotCardSerializer, SharedBillSerializer
 )
 from .services import (
     compute_shares,
@@ -44,16 +44,14 @@ def _notify_expense_added(user, expense, note='', also_in_app=True):
 
     Whoever added the expense gets pinged, regardless of whether that
     happened from the app, quick add, a bulk import, or a split they
-    created. A split-only bill (fronted purely to collect from others, never
-    counted as the user's own spending) is deliberately skipped — nothing
-    was "added" to their books. Telegram delivery further respects the
-    user's own on/off preference (see telegrambot.telegram_api.notify_user).
+    created. Telegram delivery further respects the user's own on/off
+    preference (see telegrambot.telegram_api.notify_user).
 
     also_in_app=False for the split-creation callers below: they already
     raise their own richer "Split added" in-app notification a few lines up,
     so this would otherwise double it — only the Telegram ping is new there.
     """
-    if not user or getattr(expense, 'split_only', False):
+    if not user:
         return
     label = expense.get_transaction_type_display()
     body = f'{expense.description} — ₹{expense.amount:,.0f}'
@@ -167,17 +165,15 @@ class ExpenseViewSet(viewsets.ModelViewSet):
     search_fields = ['description', 'location', 'payment_method']
 
     def get_queryset(self):
-        """Only the authenticated user's expenses.
+        """Only the authenticated user's own expenses.
 
-        split_only bills (money fronted purely to collect from others) live only
-        in Splits — kept out of the list and every spending aggregate, but still
-        reachable by id for retrieve/update/delete so the Splits page can flip one
-        into a real expense ("add to expenses").
+        Shared bills live in SharedBill now, not here — every row this
+        returns is real personal spending. A bill only shows up here once its
+        owner (or, on their own copy, the person it's owed by) has opted it
+        into their expenses, via `shared_bill`/`counted_split` respectively.
         """
-        qs = Expense.objects.filter(user=self.request.user).prefetch_related('splits')
-        if self.action not in ('retrieve', 'update', 'partial_update', 'destroy'):
-            qs = qs.exclude(split_only=True)
-        return qs
+        return (Expense.objects.filter(user=self.request.user)
+                .select_related('shared_bill').prefetch_related('shared_bill__splits'))
 
     def get_serializer_class(self):
         """Return appropriate serializer based on action"""
@@ -278,9 +274,9 @@ class ExpenseViewSet(viewsets.ModelViewSet):
             # the rest. (Caught while adding tag_breakdown below: two "Food"
             # expenses under a search filter returned only one of them.)
             owed_by_category = {
-                r['expense__category_id']: r['t']
-                for r in ExpenseSplit.objects.filter(expense__in=expense_qs)
-                    .order_by().values('expense__category_id').annotate(t=Sum('amount'))
+                r['expense__linked_expense__category_id']: r['t']
+                for r in ExpenseSplit.objects.filter(expense__linked_expense__in=expense_qs)
+                    .order_by().values('expense__linked_expense__category_id').annotate(t=Sum('amount'))
             }
             category_breakdown = {}
             for r in expense_qs.order_by().values('category__id', 'category__name').annotate(gross=Sum('amount')):
@@ -293,9 +289,9 @@ class ExpenseViewSet(viewsets.ModelViewSet):
             # full net amount to each — tag_breakdown is not a partition of
             # spend the way category_breakdown is, by design (see net_spending).
             owed_by_tag = {
-                r['expense__tags__id']: r['t']
-                for r in ExpenseSplit.objects.filter(expense__in=expense_qs)
-                    .order_by().values('expense__tags__id').annotate(t=Sum('amount'))
+                r['expense__linked_expense__tags__id']: r['t']
+                for r in ExpenseSplit.objects.filter(expense__linked_expense__in=expense_qs)
+                    .order_by().values('expense__linked_expense__tags__id').annotate(t=Sum('amount'))
             }
             tag_breakdown = {}
             for r in expense_qs.order_by().values('tags__id', 'tags__name').annotate(gross=Sum('amount')):
@@ -780,11 +776,9 @@ class ExpenseViewSet(viewsets.ModelViewSet):
                         user=user, name=str(paid_by_raw).strip(),
                         linked_user=match_account(str(paid_by_raw).strip()))
 
-        expense = Expense.objects.create(
-            user=user, amount=amount, transaction_type='expense',
-            category=category, description=description, date=expense_date,
-            group=group, split_only=not add_to_expenses,
-            paid_by_person=paid_by_person,
+        bill = SharedBill.objects.create(
+            user=user, amount=amount, category=category, description=description,
+            date=expense_date, group=group, paid_by_person=paid_by_person,
         )
         if group:
             group.members.add(*resolved)
@@ -795,16 +789,28 @@ class ExpenseViewSet(viewsets.ModelViewSet):
             person = by_name.get(name)
             if person:
                 splits.append(ExpenseSplit.objects.create(
-                    expense=expense, person=person, amount=share))
+                    expense=bill, person=person, amount=share))
 
         owed_total = sum(s.amount for s in splits)
 
+        # The payer's own "count this as my spending" - a real Expense, linked
+        # back to the bill rather than the bill itself being one.
+        expense = None
+        if add_to_expenses:
+            expense = Expense.objects.create(
+                user=user, amount=amount, transaction_type='expense',
+                category=category, description=description, date=expense_date,
+                group=group, paid_by_person=paid_by_person,
+            )
+            bill.linked_expense = expense
+            bill.save(update_fields=['linked_expense'])
+
         who = ', '.join(s.person.name for s in splits) or 'someone'
         payer_label = paid_by_person.name if paid_by_person else 'You'
-        notify(expense.user, 'Split added',
-               f"{expense.description} — ₹{expense.amount} (paid by {payer_label}). Owed ₹{owed_total} from {who}.",
+        notify(bill.user, 'Split added',
+               f"{bill.description} — ₹{bill.amount} (paid by {payer_label}). Owed ₹{owed_total} from {who}.",
                kind='split', link='/splits')
-        creator_name = (expense.user.get_full_name() or expense.user.username).strip()
+        creator_name = (bill.user.get_full_name() or bill.user.username).strip()
         from telegrambot.telegram_api import notify_user as _tg_notify
         from whatsappbot.whatsapp_api import notify_user as _wa_notify
         for s in splits:
@@ -812,23 +818,27 @@ class ExpenseViewSet(viewsets.ModelViewSet):
                 paid_note = f" (paid by {paid_by_person.name})" if paid_by_person else ""
                 notify(s.person.linked_user,
                        f"{creator_name} split a bill with you",
-                       f"{expense.description}{paid_note} — you owe ₹{s.amount}. "
+                       f"{bill.description}{paid_note} — you owe ₹{s.amount}. "
                        f"It's in Shared; add it to your expenses if you want it counted.",
                        kind='split', link='/splits')
                 _split_msg = (
-                    f"💸 {creator_name} split \"{expense.description}\" (₹{expense.amount}){paid_note} with you "
+                    f"💸 {creator_name} split \"{bill.description}\" (₹{bill.amount}){paid_note} with you "
                     f"— you owe ₹{s.amount}. It's waiting in Money OS → Splits; nothing has been "
                     f"added to your expenses."
                 )
                 _tg_notify(s.person.linked_user, _split_msg)
                 _wa_notify(s.person.linked_user, _split_msg)
 
-        _notify_expense_added(expense.user, expense, note=f'(split with {who})' if splits else '', also_in_app=False)
+        if expense is not None:
+            _notify_expense_added(bill.user, expense, note=f'(split with {who})' if splits else '', also_in_app=False)
 
         return Response({
-            'expense': ExpenseSerializer(expense).data,
+            'bill_id': bill.id,
+            'amount': str(bill.amount),
+            'description': bill.description,
+            'expense': ExpenseSerializer(expense).data if expense else None,
             'splits': ExpenseSplitSerializer(splits, many=True).data,
-            'your_share': expense.amount - owed_total,
+            'your_share': bill.amount - owed_total,
             'owed_to_you': owed_total,
         }, status=status.HTTP_201_CREATED)
 
@@ -879,17 +889,14 @@ class ExpenseViewSet(viewsets.ModelViewSet):
                     user=user, name=paid_by_name,
                     linked_user=match_account(paid_by_name))
 
-        expense = Expense.objects.create(
-            user=user,
-            amount=parsed['amount'],
-            transaction_type='expense',
-            category=self._resolve_category(parsed),
-            description=parsed['description'],
-            date=timezone.now().date(),
-            group=group,
-            paid_by_person=paid_by_person,
+        bill_category = self._resolve_category(parsed)
+        bill_date = timezone.now().date()
+        bill = SharedBill.objects.create(
+            user=user, amount=parsed['amount'], category=bill_category,
+            description=parsed['description'], date=bill_date,
+            group=group, paid_by_person=paid_by_person,
         )
-        expense.tags.set(self._resolve_tags(user, parsed.get('tags')))
+        bill.tags.set(self._resolve_tags(user, parsed.get('tags')))
 
         splits = []
         for name, share in parsed['owed'].items():
@@ -903,19 +910,30 @@ class ExpenseViewSet(viewsets.ModelViewSet):
                     person.linked_user = account
                     person.save(update_fields=['linked_user'])
             splits.append(ExpenseSplit.objects.create(
-                expense=expense, person=person, amount=share))
+                expense=bill, person=person, amount=share))
 
         if group:
             group.members.add(*[s.person for s in splits])
 
         owed_total = sum(s.amount for s in splits)
 
+        # split_add never had an opt-out - the whole bill always counted as
+        # the payer's own spending, so it always gets a linked Expense too.
+        expense = Expense.objects.create(
+            user=user, amount=parsed['amount'], transaction_type='expense',
+            category=bill_category, description=parsed['description'], date=bill_date,
+            group=group, paid_by_person=paid_by_person,
+        )
+        expense.tags.set(self._resolve_tags(user, parsed.get('tags')))
+        bill.linked_expense = expense
+        bill.save(update_fields=['linked_expense'])
+
         who = ', '.join(s.person.name for s in splits) or 'someone'
         payer_label = paid_by_person.name if paid_by_person else 'You'
-        notify(expense.user, 'Split added',
-               f"{expense.description} — ₹{expense.amount} (paid by {payer_label}). Owed ₹{owed_total} from {who}.",
+        notify(bill.user, 'Split added',
+               f"{bill.description} — ₹{bill.amount} (paid by {payer_label}). Owed ₹{owed_total} from {who}.",
                kind='split', link='/splits')
-        creator_name = (expense.user.get_full_name() or expense.user.username).strip()
+        creator_name = (bill.user.get_full_name() or bill.user.username).strip()
         from telegrambot.telegram_api import notify_user as _tg_notify
         from whatsappbot.whatsapp_api import notify_user as _wa_notify
         for s in splits:
@@ -923,23 +941,26 @@ class ExpenseViewSet(viewsets.ModelViewSet):
                 paid_note = f" (paid by {paid_by_person.name})" if paid_by_person else ""
                 notify(s.person.linked_user,
                        f"{creator_name} split a bill with you",
-                       f"{expense.description}{paid_note} — you owe ₹{s.amount}. "
+                       f"{bill.description}{paid_note} — you owe ₹{s.amount}. "
                        f"It's in Shared; add it to your expenses if you want it counted.",
                        kind='split', link='/splits')
                 _split_msg = (
-                    f"💸 {creator_name} split \"{expense.description}\" (₹{expense.amount}){paid_note} with you "
+                    f"💸 {creator_name} split \"{bill.description}\" (₹{bill.amount}){paid_note} with you "
                     f"— you owe ₹{s.amount}. It's waiting in Money OS → Splits; nothing has been "
                     f"added to your expenses."
                 )
                 _tg_notify(s.person.linked_user, _split_msg)
                 _wa_notify(s.person.linked_user, _split_msg)
 
-        _notify_expense_added(expense.user, expense, note=f'(split with {who})' if splits else '', also_in_app=False)
+        _notify_expense_added(bill.user, expense, note=f'(split with {who})' if splits else '', also_in_app=False)
 
         return Response({
+            'bill_id': bill.id,
+            'amount': str(bill.amount),
+            'description': bill.description,
             'expense': ExpenseSerializer(expense).data,
             'splits': ExpenseSplitSerializer(splits, many=True).data,
-            'your_share': expense.amount - owed_total,
+            'your_share': bill.amount - owed_total,
             'owed_to_you': owed_total,
         }, status=status.HTTP_201_CREATED)
 
@@ -1322,7 +1343,7 @@ class SplitViewSet(viewsets.ModelViewSet):
             queryset = queryset.filter(expense__user_id=uid)
         included = self.request.GET.get('included')
         if included in ('true', 'false'):
-            queryset = queryset.filter(include_in_expenses=(included == 'true'))
+            queryset = queryset.filter(linked_expense__isnull=(included != 'true'))
         person = self.request.GET.get('person')
         if person:
             # The owed-to-you side: a Person in your own contact list.
@@ -1456,13 +1477,30 @@ class SplitViewSet(viewsets.ModelViewSet):
         notes = []
 
         # ── the counterparty's consent, and only theirs ────────────────────
+        # Saying yes writes a real Expense of their own - the mirror of the
+        # payer's SharedBill.linked_expense - rather than flipping a flag on
+        # someone else's row. Saying no again removes that Expense.
         if include is not None:
             if not (split.person.linked_user_id == actor.id and expense.user_id != actor.id):
                 raise serializers.ValidationError(
                     {'include_in_expenses': "Only the person who owes this share can "
                                             "choose whether it counts as their spending."})
-            split.include_in_expenses = bool(include)
-            split.save(update_fields=['include_in_expenses'])
+            if include and not split.linked_expense_id:
+                category = expense.category
+                if not category:
+                    from .resolvers import resolve_category
+                    category = resolve_category(
+                        {'transaction_type': 'expense', 'category_name': 'Shared'})
+                counted = Expense.objects.create(
+                    user=actor, amount=split.amount, transaction_type='expense',
+                    category=category, description=expense.description,
+                    date=expense.date, group=expense.group,
+                )
+                split.linked_expense = counted
+                split.save(update_fields=['linked_expense'])
+            elif not include and split.linked_expense_id:
+                split.linked_expense.delete()
+                split.linked_expense_id = None
             # Consent is a private bookkeeping choice about the reader's own
             # totals, not a change to the shared claim - so it notifies nobody
             # and returns before the "someone edited your split" machinery.
@@ -1491,6 +1529,30 @@ class SplitViewSet(viewsets.ModelViewSet):
             expense_fields.append('amount')
         if expense_fields:
             expense.save(update_fields=expense_fields + ['updated_at'])
+            # The bill and its linked Expense(s) are separate rows now - an
+            # edit here doesn't fall out for free the way it did when they
+            # were the same row. Keep whoever has counted this bill in sync:
+            # the payer's own copy always mirrors the bill total, and every
+            # counterparty's copy of their own share follows description/
+            # date/category (their amount is their share, tracked separately
+            # below when the share itself changes).
+            if expense.linked_expense_id:
+                copy_fields = [f for f in expense_fields if f != 'amount']
+                if 'amount' in expense_fields:
+                    expense.linked_expense.amount = expense.amount
+                    copy_fields = copy_fields + ['amount']
+                for f in ('description', 'date', 'category'):
+                    if f in expense_fields:
+                        setattr(expense.linked_expense, f if f != 'category' else 'category_id',
+                                getattr(expense, f if f != 'category' else 'category_id'))
+                expense.linked_expense.save(update_fields=copy_fields + ['updated_at'])
+            for counted in expense.splits.exclude(linked_expense__isnull=True).select_related('linked_expense'):
+                for f in ('description', 'date', 'category'):
+                    if f in expense_fields:
+                        setattr(counted.linked_expense, f if f != 'category' else 'category_id',
+                                getattr(expense, f if f != 'category' else 'category_id'))
+                fields_to_save = [f for f in expense_fields if f != 'amount'] + ['updated_at']
+                counted.linked_expense.save(update_fields=fields_to_save)
 
         # ── this row's share ───────────────────────────────────────────────
         if 'amount' in vd:
@@ -1501,6 +1563,11 @@ class SplitViewSet(viewsets.ModelViewSet):
             # A share reduced to what was already paid is simply settled now.
             split.is_settled = (split.settled_amount or ZERO) >= vd['amount']
             serializer.save(is_settled=split.is_settled)
+            if split.linked_expense_id:
+                # The counterparty's own copy of their share - only the
+                # amount can drift here, since it's their share, not the bill.
+                split.linked_expense.amount = split.amount
+                split.linked_expense.save(update_fields=['amount', 'updated_at'])
             if old_amount != new_amount:
                 notes.append(f"{split.person.name}'s share \u20b9{old_amount} "
                              f"\u2192 \u20b9{new_amount}")
@@ -1577,14 +1644,22 @@ class SplitViewSet(viewsets.ModelViewSet):
         # deleted, so the last split would never look like the last one.
         remaining = ExpenseSplit.objects.filter(expense=expense).count()
         if remaining == 0 and is_owner:
-            # Only the payer may take the expense down with the last split - it
+            # Only the payer may take the bill down with the last split - it
             # is their record. A counterparty deleting the share they owe must
-            # never delete somebody else's expense out from under them, so for
+            # never delete somebody else's bill out from under them, so for
             # them the bill just shrinks to the payer's own residual and stays.
+            # The payer's own linked Expense goes with it too, same original
+            # cascade as when bill and expense were the same row.
+            linked = expense.linked_expense
             expense.delete()
+            if linked:
+                linked.delete()
         else:
             expense.amount = expense.amount - old_amount
             expense.save(update_fields=['amount', 'updated_at'])
+            if expense.linked_expense_id:
+                expense.linked_expense.amount = expense.amount
+                expense.linked_expense.save(update_fields=['amount', 'updated_at'])
 
         body = (f"{person_name}'s split for \"{description}\" "
                 f"(\u20b9{old_amount}) was removed.")
@@ -1792,6 +1867,40 @@ class SplitViewSet(viewsets.ModelViewSet):
                 touched, many=True, context={'request': request}).data,
         })
 
+    @action(detail=False, methods=['post'], url_path='add_to_expenses')
+    def add_to_expenses(self, request):
+        """The payer counts a shared bill as their own spending.
+
+        Body: {"bill_id": 7}
+
+        Only whoever paid the bill may do this - it's their record, and it's
+        the mirror of update()'s include_in_expenses for the other side. A
+        real Expense gets created and linked; calling this again on a bill
+        that already has one is a no-op rather than a duplicate.
+        """
+        user, error = _resolve_split_user(request)
+        if error:
+            return error
+        bill_id = request.data.get('bill_id')
+        bill = SharedBill.objects.filter(id=bill_id, user=user).first()
+        if not bill:
+            return Response({'error': 'Unknown bill'}, status=status.HTTP_404_NOT_FOUND)
+        if not bill.linked_expense_id:
+            category = bill.category
+            if not category:
+                from .resolvers import resolve_category
+                category = resolve_category(
+                    {'transaction_type': 'expense', 'category_name': 'Shared'})
+            expense = Expense.objects.create(
+                user=user, amount=bill.amount, transaction_type='expense',
+                category=category, description=bill.description, date=bill.date,
+                group=bill.group, paid_by_person=bill.paid_by_person,
+            )
+            expense.tags.set(bill.tags.all())
+            bill.linked_expense = expense
+            bill.save(update_fields=['linked_expense'])
+        return Response(SharedBillSerializer(bill).data)
+
 
 def _coerce_date_value(value):
     """A client-supplied YYYY-MM-DD, or None when absent or unusable."""
@@ -1954,7 +2063,7 @@ class SplitGroupViewSet(viewsets.ModelViewSet):
                       .exclude(expense__user=request.user)
                       .aggregate(t=Sum(OUTSTANDING))['t'] or 0)
 
-        spend = group.expenses.aggregate(total=Sum('amount'), count=Count('id'))
+        spend = group.bills.aggregate(total=Sum('amount'), count=Count('id'))
         return Response({
             'group': self.get_serializer(group).data,
             'viewer_is_owner': viewer_is_owner,
@@ -1975,9 +2084,9 @@ class SplitGroupViewSet(viewsets.ModelViewSet):
         Membership is enforced by get_queryset before this runs.
         """
         group = self.get_object()
-        queryset = (group.expenses.select_related('category')
+        queryset = (group.bills.select_related('category')
                     .order_by('-date', '-created_at')[:50])
-        return Response(ExpenseListSerializer(queryset, many=True).data)
+        return Response(SharedBillSerializer(queryset, many=True).data)
 
 
 class RecurringRuleViewSet(viewsets.ModelViewSet):

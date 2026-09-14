@@ -1,6 +1,9 @@
 from rest_framework import serializers
 from django.contrib.auth.models import User
-from .models import Expense, ExpenseCategory, ExpenseSplit, ExpenseTag, Person, SplitGroup, RecurringRule, CopilotCard
+from .models import (
+    Expense, ExpenseCategory, ExpenseSplit, ExpenseTag, Person, SplitGroup,
+    RecurringRule, CopilotCard, SharedBill,
+)
 
 
 class ExpenseCategorySerializer(serializers.ModelSerializer):
@@ -95,7 +98,7 @@ class ExpenseListSerializer(SplitShareMixin, serializers.ModelSerializer):
         model = Expense
         fields = ['id', 'amount', 'amount_display', 'transaction_type', 'category',
                  'description', 'date', 'tags', 'is_recent', 'balance_effect',
-                 'your_share', 'owed_to_you', 'split_only', 'paid_by_person', 'paid_by_person_name',
+                 'your_share', 'owed_to_you', 'paid_by_person', 'paid_by_person_name',
                  'created_at', 'updated_at']
         read_only_fields = ['id', 'created_at', 'updated_at']
 
@@ -193,7 +196,7 @@ class ExpenseSerializer(SplitShareMixin, serializers.ModelSerializer):
                  'related_expense', 'lender_borrower', 'receipt_image', 'location',
                  'payment_method', 'is_recurring', 'recurring_interval',
                  'is_recent', 'is_debt_related', 'balance_effect',
-                 'your_share', 'owed_to_you', 'split_only', 'paid_by_person', 'paid_by_person_name',
+                 'your_share', 'owed_to_you', 'paid_by_person', 'paid_by_person_name',
                  'created_at', 'updated_at']
         read_only_fields = ['id', 'user', 'created_at', 'updated_at']
 
@@ -270,6 +273,23 @@ class PersonSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'linked_username', 'created_at']
 
 
+class SharedBillSerializer(serializers.ModelSerializer):
+    """A shared bill on its own - a group's ledger, not one person's share of
+    it. Lean by design: a list of these is a "what happened" feed, not a
+    place to reopen the edit dialog (that reads ExpenseSplitSerializer, which
+    carries the full participant list)."""
+    category_name = serializers.CharField(source='category.name', read_only=True, default=None)
+    paid_by_person_name = serializers.CharField(source='paid_by_person.name', read_only=True, default=None)
+    counted_in_expenses = serializers.BooleanField(source='linked_expense_id', read_only=True)
+
+    class Meta:
+        model = SharedBill
+        fields = ['id', 'amount', 'description', 'date', 'category', 'category_name',
+                  'paid_by_person', 'paid_by_person_name', 'group', 'counted_in_expenses',
+                  'created_at', 'updated_at']
+        read_only_fields = fields
+
+
 class ExpenseSplitSerializer(serializers.ModelSerializer):
     """One person's share of one expense, with enough of the expense to read it.
 
@@ -286,7 +306,11 @@ class ExpenseSplitSerializer(serializers.ModelSerializer):
     date = serializers.DateField(source='expense.date', read_only=True)
     expense_total = serializers.DecimalField(
         source='expense.amount', max_digits=10, decimal_places=2, read_only=True)
-    expense_split_only = serializers.BooleanField(source='expense.split_only', read_only=True)
+    # Whether the payer has counted this bill as their own spending yet - a
+    # real Expense linked from the bill (SharedBill.linked_expense), not a
+    # flag on it. Kept under its old name so existing clients don't need to
+    # change what they read.
+    expense_split_only = serializers.SerializerMethodField()
     direction = serializers.SerializerMethodField()
     counterparty = serializers.SerializerMethodField()
     payer_user_id = serializers.IntegerField(source='expense.user_id', read_only=True)
@@ -298,9 +322,11 @@ class ExpenseSplitSerializer(serializers.ModelSerializer):
     participants = serializers.SerializerMethodField()
     # Partial settlement: what has been paid, and what is genuinely left.
     outstanding = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
-    # The counterparty's consent to count this share as their own spending.
+    # The counterparty's consent to count this share as their own spending -
+    # a real Expense of their own (ExpenseSplit.linked_expense), not a flag.
     # can_include says whether the *viewer* is the side that owns that choice —
-    # the payer's equivalent lives on their expense (split_only), not here.
+    # the payer's equivalent lives on their bill (expense_split_only), not here.
+    include_in_expenses = serializers.SerializerMethodField()
     can_include = serializers.SerializerMethodField()
 
     class Meta:
@@ -311,6 +337,12 @@ class ExpenseSplitSerializer(serializers.ModelSerializer):
                   'include_in_expenses', 'can_include',
                   'direction', 'counterparty', 'payer_user_id', 'can_edit', 'participants']
         read_only_fields = fields
+
+    def get_expense_split_only(self, obj):
+        return not obj.expense.linked_expense_id
+
+    def get_include_in_expenses(self, obj):
+        return obj.linked_expense_id is not None
 
     def get_participants(self, obj):
         """Everyone billed on this same expense, so the edit dialog opens on the

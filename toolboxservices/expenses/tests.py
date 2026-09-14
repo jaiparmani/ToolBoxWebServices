@@ -15,7 +15,7 @@ from rest_framework.authtoken.models import Token
 from rest_framework.test import APITestCase
 
 from .models import (Expense, ExpenseCategory, ExpenseSplit, ExpenseTag, Notification,
-                     Person, SplitGroup)
+                     Person, SplitGroup, SharedBill)
 
 
 class TwoSidedSplitTests(APITestCase):
@@ -180,7 +180,7 @@ class TwoSidedSplitTests(APITestCase):
         self.assertEqual(Decimal(str(data['owed_to_you'])), Decimal('1200.00'))
         expense = Expense.objects.get()
         self.assertEqual(expense.amount, Decimal('1200.00'))
-        self.assertEqual(expense.splits.get().amount, Decimal('1200.00'))
+        self.assertEqual(expense.shared_bill.splits.get().amount, Decimal('1200.00'))
 
     def test_split_without_me_leaves_the_payer_at_zero(self):
         data = self.make_split(amount='1200', split_with_me=False)
@@ -246,14 +246,14 @@ class GroupVisibilityTests(APITestCase):
             user=self.ashok, name='priya', linked_user=self.priya)
         self.group.members.add(self.jai_person, self.priya_person)
 
-        expense = Expense.objects.create(
-            user=self.ashok, amount=Decimal('900.00'), transaction_type='expense',
+        bill = SharedBill.objects.create(
+            user=self.ashok, amount=Decimal('900.00'),
             category=self.category, description='rent', date='2026-01-01',
             group=self.group)
         ExpenseSplit.objects.create(
-            expense=expense, person=self.jai_person, amount=Decimal('450.00'))
+            expense=bill, person=self.jai_person, amount=Decimal('450.00'))
         ExpenseSplit.objects.create(
-            expense=expense, person=self.priya_person, amount=Decimal('300.00'))
+            expense=bill, person=self.priya_person, amount=Decimal('300.00'))
 
     def auth(self, user):
         self.client.credentials(
@@ -282,8 +282,8 @@ class GroupVisibilityTests(APITestCase):
 
     def test_member_sees_every_group_expense(self):
         """Including a bill they are not personally split on."""
-        Expense.objects.create(
-            user=self.ashok, amount=Decimal('200.00'), transaction_type='expense',
+        SharedBill.objects.create(
+            user=self.ashok, amount=Decimal('200.00'),
             category=self.category, description='wifi', date='2026-01-02',
             group=self.group)
         self.auth(self.jai)
@@ -324,8 +324,8 @@ class GroupVisibilityTests(APITestCase):
         """The owner's own view is unchanged by the widening."""
         other = Person.objects.create(user=self.ashok, name='sam')
         self.group.members.add(other)
-        theirs = Expense.objects.create(
-            user=self.ashok, amount=Decimal('300.00'), transaction_type='expense',
+        theirs = SharedBill.objects.create(
+            user=self.ashok, amount=Decimal('300.00'),
             category=self.category, description='sam only', date='2026-01-02',
             group=self.group)
         ExpenseSplit.objects.create(expense=theirs, person=other, amount=Decimal('150.00'))
@@ -346,8 +346,8 @@ class SplitConsentTests(APITestCase):
     Ashok splitting a bill with jai used to reach into jai's spending totals the
     moment it was created: net_spending added his share, so his summary moved
     while his expense list showed nothing. Felt in the balance, invisible as an
-    item. Consent now sits on the one shared row (include_in_expenses), written
-    by the account that owes it and by nobody else.
+    item. Consent now means writing a real Expense of his own - linked from the
+    split, but on his books, not ashok's - and only he can do it.
     """
 
     def setUp(self):
@@ -418,9 +418,11 @@ class SplitConsentTests(APITestCase):
         self.assertTrue(response.data['include_in_expenses'])
 
         self.assertEqual(self.summary_total(self.jai), Decimal('600.00'))
-        # Still one row, read from both ends - opting in mirrored nothing.
+        # Still one split, but opting in now writes jai his own Expense - his
+        # spending, on his own books, not a flag on ashok's bill.
         self.assertEqual(ExpenseSplit.objects.count(), 1)
-        self.assertFalse(Expense.objects.filter(user=self.jai).exists())
+        counted = Expense.objects.get(user=self.jai)
+        self.assertEqual(counted.amount, Decimal('600.00'))
         # The payer's own figures are untouched by the other side's choice.
         self.assertEqual(self.summary_total(self.ashok), Decimal('600.00'))
 
@@ -443,7 +445,7 @@ class SplitConsentTests(APITestCase):
                                      {'include_in_expenses': True}, format='json')
         self.assertEqual(response.status_code, 400, response.data)
         split.refresh_from_db()
-        self.assertFalse(split.include_in_expenses)
+        self.assertIsNone(split.linked_expense_id)
 
     def test_a_third_account_cannot_opt_a_split_in(self):
         split = self.make_split()
@@ -1003,7 +1005,10 @@ class TagBreakdownTests(APITestCase):
         }, format='json')
         self.assertEqual(response.status_code, 201, response.data)
         split = ExpenseSplit.objects.order_by('created_at').last()
+        # The bill and Ashok's own copy of it are separate rows now - tagging
+        # both is what a real "tag this bill" UI would do on his side.
         split.expense.tags.set([outing])
+        split.expense.linked_expense.tags.set([outing])
 
         # Ashok paid in full — his tag total is net of what jai owes him (half).
         data = self.summary(self.ashok)
@@ -1013,9 +1018,12 @@ class TagBreakdownTests(APITestCase):
         data = self.summary(self.jai)
         self.assertEqual(data['tag_breakdown'], {})
 
-        # Once jai opts in, his share of the same tag appears on his side too.
+        # Once jai opts in, his share of the same tag appears on his side too -
+        # tagging his own new copy the same way.
         self.client.patch(f'/api/expenses/splits/{split.id}/',
                           {'include_in_expenses': True}, format='json')
+        split.refresh_from_db()
+        split.linked_expense.tags.set([outing])
         data = self.summary(self.jai)
         self.assertEqual(Decimal(str(data['tag_breakdown']['Outing'])), Decimal('600.00'))
 
@@ -1029,7 +1037,9 @@ class TagBreakdownTests(APITestCase):
             'participants': [{'user_id': self.jai.id}],
         }, format='json')
         self.assertEqual(response.status_code, 201, response.data)
-        ExpenseSplit.objects.order_by('created_at').last().expense.tags.set([outing])
+        split = ExpenseSplit.objects.order_by('created_at').last()
+        split.expense.tags.set([outing])
+        split.expense.linked_expense.tags.set([outing])
 
         # search= is one of the extra_filter_params, forcing the filtered branch.
         data = self.summary(self.ashok, search='trip')
