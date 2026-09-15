@@ -36,6 +36,7 @@ from .services import (
     answer_lending_question, looks_like_batch,
     parse_expense_batch, parse_expense_text, parse_search_query, parse_split_text,
     validate_supplied_items,
+    generate_monthly_narrative, generate_month_forecast, suggest_category_merges,
 )
 
 
@@ -59,6 +60,14 @@ def _notify_expense_added(user, expense, note='', also_in_app=True):
         body += f' {note}'
     if also_in_app:
         notify(user, f'{label} added', body, kind='expense', link='/expense-tracker')
+    # AI anomaly / nudge check (best-effort, never blocks the response)
+    try:
+        from .services import check_expense_for_insights
+        insight = check_expense_for_insights(user, expense)
+        if insight:
+            notify(user, 'Money insight', insight, kind='insight', link='/expense-tracker')
+    except Exception:
+        pass
     try:
         from telegrambot.telegram_api import notify_user as _tg
         _tg(user, f'✅ {label} added: {body}')
@@ -1226,6 +1235,60 @@ class ExpenseViewSet(viewsets.ModelViewSet):
 
         serializer = self.get_serializer(expense)
         return Response(serializer.data)
+
+    @action(detail=False, methods=['get'])
+    def monthly_narrative(self, request):
+        """Return a 3-4 sentence plain-language narrative about the user's month.
+
+        Params: ?year=2026&month=9 (defaults to current month).
+        """
+        user = request.user
+        now = timezone.now()
+        try:
+            year = int(request.query_params.get('year', now.year))
+            month = int(request.query_params.get('month', now.month))
+        except (TypeError, ValueError):
+            return Response({'error': 'year and month must be integers'},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            narrative = generate_monthly_narrative(user, year, month)
+        except ExpenseParseNotPossible as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except ExpenseParseRateLimited as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_429_TOO_MANY_REQUESTS)
+        except ExpenseParseError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+
+        return Response({'year': year, 'month': month, 'narrative': narrative})
+
+    @action(detail=False, methods=['get'])
+    def month_forecast(self, request):
+        """Forecast this month's end-of-month total spend.
+
+        Returns projected_total, current_spend, days_left, daily_rate, pace,
+        and top 3 categories with projected amounts. Pure calculation — no LLM.
+        """
+        user = request.user
+        try:
+            forecast = generate_month_forecast(user)
+        except Exception as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(forecast)
+
+    @action(detail=False, methods=['get'])
+    def category_merge_suggestions(self, request):
+        """Return up to 3 suggestions for category names that likely mean the same thing."""
+        user = request.user
+        try:
+            suggestions = suggest_category_merges(user)
+        except ExpenseParseNotPossible as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except ExpenseParseRateLimited as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_429_TOO_MANY_REQUESTS)
+        except ExpenseParseError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+        return Response({'suggestions': suggestions})
 
 
 def match_account(name):

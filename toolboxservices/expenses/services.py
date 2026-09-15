@@ -12,7 +12,7 @@ llm.client; this module only describes what an expense looks like.
 import json
 import logging
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import ROUND_DOWN, Decimal, InvalidOperation
 
 from llm.client import LLMError, LLMNotConfigured, LLMRateLimited, call_json
@@ -824,3 +824,421 @@ def parse_split_text(text, known_people=(), known_tags=()):
     parsed['owed'] = compute_shares(
         parsed['amount'], parsed['people'], parsed['split_with_me'], parsed['shares'])
     return parsed
+
+
+# --------------------------------------------------------------------------
+# Monthly narrative
+# --------------------------------------------------------------------------
+
+NARRATIVE_SYSTEM_PROMPT = (
+    "You write a short, warm monthly summary of someone's spending. You are given "
+    "a JSON object with their total spend, top categories, total income, transaction "
+    "count, and how this month compares to the previous one. All amounts are in "
+    "Indian rupees (₹).\n"
+    "\n"
+    "Write exactly 3-4 sentences. First sentence: what happened this month at a glance. "
+    "Second sentence: one pattern or trend you notice (a category that stands out, "
+    "a change in behaviour). Third (and optional fourth) sentence: one observation or "
+    "positive note — not advice, just something worth knowing.\n"
+    "\n"
+    "Write like a thoughtful friend who knows their money, not like a spreadsheet. "
+    "Be specific: use the actual figures and category names from the data. Use ₹ for "
+    "amounts. Avoid generic filler phrases.\n"
+    "\n"
+    "Respond with ONLY a JSON object: {\"narrative\": \"...\"} — no prose outside it, "
+    "no code fences."
+)
+
+
+def _validate_narrative(parsed):
+    if not isinstance(parsed, dict):
+        raise LLMError("The model did not return a JSON object.")
+    narrative = parsed.get('narrative')
+    if not isinstance(narrative, str) or not narrative.strip():
+        raise LLMError("The model's response has no \"narrative\" string.")
+    return narrative.strip()
+
+
+def generate_monthly_narrative(user, year, month):
+    """Generate a 3-4 sentence plain-language narrative about the user's month."""
+    import calendar as _calendar
+    from django.db.models import Sum
+    from .models import Expense
+    from .net_spending import net_spending as _net_spending
+
+    first = date(year, month, 1)
+    last = date(year, month, _calendar.monthrange(year, month)[1])
+    ns = _net_spending(user, first, last)
+
+    prev_month = month - 1 if month > 1 else 12
+    prev_year = year if month > 1 else year - 1
+    prev_first = date(prev_year, prev_month, 1)
+    prev_last = date(prev_year, prev_month, _calendar.monthrange(prev_year, prev_month)[1])
+    prev_ns = _net_spending(user, prev_first, prev_last)
+
+    income_total = float(
+        Expense.objects.filter(user=user, transaction_type='income',
+                               date__gte=first, date__lte=last)
+        .aggregate(t=Sum('amount'))['t'] or 0
+    )
+
+    top_categories = [
+        {'name': c['category__name'] or 'Uncategorised', 'amount': round(c['total'], 2)}
+        for c in ns['category_totals'][:5]
+    ]
+
+    prev_total = prev_ns['total']
+    change_pct = None
+    if prev_total > 0:
+        change_pct = round(((ns['total'] - prev_total) / prev_total) * 100, 1)
+
+    context = {
+        'year': year,
+        'month': month,
+        'total_spend': round(ns['total'], 2),
+        'total_income': round(income_total, 2),
+        'transaction_count': ns['count'],
+        'top_categories': top_categories,
+        'prev_month_spend': round(prev_total, 2),
+        'change_vs_prev_month_pct': change_pct,
+    }
+
+    user_content = (
+        f"Month: {year}-{month:02d}\n"
+        f"Data:\n{json.dumps(context, indent=2)}"
+    )
+    messages = [
+        {"role": "system", "content": NARRATIVE_SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
+    return _translate_errors(
+        call_json, messages, validate=_validate_narrative, expect_key='narrative',
+        retry_instruction=(
+            "That was not usable. Reply with ONLY a JSON object shaped "
+            "{\"narrative\": \"...\"}, no prose and no code fences."
+        ),
+    )
+
+
+# --------------------------------------------------------------------------
+# Month-end forecast (pure calculation, no LLM)
+# --------------------------------------------------------------------------
+
+def generate_month_forecast(user):
+    """Forecast this month's end-of-month total spend."""
+    import calendar as _calendar
+    from django.utils import timezone as _tz
+    from .projections import daily_discretionary as _daily_disc
+    from .net_spending import net_spending as _net_spending
+    from .models import RecurringRule
+
+    today = _tz.now().date()
+    year, month = today.year, today.month
+    first = date(year, month, 1)
+    last = date(year, month, _calendar.monthrange(year, month)[1])
+
+    days_elapsed = (today - first).days + 1
+    days_left = last.day - today.day
+
+    ns = _net_spending(user, first, today)
+    current_spend = ns['total']
+
+    if days_elapsed > 0 and current_spend > 0:
+        daily_rate = current_spend / days_elapsed
+    else:
+        daily_rate = float(_daily_disc(user))
+
+    upcoming_bills = 0.0
+    rules = RecurringRule.objects.filter(user=user, is_active=True, transaction_type='expense')
+    for rule in rules:
+        for _occ in rule.occurrences(today + timedelta(days=1), last):
+            upcoming_bills += float(rule.amount)
+
+    projected_total = current_spend + (daily_rate * days_left) + upcoming_bills
+
+    prev_month = month - 1 if month > 1 else 12
+    prev_year = year if month > 1 else year - 1
+    prev_first = date(prev_year, prev_month, 1)
+    prev_last = date(prev_year, prev_month, _calendar.monthrange(prev_year, prev_month)[1])
+    prev_ns = _net_spending(user, prev_first, prev_last)
+    prev_total = prev_ns['total']
+
+    if prev_total > 0:
+        ratio = projected_total / prev_total
+        if ratio > 1.15:
+            pace = 'running high'
+        elif ratio < 0.85:
+            pace = 'running low'
+        else:
+            pace = 'on track'
+    else:
+        pace = 'on track'
+
+    if current_spend > 0:
+        categories = [
+            {
+                'name': c['category__name'] or 'Uncategorised',
+                'current': round(c['total'], 2),
+                'projected': round(c['total'] / current_spend * projected_total, 2),
+            }
+            for c in ns['category_totals'][:3]
+        ]
+    else:
+        categories = []
+
+    return {
+        'projected_total': round(projected_total, 2),
+        'current_spend': round(current_spend, 2),
+        'days_left': days_left,
+        'daily_rate': round(daily_rate, 2),
+        'pace': pace,
+        'categories': categories,
+    }
+
+
+# --------------------------------------------------------------------------
+# Category merge suggestions
+# --------------------------------------------------------------------------
+
+MERGE_SYSTEM_PROMPT = (
+    "You are given a list of expense category names. Some of them likely represent "
+    "the same kind of spending under different names — for instance, \"Zomato\", "
+    "\"Swiggy Food\", and \"Food Delivery\" clearly belong together.\n"
+    "\n"
+    "Identify up to 3 groups of names that clearly mean the same thing. Only group "
+    "names with an obvious semantic match — do not force weak connections. For each "
+    "group, suggest what a single merged name should be (short, 1-3 words).\n"
+    "\n"
+    "If no meaningful merges exist, return an empty suggestions list.\n"
+    "\n"
+    "Respond with ONLY a JSON object — no prose, no code fences — shaped:\n"
+    "{\"suggestions\": [{\"merge\": [\"name1\", \"name2\"], \"into\": \"Merged Name\", "
+    "\"reason\": \"one short sentence\"}, ...]}"
+)
+
+
+def _validate_merges(parsed):
+    if not isinstance(parsed, dict):
+        raise LLMError("The model did not return a JSON object.")
+    suggestions = parsed.get('suggestions')
+    if not isinstance(suggestions, list):
+        raise LLMError("The model's response has no \"suggestions\" list.")
+    clean = []
+    for s in suggestions[:3]:
+        if not isinstance(s, dict):
+            continue
+        merge = s.get('merge')
+        into = s.get('into')
+        reason = s.get('reason', '')
+        if not isinstance(merge, list) or len(merge) < 2:
+            continue
+        if not isinstance(into, str) or not into.strip():
+            continue
+        clean.append({
+            'merge': [str(n).strip() for n in merge if isinstance(n, str)],
+            'into': into.strip(),
+            'reason': reason.strip() if isinstance(reason, str) else '',
+        })
+    return clean
+
+
+def suggest_category_merges(user):
+    """Return categories that likely represent the same thing."""
+    from django.db.models import Count
+    from .models import Expense
+
+    rows = (
+        Expense.objects.filter(user=user)
+        .exclude(category__isnull=True)
+        .values('category__name')
+        .annotate(usage=Count('id'))
+        .order_by('-usage')[:20]
+    )
+
+    cat_names = [r['category__name'] for r in rows if r['category__name']]
+    if len(cat_names) <= 1:
+        return []
+
+    user_content = (
+        f"Category names (most used first):\n{json.dumps(cat_names, indent=2)}"
+    )
+    messages = [
+        {"role": "system", "content": MERGE_SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
+    return _translate_errors(
+        call_json, messages, validate=_validate_merges, expect_key='suggestions',
+        retry_instruction=(
+            "That was not usable. Reply with ONLY a JSON object shaped "
+            "{\"suggestions\": [{\"merge\": [...], \"into\": \"...\", \"reason\": \"...\"}]}, "
+            "no prose and no code fences."
+        ),
+    )
+
+
+# --------------------------------------------------------------------------
+# Anomaly detection + behaviour nudge
+# --------------------------------------------------------------------------
+
+INSIGHT_SYSTEM_PROMPT = (
+    "You write a single, specific sentence about a money insight for a personal "
+    "finance app. You are given a data object describing either:\n"
+    "  type=anomaly: a purchase that is unusually large for this person's daily pace\n"
+    "  type=nudge: a purchase from a merchant they've visited multiple times this week\n"
+    "\n"
+    "For an anomaly: note that the purchase is X times the daily average, in a "
+    "matter-of-fact way. No judgment — just a clear observation.\n"
+    "For a nudge: note the frequency this week (N visits), as a gentle observation.\n"
+    "\n"
+    "Keep it to one sentence. Use ₹ for amounts. Be specific, not generic.\n"
+    "\n"
+    "Respond with ONLY a JSON object: {\"insight\": \"...\"} — no prose, no fences."
+)
+
+
+def _validate_insight(parsed):
+    if not isinstance(parsed, dict):
+        raise LLMError("The model did not return a JSON object.")
+    insight = parsed.get('insight')
+    if not isinstance(insight, str) or not insight.strip():
+        raise LLMError("The model's response has no \"insight\" string.")
+    return insight.strip()
+
+
+def check_expense_for_insights(user, expense):
+    """Return an anomaly/nudge string if this expense is noteworthy, else None."""
+    from django.db.models import Sum
+    from .models import Expense
+
+    total_count = Expense.objects.filter(user=user).count()
+    if total_count <= 10:
+        return None
+
+    today = date.today()
+    thirty_days_ago = today - timedelta(days=30)
+    week_ago = today - timedelta(days=7)
+
+    recent_total = float(
+        Expense.objects.filter(
+            user=user, transaction_type='expense',
+            date__gte=thirty_days_ago, date__lte=today,
+        ).aggregate(t=Sum('amount'))['t'] or 0
+    )
+    daily_avg = recent_total / 30.0 if recent_total else 0.0
+
+    insight_type = None
+    context_data = {}
+
+    if daily_avg > 0 and float(expense.amount) > daily_avg * 3:
+        ratio = round(float(expense.amount) / daily_avg, 1)
+        insight_type = 'anomaly'
+        context_data = {
+            'type': 'anomaly',
+            'description': expense.description,
+            'amount': float(expense.amount),
+            'daily_avg': round(daily_avg, 2),
+            'times_daily_avg': ratio,
+        }
+    else:
+        first_word = (expense.description or '').split()[0].lower() if expense.description else ''
+        if first_word:
+            week_count = Expense.objects.filter(
+                user=user, date__gte=week_ago,
+                description__istartswith=first_word,
+            ).count()
+            if week_count >= 4:
+                insight_type = 'nudge'
+                context_data = {
+                    'type': 'nudge',
+                    'description': expense.description,
+                    'merchant_keyword': first_word,
+                    'times_this_week': week_count,
+                }
+
+    if not insight_type:
+        return None
+
+    messages = [
+        {"role": "system", "content": INSIGHT_SYSTEM_PROMPT},
+        {"role": "user", "content": json.dumps(context_data)},
+    ]
+    try:
+        return _translate_errors(
+            call_json, messages, validate=_validate_insight, expect_key='insight',
+            retry_instruction=(
+                "Reply with ONLY {\"insight\": \"...\"} — one sentence, no prose, no fences."
+            ),
+        )
+    except (ExpenseParseNotPossible, ExpenseParseError):
+        return None
+
+
+# --------------------------------------------------------------------------
+# Weekly AI brief
+# --------------------------------------------------------------------------
+
+WEEKLY_BRIEF_SYSTEM_PROMPT = (
+    "You write a brief, friendly weekly spending summary for a personal finance app. "
+    "You are given a JSON object with this week's spend, last week's spend, the top "
+    "categories this week, and a percentage change. All amounts are in Indian rupees (₹).\n"
+    "\n"
+    "Write 2-3 sentences:\n"
+    "  1. What happened this week overall (total, vs last week).\n"
+    "  2. One observation about where the money went (a category that stands out).\n"
+    "  3. One short forward-looking suggestion or note — practical, not preachy.\n"
+    "\n"
+    "Be specific. Use ₹ figures. Write like a smart friend, not a financial advisor.\n"
+    "\n"
+    "Respond with ONLY a JSON object: {\"brief\": \"...\"} — no prose, no code fences."
+)
+
+
+def _validate_brief(parsed):
+    if not isinstance(parsed, dict):
+        raise LLMError("The model did not return a JSON object.")
+    brief = parsed.get('brief')
+    if not isinstance(brief, str) or not brief.strip():
+        raise LLMError("The model's response has no \"brief\" string.")
+    return brief.strip()
+
+
+def generate_weekly_brief(user):
+    """Write a 2-3 sentence weekly spend summary for push notification."""
+    from .net_spending import net_spending as _net_spending
+
+    today = date.today()
+    week_start = today - timedelta(days=6)
+    prev_week_start = today - timedelta(days=13)
+    prev_week_end = today - timedelta(days=7)
+
+    ns = _net_spending(user, week_start, today)
+    prev_ns = _net_spending(user, prev_week_start, prev_week_end)
+
+    change_pct = None
+    if prev_ns['total'] > 0:
+        change_pct = round(((ns['total'] - prev_ns['total']) / prev_ns['total']) * 100, 1)
+
+    top_cats = [
+        {'name': c['category__name'] or 'Uncategorised', 'amount': round(c['total'], 2)}
+        for c in ns['category_totals'][:3]
+    ]
+
+    context = {
+        'this_week_spend': round(ns['total'], 2),
+        'last_week_spend': round(prev_ns['total'], 2),
+        'change_pct': change_pct,
+        'top_categories': top_cats,
+        'transaction_count': ns['count'],
+    }
+
+    messages = [
+        {"role": "system", "content": WEEKLY_BRIEF_SYSTEM_PROMPT},
+        {"role": "user", "content": json.dumps(context, indent=2)},
+    ]
+    return _translate_errors(
+        call_json, messages, validate=_validate_brief, expect_key='brief',
+        retry_instruction=(
+            "That was not usable. Reply with ONLY a JSON object shaped "
+            "{\"brief\": \"...\"}, no prose and no code fences."
+        ),
+    )
