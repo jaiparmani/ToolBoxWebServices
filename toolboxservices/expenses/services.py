@@ -1242,3 +1242,259 @@ def generate_weekly_brief(user):
             "{\"brief\": \"...\"}, no prose and no code fences."
         ),
     )
+
+
+# --------------------------------------------------------------------------
+# Spending personality
+# --------------------------------------------------------------------------
+
+PERSONALITY_SYSTEM_PROMPT = (
+    "You write a 3-sentence spending personality description for a personal finance app. "
+    "You are given a JSON object with the user's expense patterns from the last 90 days.\n"
+    "\n"
+    "Write exactly 3 sentences:\n"
+    "  1. What kind of spender they are — a clear, specific archetype that captures "
+    "their dominant behaviour (e.g. 'You're a frequent, food-first spender who treats "
+    "dining as a daily ritual.').\n"
+    "  2. One pattern that reveals character — not just a number, but an interpretation: "
+    "what the data says about how they relate to money.\n"
+    "  3. One strength and one blind spot — something they do well and one thing worth "
+    "watching.\n"
+    "\n"
+    "Tone: warm, specific, observational — like a smart friend who studied their receipts. "
+    "Use the actual category names and figures from the data. Use ₹ for amounts. "
+    "Be concrete; avoid generic filler phrases.\n"
+    "\n"
+    "Respond with ONLY a JSON object: {\"personality\": \"...\"} — no prose outside it, "
+    "no code fences."
+)
+
+
+def _validate_personality(parsed):
+    if not isinstance(parsed, dict):
+        raise LLMError("The model did not return a JSON object.")
+    personality = parsed.get('personality')
+    if not isinstance(personality, str) or not personality.strip():
+        raise LLMError("The model's response has no \"personality\" string.")
+    return personality.strip()
+
+
+def generate_financial_age_score(user):
+    """Return a financial maturity level and 2-sentence description based on behaviour."""
+    import statistics
+    from django.core.cache import cache
+    from django.db.models import Sum
+    from .models import Expense, RecurringRule
+
+    cache_key = f"financial_age_{user.id}"
+    cached = cache.get(cache_key)
+    if cached:
+        return cached
+
+    today = date.today()
+    ninety_days_ago = today - timedelta(days=90)
+
+    expenses_qs = Expense.objects.filter(
+        user=user, transaction_type='expense',
+        date__gte=ninety_days_ago, date__lte=today,
+    )
+    expense_count = expenses_qs.count()
+
+    income_count = Expense.objects.filter(
+        user=user, transaction_type='income',
+        date__gte=ninety_days_ago, date__lte=today,
+    ).count()
+
+    # --- Signal: savings_rate ---
+    total_income = float(
+        Expense.objects.filter(
+            user=user, transaction_type='income',
+            date__gte=ninety_days_ago, date__lte=today,
+        ).aggregate(t=Sum('amount'))['t'] or 0
+    )
+    total_expense = float(expenses_qs.aggregate(t=Sum('amount'))['t'] or 0)
+
+    if total_income > 0:
+        savings_rate = total_income / (total_income + total_expense)
+    else:
+        savings_rate = None
+
+    # --- Signal: spending_discipline (1 - stddev/mean of daily spend) ---
+    from .net_spending import net_spending as _net_spending
+    ns = _net_spending(user, ninety_days_ago, today)
+    daily_amounts = [float(row['total']) for row in ns['daily_totals'] if float(row['total']) > 0]
+    if len(daily_amounts) >= 2:
+        mean_daily = statistics.mean(daily_amounts)
+        stddev_daily = statistics.stdev(daily_amounts)
+        spending_discipline = 1 - (stddev_daily / mean_daily) if mean_daily > 0 else 0
+        spending_discipline = max(0.0, min(1.0, spending_discipline))
+    else:
+        spending_discipline = None
+
+    # --- Signal: top_category_concentration ---
+    category_totals = ns['category_totals']
+    if category_totals and total_expense > 0:
+        top_cat_amount = float(category_totals[0]['total'])
+        top_category_concentration = top_cat_amount / total_expense
+    else:
+        top_category_concentration = None
+
+    # --- Signal: transaction_frequency ---
+    transaction_frequency = expense_count / 90.0
+
+    # --- Signal: has_recurring ---
+    has_recurring = RecurringRule.objects.filter(user=user, is_active=True).exists()
+
+    # --- Signal: tracks_income ---
+    tracks_income = income_count > 0
+
+    signals = {
+        'expense_count': expense_count,
+        'savings_rate': round(savings_rate, 4) if savings_rate is not None else None,
+        'spending_discipline': round(spending_discipline, 4) if spending_discipline is not None else None,
+        'top_category_concentration': round(top_category_concentration, 4) if top_category_concentration is not None else None,
+        'transaction_frequency': round(transaction_frequency, 4),
+        'has_recurring': has_recurring,
+        'tracks_income': tracks_income,
+    }
+
+    # --- Level mapping (deterministic) ---
+    if expense_count < 10 or not tracks_income:
+        level = 'Student'
+    elif savings_rate is None or savings_rate < 0.05 or (top_category_concentration is not None and top_category_concentration > 0.60):
+        level = 'Starter'
+    elif savings_rate >= 0.35 and (spending_discipline is not None and spending_discipline > 0.5) and tracks_income:
+        level = 'Free'
+    elif savings_rate >= 0.20 and has_recurring and (top_category_concentration is None or top_category_concentration <= 0.50):
+        level = 'Owner'
+    else:
+        level = 'Builder'
+
+    # --- LLM description ---
+    FINANCIAL_AGE_SYSTEM_PROMPT = (
+        "You write a 2-sentence financial maturity comment for a personal finance app. "
+        "You are given a level name and a JSON object of signals about the user's last 90 days.\n"
+        "\n"
+        "Write exactly 2 sentences:\n"
+        "  1. What this level means for THIS specific person — reference their actual signals "
+        "(savings_rate, spending_discipline, top_category_concentration, etc.). Do not be generic.\n"
+        "  2. The single most impactful thing that would move them to the next level.\n"
+        "\n"
+        "Tone: warm, direct, specific. Use % for rates. Do not mention the level name in the text.\n"
+        "\n"
+        "Respond with ONLY a JSON object: {\"description\": \"...\"} — no prose, no code fences."
+    )
+
+    def _validate_financial_age_desc(parsed):
+        if not isinstance(parsed, dict):
+            raise LLMError("The model did not return a JSON object.")
+        desc = parsed.get('description')
+        if not isinstance(desc, str) or not desc.strip():
+            raise LLMError("The model's response has no \"description\" string.")
+        return desc.strip()
+
+    user_content = (
+        f"Level: {level}\n"
+        f"Signals:\n{json.dumps(signals, indent=2)}"
+    )
+    messages = [
+        {"role": "system", "content": FINANCIAL_AGE_SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
+    try:
+        description = _translate_errors(
+            call_json, messages, validate=_validate_financial_age_desc, expect_key='description',
+            retry_instruction=(
+                "That was not usable. Reply with ONLY a JSON object shaped "
+                "{\"description\": \"...\"}, no prose and no code fences."
+            ),
+        )
+    except (ExpenseParseNotPossible, ExpenseParseError):
+        description = ''
+
+    result = {'level': level, 'description': description, 'signals': signals}
+    cache.set(cache_key, result, 86400)
+    return result
+
+
+def generate_spending_personality(user):
+    """Write a 3-sentence spending personality description based on the user's actual patterns."""
+    from .models import Expense
+    from .net_spending import net_spending as _net_spending
+
+    today = date.today()
+    ninety_days_ago = today - timedelta(days=90)
+
+    ns = _net_spending(user, ninety_days_ago, today)
+
+    # Top 3 categories by spend with % of total
+    total_spend = ns['total']
+    top_categories = []
+    for c in ns['category_totals'][:3]:
+        name = c['category__name'] or 'Uncategorised'
+        amount = round(c['total'], 2)
+        pct = round((amount / total_spend * 100), 1) if total_spend > 0 else 0
+        top_categories.append({'name': name, 'amount': amount, 'pct_of_total': pct})
+
+    # Average daily spend
+    avg_daily = round(total_spend / 90, 2) if total_spend > 0 else 0
+
+    # Busiest day of week by transaction count (from daily_totals)
+    day_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+    day_counts = [0] * 7
+    for row in ns['daily_totals']:
+        try:
+            d = datetime.strptime(row['date'], '%Y-%m-%d').date()
+            day_counts[d.weekday()] += row['count']
+        except (ValueError, KeyError):
+            pass
+    busiest_day = day_names[day_counts.index(max(day_counts))] if any(day_counts) else 'Unknown'
+
+    # Whether income is tracked
+    income_count = Expense.objects.filter(
+        user=user, transaction_type='income',
+        date__gte=ninety_days_ago, date__lte=today,
+    ).count()
+
+    # Time-of-day distribution: morning 6-12, afternoon 12-18, evening 18-23, night 23-6
+    expenses_qs = Expense.objects.filter(
+        user=user, transaction_type='expense',
+        date__gte=ninety_days_ago, date__lte=today,
+    ).only('created_at')
+    tod = {'morning': 0, 'afternoon': 0, 'evening': 0, 'night': 0}
+    for exp in expenses_qs:
+        h = exp.created_at.hour
+        if 6 <= h < 12:
+            tod['morning'] += 1
+        elif 12 <= h < 18:
+            tod['afternoon'] += 1
+        elif 18 <= h < 23:
+            tod['evening'] += 1
+        else:
+            tod['night'] += 1
+
+    context = {
+        'period': 'last 90 days',
+        'top_categories': top_categories,
+        'avg_daily_spend': avg_daily,
+        'transaction_count': ns['count'],
+        'busiest_day_of_week': busiest_day,
+        'income_tracked': income_count > 0,
+        'income_transaction_count': income_count,
+        'time_of_day_distribution': tod,
+    }
+
+    user_content = (
+        f"Spending data:\n{json.dumps(context, indent=2)}"
+    )
+    messages = [
+        {"role": "system", "content": PERSONALITY_SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
+    return _translate_errors(
+        call_json, messages, validate=_validate_personality, expect_key='personality',
+        retry_instruction=(
+            "That was not usable. Reply with ONLY a JSON object shaped "
+            "{\"personality\": \"...\"}, no prose and no code fences."
+        ),
+    )

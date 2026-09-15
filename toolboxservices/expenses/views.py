@@ -37,6 +37,7 @@ from .services import (
     parse_expense_batch, parse_expense_text, parse_search_query, parse_split_text,
     validate_supplied_items,
     generate_monthly_narrative, generate_month_forecast, suggest_category_merges,
+    generate_spending_personality, generate_financial_age_score,
 )
 
 
@@ -1289,6 +1290,154 @@ class ExpenseViewSet(viewsets.ModelViewSet):
         except ExpenseParseError as exc:
             return Response({'error': str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
         return Response({'suggestions': suggestions})
+
+    @action(detail=False, methods=['get'])
+    def spending_personality(self, request):
+        """Generate a 3-sentence personality profile from the last 90 days.
+
+        Requires more than 15 expenses. Result is cached per-user for one day.
+        """
+        from django.core.cache import cache
+
+        user = request.user
+        total_count = Expense.objects.filter(user=user).count()
+        if total_count <= 15:
+            return Response({'detail': 'Not enough data yet'}, status=status.HTTP_404_NOT_FOUND)
+
+        cache_key = f"spending_personality_{user.id}"
+        cached = cache.get(cache_key)
+        if cached:
+            return Response(cached)
+
+        try:
+            personality = generate_spending_personality(user)
+        except ExpenseParseNotPossible as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except ExpenseParseRateLimited as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_429_TOO_MANY_REQUESTS)
+        except ExpenseParseError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+
+        result = {
+            'personality': personality,
+            'generated_at': date.today().isoformat(),
+        }
+        cache.set(cache_key, result, timeout=86400)
+        return Response(result)
+
+    @action(detail=False, methods=['get'])
+    def financial_age_score(self, request):
+        """Return a financial maturity level and 2-sentence description.
+
+        Requires more than 10 expenses. Result is cached per-user for 24h.
+        """
+        user = request.user
+        total_count = Expense.objects.filter(user=user).count()
+        if total_count <= 10:
+            return Response({'detail': 'Not enough data yet'}, status=status.HTTP_404_NOT_FOUND)
+
+        try:
+            result = generate_financial_age_score(user)
+        except ExpenseParseNotPossible as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except ExpenseParseRateLimited as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_429_TOO_MANY_REQUESTS)
+        except ExpenseParseError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+
+        return Response(result)
+
+    @action(detail=True, methods=['post'])
+    def set_sentiment(self, request, pk=None):
+        """Set good/neutral/regret on an expense. Body: {"sentiment": "good"}
+
+        Pass null or omit the key to clear an existing sentiment.
+        """
+        expense = self.get_object()
+        sentiment = request.data.get('sentiment', None)
+        valid = {c[0] for c in Expense.SENTIMENT_CHOICES}
+        if sentiment is not None and sentiment not in valid:
+            return Response(
+                {'error': f"sentiment must be one of {sorted(valid)} or null"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        expense.sentiment = sentiment
+        expense.save(update_fields=['sentiment', 'updated_at'])
+        serializer = ExpenseSerializer(expense, context={'request': request})
+        return Response(serializer.data)
+
+    @action(detail=False, methods=['get'])
+    def sentiment_report(self, request):
+        """Breakdown of sentiment by category, plus top joy/regret categories.
+
+        Returns:
+          total_tagged, total_expenses, by_sentiment,
+          category_breakdown (sorted by regret_rate desc, min 2 tagged),
+          most_joyful, most_regretted
+        """
+        qs = self.get_queryset()
+        total_expenses = qs.count()
+        tagged_qs = qs.filter(sentiment__isnull=False)
+        total_tagged = tagged_qs.count()
+
+        # Overall by-sentiment counts
+        sent_counts = (
+            tagged_qs
+            .values('sentiment')
+            .annotate(n=Count('id'))
+        )
+        by_sentiment = {'good': 0, 'neutral': 0, 'regret': 0}
+        for row in sent_counts:
+            by_sentiment[row['sentiment']] = row['n']
+
+        # Per-category breakdown — only categories with at least 2 tagged rows
+        cat_rows = (
+            tagged_qs
+            .values('category__name')
+            .annotate(
+                good=Count('id', filter=Q(sentiment='good')),
+                neutral=Count('id', filter=Q(sentiment='neutral')),
+                regret=Count('id', filter=Q(sentiment='regret')),
+                total=Count('id'),
+            )
+            .filter(total__gte=2)
+        )
+
+        category_breakdown = []
+        for row in cat_rows:
+            cat = row['category__name'] or 'Uncategorised'
+            total_cat = row['total'] or 1
+            regret_rate = round(row['regret'] / total_cat, 4)
+            category_breakdown.append({
+                'category': cat,
+                'good': row['good'],
+                'neutral': row['neutral'],
+                'regret': row['regret'],
+                'regret_rate': regret_rate,
+            })
+
+        # Sort by regret_rate descending
+        category_breakdown.sort(key=lambda x: -x['regret_rate'])
+
+        # Most joyful: highest good rate; most regretted: highest regret rate
+        most_joyful = None
+        most_regretted = None
+        if category_breakdown:
+            most_regretted = category_breakdown[0]['category']
+            joy_sorted = sorted(
+                category_breakdown,
+                key=lambda x: -x['good'] / max(x['good'] + x['neutral'] + x['regret'], 1),
+            )
+            most_joyful = joy_sorted[0]['category'] if joy_sorted else None
+
+        return Response({
+            'total_tagged': total_tagged,
+            'total_expenses': total_expenses,
+            'by_sentiment': by_sentiment,
+            'category_breakdown': category_breakdown,
+            'most_joyful': most_joyful,
+            'most_regretted': most_regretted,
+        })
 
 
 def match_account(name):

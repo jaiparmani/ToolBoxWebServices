@@ -81,6 +81,10 @@ class Expense(models.Model):
     location = models.CharField(max_length=255, blank=True, null=True)
     payment_method = models.CharField(max_length=50, blank=True, null=True)
 
+    # Regret Score — did this expense feel good, neutral, or bad in hindsight?
+    SENTIMENT_CHOICES = [('good', 'Felt good'), ('neutral', 'Neutral'), ('regret', 'Regret')]
+    sentiment = models.CharField(max_length=10, choices=SENTIMENT_CHOICES, null=True, blank=True)
+
     # Shared spending: set when the expense was split within a group, so the
     # group can be totalled without duplicating any of the split rows.
     group = models.ForeignKey('SplitGroup', on_delete=models.SET_NULL, null=True, blank=True,
