@@ -2240,3 +2240,49 @@ class CopilotViewSet(viewsets.ViewSet):
         if endpoint:
             PushSubscription.objects.filter(user=request.user, endpoint=endpoint).delete()
         return Response({'ok': True})
+
+    @action(detail=False, methods=['get'], url_path='push-status')
+    def push_status(self, request):
+        """Diagnostic: subscription count + last-error test push."""
+        from .models import PushSubscription
+        subs = list(PushSubscription.objects.filter(user=request.user).values('endpoint', 'created_at'))
+        results = []
+        for s in subs:
+            ep = s['endpoint']
+            results.append({'endpoint_prefix': ep[:60], 'created_at': str(s['created_at'])})
+        return Response({'subscription_count': len(subs), 'subscriptions': results})
+
+    @action(detail=False, methods=['post'], url_path='push-test')
+    def push_test(self, request):
+        """Diagnostic: send a test push to all subscriptions; surfaces errors."""
+        from .models import PushSubscription
+        from pywebpush import webpush
+        from py_vapid import Vapid
+        from django.conf import settings as django_settings
+        import json as _json
+
+        subs = list(PushSubscription.objects.filter(user=request.user))
+        if not subs:
+            return Response({'ok': False, 'error': 'No push subscriptions found.'}, status=404)
+
+        pem = django_settings.VAPID_PRIVATE_KEY
+        vapid = Vapid.from_pem(pem.encode() if isinstance(pem, str) else pem)
+
+        results = []
+        for sub in subs:
+            try:
+                webpush(
+                    subscription_info={
+                        'endpoint': sub.endpoint,
+                        'keys': {'p256dh': sub.p256dh, 'auth': sub.auth},
+                    },
+                    data=_json.dumps({'title': 'Money OS', 'body': 'Push is working!', 'url': '/'}),
+                    vapid_private_key=vapid,
+                    vapid_claims=dict(django_settings.VAPID_CLAIMS),
+                )
+                results.append({'endpoint_prefix': sub.endpoint[:60], 'ok': True})
+            except Exception as e:
+                results.append({'endpoint_prefix': sub.endpoint[:60], 'ok': False, 'error': str(e)})
+
+        all_ok = all(r['ok'] for r in results)
+        return Response({'ok': all_ok, 'sent_to': len(subs), 'results': results})
