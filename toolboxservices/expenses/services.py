@@ -281,16 +281,23 @@ def looks_like_batch(text):
     return len(amounts) >= 2
 
 
-def parse_expense_text(text, known_tags=()):
+def parse_expense_text(text, known_tags=(), known_merchants=()):
     """Ask the model to turn one free-text note into an expense dict."""
     text = (text or '').strip()
     if not text:
         raise ExpenseParseNotPossible("No text provided.")
 
+    merchant_hint = (
+        "Past patterns for this user (use these to pick category/description):\n"
+        + "\n".join(f'  "{d}" → {c}' for d, c in known_merchants)
+        + "\n"
+    ) if known_merchants else ""
+
     user_content = (
         f"Today is {date.today().isoformat()}.\n"
         f"Existing categories: {json.dumps(_category_context())}\n"
-        f"Existing tags: {json.dumps(list(known_tags))}\n\n"
+        f"Existing tags: {json.dumps(list(known_tags))}\n"
+        f"{merchant_hint}\n"
         f"Note: \"{text}\""
     )
     messages = [
@@ -315,7 +322,7 @@ def parse_expense_text(text, known_tags=()):
     return result
 
 
-def parse_expense_batch(text, known_tags=()):
+def parse_expense_batch(text, known_tags=(), known_merchants=()):
     """Extract every transaction in a pasted log. Returns a list of expense dicts.
 
     An empty list is a legitimate result - the paste may hold no transactions.
@@ -324,9 +331,16 @@ def parse_expense_batch(text, known_tags=()):
     if not text:
         raise ExpenseParseNotPossible("No text provided.")
 
+    merchant_hint = (
+        "Past patterns for this user:\n"
+        + "\n".join(f'  "{d}" → {c}' for d, c in known_merchants)
+        + "\n"
+    ) if known_merchants else ""
+
     user_content = (
         f"Existing categories: {json.dumps(_category_context())}\n"
-        f"Existing tags: {json.dumps(list(known_tags))}\n\n"
+        f"Existing tags: {json.dumps(list(known_tags))}\n"
+        f"{merchant_hint}\n"
         f"Today's date is {date.today().isoformat()}.\n\n"
         f"Log:\n{text}"
     )

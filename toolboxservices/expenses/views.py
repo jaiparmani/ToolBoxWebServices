@@ -467,6 +467,30 @@ class ExpenseViewSet(viewsets.ModelViewSet):
         return known_tag_names(user)
 
     @staticmethod
+    def _known_merchants(user):
+        """Return the user's 30 most-recent distinct (description, category) pairs.
+
+        Injected into the LLM prompt so "Swiggy #98712" consistently maps to
+        the same category the user chose last time, without any new model.
+        """
+        rows = (
+            Expense.objects
+            .filter(user=user)
+            .exclude(description='')
+            .select_related('category')
+            .order_by('-date', '-id')
+            .values_list('description', 'category__name')[:200]
+        )
+        seen = {}
+        for desc, cat in rows:
+            key = desc.lower().split()[0] if desc else desc
+            if key and cat and key not in seen:
+                seen[key] = (desc, cat)
+            if len(seen) >= 30:
+                break
+        return list(seen.values())
+
+    @staticmethod
     def _resolve_tags(user, names):
         from .resolvers import resolve_tags
         return resolve_tags(user, names)
@@ -493,10 +517,11 @@ class ExpenseViewSet(viewsets.ModelViewSet):
             return Response({'error': 'text is required'}, status=status.HTTP_400_BAD_REQUEST)
 
         known_tags = self._known_tag_names(user)
+        known_merchants = self._known_merchants(user)
 
         if looks_like_batch(text):
             try:
-                items = parse_expense_batch(text, known_tags=known_tags)
+                items = parse_expense_batch(text, known_tags=known_tags, known_merchants=known_merchants)
             except ExpenseParseNotPossible as exc:
                 return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
             except ExpenseParseRateLimited as exc:
@@ -525,7 +550,7 @@ class ExpenseViewSet(viewsets.ModelViewSet):
                 )
 
         try:
-            parsed = parse_expense_text(text, known_tags=known_tags)
+            parsed = parse_expense_text(text, known_tags=known_tags, known_merchants=known_merchants)
         except ExpenseParseNotPossible as exc:
             return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         except ExpenseParseRateLimited as exc:
