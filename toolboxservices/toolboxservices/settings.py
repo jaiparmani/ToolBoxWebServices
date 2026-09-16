@@ -226,12 +226,24 @@ if not DEBUG:
     CSRF_COOKIE_SECURE = True
 
 
-# OpenRouter (used by the AI features in expenses and insights)
-# Keys normally live in the database and are rotated round-robin - see
+# ── LLM access (used by the AI features in expenses and insights) ────────────
+# The provider keys live on llm-gateway now, which holds them for every service
+# that needs one and rotates them round-robin, so the free tier's daily cap is
+# shared rather than duplicated:
+#   https://github.com/jaiparmani/llm-gateway
+#
+# LLM_GATEWAY_TOKEN is THIS APP's client token, issued by the gateway. It is not
+# an OpenRouter key and cannot be used as one.
+#   export LLM_GATEWAY_URL="https://llm-gateway.brain-store.workers.dev"
+#   export LLM_GATEWAY_TOKEN="lgw_..."
+LLM_GATEWAY_URL = os.environ.get('LLM_GATEWAY_URL', '')
+LLM_GATEWAY_TOKEN = os.environ.get('LLM_GATEWAY_TOKEN', '')
+
+# Kept as the escape hatch. Stored keys and this variable still work exactly as
+# before, and are used whenever the gateway is not configured - so an outage on
+# that side is one env var away from being routed around, and the OpenRouterKey
+# table does not have to be emptied to migrate.
 #   manage.py openrouter_keys list
-# This environment variable is the fallback used when no stored key is
-# usable, so a fresh deployment still works before any are added.
-#   export OPENROUTER_API_KEY="sk-or-v1-..."
 OPENROUTER_API_KEY = os.environ.get('OPENROUTER_API_KEY', '')
 OPENROUTER_MODEL = os.environ.get('OPENROUTER_MODEL', 'openrouter/free')
 

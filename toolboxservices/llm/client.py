@@ -1,4 +1,4 @@
-"""Shared OpenRouter client for structured (JSON) model calls.
+"""Shared client for structured (JSON) model calls.
 
 Every LLM feature in this project wants the same thing: send some messages,
 get a JSON object back, and be confident the object is usable. The default
@@ -9,6 +9,18 @@ amount as a string.
 
 Keep that hardening here so features (expense parsing, insight generation)
 only have to describe what they want and how to validate it.
+
+Where the request goes
+----------------------
+Preferably to llm-gateway, which holds the provider keys for every service that
+needs one and rotates them round-robin, so the free tier's daily cap is shared
+rather than duplicated per app. It speaks OpenAI's response shape, so nothing
+below this line had to change when the keys moved out: extract_json, the retry,
+the validate callbacks and all five call sites are untouched.
+
+Failing that, straight to OpenRouter with a stored or environment key, exactly
+as before. That path is the escape hatch, not the normal one - unset
+LLM_GATEWAY_URL and this app is back where it started.
 """
 
 import json
@@ -22,6 +34,15 @@ from django.conf import settings
 logger = logging.getLogger(__name__)
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+
+def _gateway():
+    """(url, token) for the gateway, or (None, None) when it is not configured."""
+    url = getattr(settings, 'LLM_GATEWAY_URL', '')
+    token = getattr(settings, 'LLM_GATEWAY_TOKEN', '')
+    if url and token:
+        return url.rstrip('/') + '/v1/chat/completions', token
+    return None, None
 
 DEFAULT_RETRY_INSTRUCTION = (
     "That was not usable. Reply with ONLY a JSON object - no prose, no code fences."
@@ -76,14 +97,27 @@ def _candidate_keys():
         candidates.append((env_key, None))
 
     if not candidates:
+        # The gateway carries the keys and does its own rotation, so there is
+        # nothing to queue here. One placeholder drives a single pass through
+        # the retry loop; _post() sends it to the gateway instead.
+        if _gateway()[0]:
+            return [(None, None)]
         raise LLMNotConfigured(
-            "No OpenRouter API key is configured, so AI features are unavailable. "
-            "Add one in the app, or with: manage.py openrouter_keys add <key>"
+            "No LLM access is configured, so AI features are unavailable. "
+            "Set LLM_GATEWAY_URL and LLM_GATEWAY_TOKEN, or add a key with: "
+            "manage.py openrouter_keys add <key>"
         )
     return candidates
 
 
 def _post(messages, api_key, model, timeout, max_tokens):
+    # The gateway wins when it is configured: it holds the keys, rotates them
+    # and salvages the reply. Everything else here is unchanged either way,
+    # because it answers in OpenAI's shape.
+    url, token = _gateway()
+    if url is None:
+        url, token = OPENROUTER_URL, api_key
+
     body = {
         "model": model,
         "messages": messages,
@@ -96,35 +130,51 @@ def _post(messages, api_key, model, timeout, max_tokens):
 
     try:
         response = requests.post(
-            OPENROUTER_URL,
+            url,
             headers={
-                "Authorization": f"Bearer {api_key}",
+                "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
             },
             json=body,
             timeout=timeout,
         )
     except requests.RequestException as exc:
-        logger.exception("Could not reach OpenRouter")
-        raise LLMError("Could not reach the OpenRouter API. Check network access.") from exc
+        logger.exception("Could not reach %s", url)
+        raise LLMError(
+            "Could not reach the LLM gateway. Check network access."
+            if _gateway()[0] else
+            "Could not reach the OpenRouter API. Check network access."
+        ) from exc
 
     if response.status_code == 429:
-        logger.warning("OpenRouter rate limit hit: %s", response.text[:300])
+        logger.warning("Rate limited by %s: %s", url, response.text[:300])
         message, reset_at = _rate_limit_details(response)
         raise LLMRateLimited(message, reset_at=reset_at)
 
+    if response.status_code == 401 and _gateway()[0]:
+        raise LLMNotConfigured(
+            "The LLM gateway rejected this app's client token. Check "
+            "LLM_GATEWAY_TOKEN, or issue a new one on the gateway."
+        )
+
+    if response.status_code == 503 and _gateway()[0]:
+        raise LLMError(
+            "The LLM gateway is holding no provider keys. Add one there - "
+            "they are not stored in this app any more."
+        )
+
     if not response.ok:
-        logger.error("OpenRouter returned %s: %s", response.status_code, response.text[:500])
-        raise LLMError(f"OpenRouter API error ({response.status_code}): {response.text[:300]}")
+        logger.error("LLM call to %s returned %s: %s", url, response.status_code, response.text[:500])
+        raise LLMError(f"LLM API error ({response.status_code}): {response.text[:300]}")
 
     payload = response.json()
     choices = payload.get('choices') or []
     if not choices:
-        raise LLMError("OpenRouter returned no choices.")
+        raise LLMError("The model returned no choices.")
 
     content = choices[0].get('message', {}).get('content')
     if not content:
-        raise LLMError("OpenRouter returned an empty message.")
+        raise LLMError("The model returned an empty message.")
 
     # The free pool reports which model actually served the call - worth
     # recording, since it differs between calls.
