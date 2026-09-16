@@ -1,4 +1,4 @@
-"""Shared OpenRouter client for structured (JSON) model calls.
+"""Shared client for structured (JSON) model calls.
 
 Every LLM feature in this project wants the same thing: send some messages,
 get a JSON object back, and be confident the object is usable. The default
@@ -9,6 +9,18 @@ amount as a string.
 
 Keep that hardening here so features (expense parsing, insight generation)
 only have to describe what they want and how to validate it.
+
+Where the request goes
+----------------------
+To llm-gateway, and only there. It holds the provider keys for every service
+that needs one, rotates them round-robin so the free tier's daily cap is shared
+rather than duplicated, and salvages the reply. This app holds a client token
+and no provider key at all.
+
+There is deliberately no direct path to OpenRouter left. A fallback would mean a
+second place to put a key, which is the thing the gateway exists to stop - and a
+fallback that is never exercised is not a safety net, it is a rotted rope. If
+the gateway is down, these features are down, and the error says so plainly.
 """
 
 import json
@@ -21,7 +33,17 @@ from django.conf import settings
 
 logger = logging.getLogger(__name__)
 
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+def _gateway():
+    """(url, token), or raises if the gateway is not configured."""
+    url = getattr(settings, 'LLM_GATEWAY_URL', '')
+    token = getattr(settings, 'LLM_GATEWAY_TOKEN', '')
+    if not (url and token):
+        raise LLMNotConfigured(
+            "No LLM gateway is configured, so AI features are unavailable. "
+            "Set LLM_GATEWAY_URL and LLM_GATEWAY_TOKEN. Provider keys are not "
+            "stored in this app - they live on the gateway."
+        )
+    return url.rstrip('/') + '/v1/chat/completions', token
 
 DEFAULT_RETRY_INSTRUCTION = (
     "That was not usable. Reply with ONLY a JSON object - no prose, no code fences."
@@ -56,34 +78,9 @@ def _model():
     return getattr(settings, 'OPENROUTER_MODEL', 'openrouter/free')
 
 
-def _candidate_keys():
-    """The key queue, front first, as (key_string, record_or_None) pairs.
+def _post(messages, model, timeout, max_tokens):
+    url, token = _gateway()
 
-    The environment variable is the fallback so the app keeps working before
-    any keys are stored - a fresh deployment isn't dead on arrival.
-    """
-    records = []
-    try:
-        from .models import OpenRouterKey
-        records = list(OpenRouterKey.objects.all())  # Meta.ordering = queue order
-    except Exception:  # table not migrated yet, or app not installed
-        logger.debug("Stored OpenRouter keys unavailable; falling back to settings")
-
-    candidates = [(record.key, record) for record in records]
-
-    env_key = getattr(settings, 'OPENROUTER_API_KEY', '')
-    if env_key and not candidates:
-        candidates.append((env_key, None))
-
-    if not candidates:
-        raise LLMNotConfigured(
-            "No OpenRouter API key is configured, so AI features are unavailable. "
-            "Add one in the app, or with: manage.py openrouter_keys add <key>"
-        )
-    return candidates
-
-
-def _post(messages, api_key, model, timeout, max_tokens):
     body = {
         "model": model,
         "messages": messages,
@@ -96,35 +93,47 @@ def _post(messages, api_key, model, timeout, max_tokens):
 
     try:
         response = requests.post(
-            OPENROUTER_URL,
+            url,
             headers={
-                "Authorization": f"Bearer {api_key}",
+                "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
             },
             json=body,
             timeout=timeout,
         )
     except requests.RequestException as exc:
-        logger.exception("Could not reach OpenRouter")
-        raise LLMError("Could not reach the OpenRouter API. Check network access.") from exc
+        logger.exception("Could not reach %s", url)
+        raise LLMError("Could not reach the LLM gateway. Check network access.") from exc
 
     if response.status_code == 429:
-        logger.warning("OpenRouter rate limit hit: %s", response.text[:300])
+        logger.warning("Rate limited by %s: %s", url, response.text[:300])
         message, reset_at = _rate_limit_details(response)
         raise LLMRateLimited(message, reset_at=reset_at)
 
+    if response.status_code == 401:
+        raise LLMNotConfigured(
+            "The LLM gateway rejected this app's client token. Check "
+            "LLM_GATEWAY_TOKEN, or issue a new one on the gateway."
+        )
+
+    if response.status_code == 503:
+        raise LLMError(
+            "The LLM gateway is holding no provider keys. Add one there - "
+            "they are not stored in this app any more."
+        )
+
     if not response.ok:
-        logger.error("OpenRouter returned %s: %s", response.status_code, response.text[:500])
-        raise LLMError(f"OpenRouter API error ({response.status_code}): {response.text[:300]}")
+        logger.error("LLM call to %s returned %s: %s", url, response.status_code, response.text[:500])
+        raise LLMError(f"LLM API error ({response.status_code}): {response.text[:300]}")
 
     payload = response.json()
     choices = payload.get('choices') or []
     if not choices:
-        raise LLMError("OpenRouter returned no choices.")
+        raise LLMError("The model returned no choices.")
 
     content = choices[0].get('message', {}).get('content')
     if not content:
-        raise LLMError("OpenRouter returned an empty message.")
+        raise LLMError("The model returned an empty message.")
 
     # The free pool reports which model actually served the call - worth
     # recording, since it differs between calls.
@@ -234,50 +243,31 @@ def call_json(messages, validate=None, expect_key=None,
     pool routes to a different model per call, a retry often lands on a model
     that behaves - so one bad responder shouldn't fail the whole request.
 
+    Key rotation is the gateway's job, not this function's.
+
     With `return_meta`, returns (value, meta) where meta carries the model that
     actually served the call and its token counts.
     """
     model = _model()
     original = list(messages)
-    last_rate_limit = None
+    last_error = None
 
-    # Outer loop rotates keys, inner loop retries a key that answered badly.
-    # A quota-exhausted key is benched and the next one tried, so N keys give
-    # N times the daily headroom rather than failing at the first cap.
-    for api_key, record in _candidate_keys():
-        messages = original
-        last_error = None
+    # Only the bad-JSON retry lives here now. Key rotation moved to the gateway,
+    # which is the only thing that can do it properly - it is the one that knows
+    # which keys exist and which are spent.
+    for attempt in range(max_attempts):
+        content, meta = _post(messages, model, timeout, max_tokens)
 
-        for attempt in range(max_attempts):
-            try:
-                content, meta = _post(messages, api_key, model, timeout, max_tokens)
-            except LLMRateLimited as exc:
-                # Spent for now. Send it to the back and let the next key serve.
-                if record:
-                    record.push_to_back()
-                    logger.info("Key %s is rate limited; moved to back of queue", record.masked)
-                last_rate_limit = exc
-                break
+        try:
+            parsed = extract_json(content, expect_key=expect_key)
+            value = validate(parsed) if validate else parsed
+            return (value, meta) if return_meta else value
+        except LLMError as exc:
+            last_error = exc
+            logger.warning("LLM attempt %s/%s failed: %s", attempt + 1, max_attempts, exc)
+            messages = original + [
+                {"role": "assistant", "content": content[:1000]},
+                {"role": "user", "content": retry_instruction},
+            ]
 
-            # Used it - back of the queue, so the next call takes a different one.
-            if record:
-                record.push_to_back()
-
-            try:
-                parsed = extract_json(content, expect_key=expect_key)
-                value = validate(parsed) if validate else parsed
-                return (value, meta) if return_meta else value
-            except LLMError as exc:
-                last_error = exc
-                logger.warning("LLM attempt %s/%s failed: %s", attempt + 1, max_attempts, exc)
-                messages = original + [
-                    {"role": "assistant", "content": content[:1000]},
-                    {"role": "user", "content": retry_instruction},
-                ]
-
-        if last_error is not None:
-            # The key worked, the model just wouldn't produce usable JSON.
-            # Another key would reach the same pool, so don't burn one.
-            raise last_error
-
-    raise last_rate_limit
+    raise last_error
