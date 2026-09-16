@@ -239,12 +239,8 @@ if not DEBUG:
 LLM_GATEWAY_URL = os.environ.get('LLM_GATEWAY_URL', '')
 LLM_GATEWAY_TOKEN = os.environ.get('LLM_GATEWAY_TOKEN', '')
 
-# Kept as the escape hatch. Stored keys and this variable still work exactly as
-# before, and are used whenever the gateway is not configured - so an outage on
-# that side is one env var away from being routed around, and the OpenRouterKey
-# table does not have to be emptied to migrate.
-#   manage.py openrouter_keys list
-OPENROUTER_API_KEY = os.environ.get('OPENROUTER_API_KEY', '')
+# Which model to ask the gateway for. Blank takes the gateway's own default,
+# which is the point of having one place: change the model there, not per app.
 OPENROUTER_MODEL = os.environ.get('OPENROUTER_MODEL', 'openrouter/free')
 
 # ── Password-reset email (Gmail SMTP) ────────────────────────────────────────

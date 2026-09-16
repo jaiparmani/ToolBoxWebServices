@@ -7,6 +7,7 @@ what it did before.
 """
 
 import json
+import pathlib
 from unittest.mock import patch
 
 from django.test import SimpleTestCase, override_settings
@@ -46,7 +47,7 @@ def completion(content, model="stub/model-a"):
 MESSAGES = [{"role": "user", "content": "hello"}]
 
 
-@override_settings(LLM_GATEWAY_URL=GATEWAY, LLM_GATEWAY_TOKEN=CLIENT_TOKEN, OPENROUTER_API_KEY="")
+@override_settings(LLM_GATEWAY_URL=GATEWAY, LLM_GATEWAY_TOKEN=CLIENT_TOKEN)
 class GatewayRoutingTests(SimpleTestCase):
     def test_call_goes_to_the_gateway_with_the_client_token(self):
         with patch("llm.client.requests.post", return_value=completion('{"ok": true}')) as post:
@@ -67,11 +68,6 @@ class GatewayRoutingTests(SimpleTestCase):
             "body": post.call_args.kwargs["json"],
         })
         self.assertNotIn("sk-or-v1-", sent)
-
-    def test_no_stored_key_is_needed(self):
-        """With no OpenRouterKey rows and no env key, the call still works."""
-        with patch("llm.client.requests.post", return_value=completion('{"ok": true}')):
-            self.assertEqual(call_json(MESSAGES), {"ok": True})
 
     def test_salvaging_still_happens_here(self):
         messy = '<think>{"draft": 1}</think>\nSure:\n```json\n{"amount": 42}\n```'
@@ -110,25 +106,37 @@ class GatewayRoutingTests(SimpleTestCase):
         self.assertEqual(post.call_count, 2)
 
 
-@override_settings(LLM_GATEWAY_URL="", LLM_GATEWAY_TOKEN="", OPENROUTER_API_KEY=PROVIDER_KEY)
-class FallbackTests(SimpleTestCase):
-    """Unset the gateway and the app is exactly where it started."""
+@override_settings(LLM_GATEWAY_URL="", LLM_GATEWAY_TOKEN="")
+class NoGatewayTests(SimpleTestCase):
+    """There is no second route. Without the gateway the features are off."""
 
-    def test_falls_back_to_openrouter_with_the_stored_key(self):
-        with patch("llm.client.requests.post", return_value=completion('{"ok": true}')) as post:
-            call_json(MESSAGES)
-        self.assertEqual(post.call_args.args[0], "https://openrouter.ai/api/v1/chat/completions")
-        self.assertEqual(post.call_args.kwargs["headers"]["Authorization"], f"Bearer {PROVIDER_KEY}")
-
-
-@override_settings(LLM_GATEWAY_URL="", LLM_GATEWAY_TOKEN="", OPENROUTER_API_KEY="")
-class NothingConfiguredTests(SimpleTestCase):
-    def test_the_error_names_both_ways_to_fix_it(self):
+    def test_an_unconfigured_gateway_is_a_clear_refusal(self):
         with self.assertRaises(LLMNotConfigured) as caught:
             call_json(MESSAGES)
         message = str(caught.exception)
         self.assertIn("LLM_GATEWAY_URL", message)
-        self.assertIn("openrouter_keys add", message)
+        self.assertIn("not stored in this app", message)
+
+    def test_it_does_not_quietly_reach_openrouter_instead(self):
+        with patch("llm.client.requests.post") as post:
+            with self.assertRaises(LLMNotConfigured):
+                call_json(MESSAGES)
+        post.assert_not_called()
+
+
+@override_settings(LLM_GATEWAY_URL=GATEWAY, LLM_GATEWAY_TOKEN=CLIENT_TOKEN)
+class NoDirectProviderPathTests(SimpleTestCase):
+    """The point of the migration, asserted rather than assumed."""
+
+    def test_openrouter_is_never_called_directly(self):
+        with patch("llm.client.requests.post", return_value=completion('{"ok": true}')) as post:
+            call_json(MESSAGES)
+        self.assertNotIn("openrouter.ai", post.call_args.args[0])
+
+    def test_the_module_holds_no_provider_endpoint(self):
+        from llm import client
+        source = pathlib.Path(client.__file__).read_text()
+        self.assertNotIn("openrouter.ai/api", source)
 
 
 class SalvageTests(SimpleTestCase):

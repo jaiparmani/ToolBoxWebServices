@@ -30,7 +30,6 @@ urlpatterns = [
     path("api/users/", include("users.urls")),
     path("api/health/", include("health.urls")),
     path("api/insights/", include("insights.urls")),
-    path("api/llm/", include("llm.urls")),
     path("api/telegram/", include("telegrambot.urls")),
     path("api/whatsapp/", include("whatsappbot.urls")),
     # One brain, one endpoint.
