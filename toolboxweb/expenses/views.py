@@ -120,8 +120,12 @@ class ExpenseFilter(django_filters.FilterSet):
 
 
 class ExpenseCategoryViewSet(viewsets.ModelViewSet):
-    """ViewSet for ExpenseCategory CRUD operations"""
-    queryset = ExpenseCategory.objects.filter(is_active=True)
+    """ViewSet for ExpenseCategory CRUD operations.
+
+    Returns system categories (user=null) plus the requesting user's own
+    private categories. Creating a category always scopes it to the user.
+    System categories (user=null) can only be modified by staff.
+    """
     serializer_class = ExpenseCategorySerializer
     pagination_class = StandardResultsSetPagination
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
@@ -129,16 +133,31 @@ class ExpenseCategoryViewSet(viewsets.ModelViewSet):
     ordering = ['transaction_type', 'name']
 
     def get_queryset(self):
-        """Filter categories by transaction type if specified"""
-        queryset = super().get_queryset()
-        transaction_type = self.request.query_params.get('type', None)
+        qs = ExpenseCategory.objects.filter(
+            is_active=True,
+        ).filter(
+            Q(user__isnull=True) | Q(user=self.request.user)
+        )
+        transaction_type = self.request.query_params.get('type')
         if transaction_type:
-            queryset = queryset.filter(transaction_type=transaction_type)
-        return queryset
+            qs = qs.filter(transaction_type=transaction_type)
+        return qs
 
     def perform_create(self, serializer):
-        """Set the user for the category (if needed for future user-specific categories)"""
+        serializer.save(user=self.request.user)
+
+    def perform_update(self, serializer):
+        # Prevent non-staff users from editing system categories.
+        if serializer.instance.user is None and not self.request.user.is_staff:
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied("System categories can only be modified by staff.")
         serializer.save()
+
+    def perform_destroy(self, instance):
+        if instance.user is None and not self.request.user.is_staff:
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied("System categories can only be deleted by staff.")
+        instance.delete()
 
 
 class ExpenseTagViewSet(viewsets.ModelViewSet):

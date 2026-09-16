@@ -5,7 +5,11 @@ import decimal
 
 
 class ExpenseCategory(models.Model):
-    """Model for expense categories like Food, Transport, Entertainment, etc."""
+    """Model for expense categories like Food, Transport, Entertainment, etc.
+
+    user=None means a system default — visible to everyone.
+    user set means a private category belonging to that user only.
+    """
 
     TRANSACTION_TYPE_CHOICES = [
         ('expense', 'Expense'),
@@ -14,7 +18,12 @@ class ExpenseCategory(models.Model):
         ('debt', 'Debt'),
     ]
 
-    name = models.CharField(max_length=100, unique=True)
+    # null = system/default category (visible to all users)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
+        null=True, blank=True, related_name='expense_categories',
+    )
+    name = models.CharField(max_length=100)
     description = models.TextField(blank=True, null=True)
     color = models.CharField(max_length=7, default='#007bff', help_text='Hex color code for UI display')
     icon = models.CharField(max_length=50, blank=True, null=True, help_text='Icon class or name')
@@ -26,6 +35,20 @@ class ExpenseCategory(models.Model):
     class Meta:
         ordering = ['transaction_type', 'name']
         verbose_name_plural = 'Expense Categories'
+        constraints = [
+            # Each user can only have one category with a given name.
+            models.UniqueConstraint(
+                fields=['user', 'name'],
+                condition=models.Q(user__isnull=False),
+                name='unique_category_name_per_user',
+            ),
+            # System categories (user=null) must also have unique names.
+            models.UniqueConstraint(
+                fields=['name'],
+                condition=models.Q(user__isnull=True),
+                name='unique_system_category_name',
+            ),
+        ]
 
     def __str__(self):
         return f"{self.get_transaction_type_display()}: {self.name}"
