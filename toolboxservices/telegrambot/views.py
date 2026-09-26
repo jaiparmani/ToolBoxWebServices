@@ -1,34 +1,35 @@
-"""Telegram webhook — the whole bot runs inside the Django web app.
+"""Telegram — command logic lives here; the webhook itself does not.
 
-Telegram POSTs each update to POST /api/telegram/webhook/<secret>/. Because this
-is served by the normal web worker, the bot is up whenever the backend is up:
-there is no separate long-polling process to keep alive (which is exactly what
-the standalone script needed, and why it kept going down on PythonAnywhere,
-where always-on tasks are limited).
+telegram-router (a separate Cloudflare Worker) now owns the one webhook the
+shared bot can have: it classifies each inbound message and, for anything
+meant for ToolBox, POSTs it to /api/telegram/relay/ below. This app never
+parses a raw Telegram update or calls Telegram back directly for that reply —
+it just turns {chat_id, username, text} into {reply, parse_mode} and lets the
+router deliver it. Proactive, unrelated notifications (telegram_api.py's
+send_message/notify_user — e.g. pinging the other party of a split) still go
+straight to Telegram from here, since those have nothing to do with replying
+to an inbound message.
 
-Security: the <secret> path segment must match settings.TELEGRAM_WEBHOOK_SECRET,
-and, when set with a secret_token, Telegram also echoes it in the
-X-Telegram-Bot-Api-Secret-Token header — we check both. The view always returns
-200 for an authenticated-but-unprocessable update so Telegram doesn't retry it
-forever; only a bad secret gets a 403.
+Security: the relay is gated by a shared secret (TELEGRAM_ROUTER_TOKEN),
+compared in constant time so it can't be recovered by timing. The view always
+returns 200 for an authenticated-but-unprocessable message so a retry from the
+router doesn't compound into a second reply; only a bad token gets a 403.
 """
 
-import json
+import hmac
 import logging
 
 from django.conf import settings
-from django.http import HttpResponse, HttpResponseForbidden, JsonResponse
-from django.views.decorators.csrf import csrf_exempt
+from django.http import HttpResponseForbidden, JsonResponse
 
 from rest_framework import status
 from rest_framework.authtoken.models import Token
-from rest_framework.decorators import api_view, permission_classes
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.decorators import api_view, authentication_classes, permission_classes
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 
 from . import handlers
 from .models import TelegramLink
-from .telegram_api import send_chat_action, send_message
 
 logger = logging.getLogger(__name__)
 
@@ -84,20 +85,15 @@ def telegram_link(request):
     return Response(_link_state(request.user))
 
 
-def _secret_ok(request, secret):
-    expected = getattr(settings, "TELEGRAM_WEBHOOK_SECRET", "") or ""
+def _relay_auth_ok(request):
+    expected = getattr(settings, "TELEGRAM_ROUTER_TOKEN", "") or ""
     if not expected:
-        # Refuse to run wide open. Setting the secret is part of deployment.
-        logger.error("TELEGRAM_WEBHOOK_SECRET is not set; rejecting webhook call")
+        # Refuse to run wide open. Setting the token is part of deployment.
+        logger.error("TELEGRAM_ROUTER_TOKEN is not set; rejecting relay call")
         return False
-    header = request.META.get("HTTP_X_TELEGRAM_BOT_API_SECRET_TOKEN", "")
-    # The path secret is the primary gate; the header is Telegram's own echo and
-    # only checked when present, so a mismatch there can't lock out a correct URL.
-    if secret != expected:
-        return False
-    if header and header != expected:
-        return False
-    return True
+    header = request.META.get("HTTP_AUTHORIZATION", "")
+    given = header[len("Bearer "):] if header.startswith("Bearer ") else ""
+    return hmac.compare_digest(given, expected)
 
 
 def _link_for_chat(chat_id):
@@ -140,24 +136,19 @@ def _split_command(text):
     return command, rest.strip()
 
 
-def _handle_update(update):
-    """Turn one Telegram update into a sent reply. Returns nothing."""
-    message = update.get("message") or update.get("edited_message")
-    if not message:
-        return
-    chat = message.get("chat") or {}
-    chat_id = chat.get("id")
-    if chat_id is None:
-        return
-    text = message.get("text") or ""
-    from_user = message.get("from") or {}
-    username = from_user.get("username") or from_user.get("first_name") or ""
+def _handle_message(chat_id, username, text):
+    """Turn one inbound message into (reply, parse_mode). Either may be None.
 
+    This is exactly today's command dispatch, unchanged — only the outer
+    layer moved: it used to unwrap a raw Telegram update and call
+    send_message/send_chat_action itself; now telegram-router does both of
+    those, and this just answers the question "what should I say back".
+    """
     command, args = _split_command(text)
 
     # Linking is available before an account exists.
     if command in ("/link", "/start") and args:
-        return send_message(chat_id, _try_link(chat_id, username, args))
+        return _try_link(chat_id, username, args), None
 
     link = _link_for_chat(chat_id)
     if link is None:
@@ -169,74 +160,66 @@ def _handle_update(update):
             "Open Money OS → Settings → Connect Telegram and paste this ID.\n\n"
             "(Or send /link <your ToolBox API token>.)"
         )
-        return send_message(chat_id, help_text)
+        return help_text, None
 
     user = link.user
 
     if command in ("/start", "/help"):
-        return send_message(chat_id, handlers.WELCOME)
+        return handlers.WELCOME, None
     if command == "/link":
         # Already linked, no token given.
-        return send_message(chat_id, "You're already linked. Just send me an expense.")
+        return "You're already linked. Just send me an expense.", None
     if command == "/ask":
-        send_chat_action(chat_id)
-        reply, mode = handlers.handle_ask(user, args)
-        return send_message(chat_id, reply, parse_mode=mode)
+        return handlers.handle_ask(user, args)
     if command in ("/review", "/insight", "/spending"):
-        send_chat_action(chat_id)
-        reply, mode = handlers.handle_review(user)
-        return send_message(chat_id, reply, parse_mode=mode)
+        return handlers.handle_review(user)
     if command == "/lending":
-        send_chat_action(chat_id)
-        reply, mode = handlers.handle_lending(user, args)
-        return send_message(chat_id, reply, parse_mode=mode)
+        return handlers.handle_lending(user, args)
     if command == "/split":
-        send_chat_action(chat_id)
-        reply, mode = handlers.handle_split(user, args)
-        return send_message(chat_id, reply, parse_mode=mode)
+        return handlers.handle_split(user, args)
     if command == "/import":
-        reply, mode = handlers.handle_import(link)
-        return send_message(chat_id, reply, parse_mode=mode)
+        return handlers.handle_import(link)
     if command.startswith("/"):
-        return send_message(chat_id, "Unknown command. Send /help.")
+        return "Unknown command. Send /help.", None
 
     # Plain text that reads as a spending question is answered, not logged — so a
     # user doesn't have to remember /ask. A leading number or a paste is still a
     # transaction to log (see looks_like_analysis_question).
     if not link.awaiting_import and handlers.looks_like_analysis_question(text):
-        send_chat_action(chat_id)
-        reply, mode = handlers.handle_ask(user, text)
-        return send_message(chat_id, reply, parse_mode=mode)
+        return handlers.handle_ask(user, text)
 
     # "split 1200 dinner with raj and mira" → a split, without the slash command.
     if not link.awaiting_import and handlers.looks_like_split(text):
-        send_chat_action(chat_id)
-        reply, mode = handlers.handle_split(user, text)
-        return send_message(chat_id, reply, parse_mode=mode)
+        return handlers.handle_split(user, text)
 
     # Plain text → log it.
-    send_chat_action(chat_id)
-    reply, mode = handlers.handle_expense(user, text, link)
-    if reply:
-        send_message(chat_id, reply, parse_mode=mode)
+    return handlers.handle_expense(user, text, link)
 
 
-@csrf_exempt
-def webhook(request, secret):
-    if request.method != "POST":
-        return HttpResponse(status=405)
-    if not _secret_ok(request, secret):
-        return HttpResponseForbidden("bad secret")
+@api_view(["POST"])
+@authentication_classes([])  # this app's ApiKeyAuthentication also claims "Bearer …"
+@permission_classes([AllowAny])  # gated by _relay_auth_ok's shared secret instead
+def relay(request):
+    """POST {chat_id, username, text} -> {reply, parse_mode}.
+
+    Called by telegram-router once it has decided a message belongs to
+    ToolBox. It, not this view, talks to Telegram — this always answers 200
+    with whatever there is (or isn't) to say, so a retry from the router can
+    never turn into a second reply landing in the chat.
+    """
+    if not _relay_auth_ok(request):
+        return HttpResponseForbidden("bad token")
+
+    chat_id = request.data.get("chat_id")
+    text = request.data.get("text") or ""
+    username = request.data.get("username") or ""
+    if chat_id is None or not text:
+        return JsonResponse({"reply": None, "parse_mode": None})
 
     try:
-        update = json.loads(request.body.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError):
-        # Malformed body: 200 so Telegram doesn't hammer us retrying it.
-        return JsonResponse({"ok": True})
+        reply, mode = _handle_message(chat_id, username, text)
+    except Exception:  # never 500 back to the router — it would retry forever
+        logger.exception("Telegram relay failed to handle message")
+        reply, mode = "Something went wrong handling that. Try again shortly.", None
 
-    try:
-        _handle_update(update)
-    except Exception:  # never 500 back to Telegram — it would retry forever
-        logger.exception("Telegram webhook failed to handle update")
-
-    return JsonResponse({"ok": True})
+    return JsonResponse({"reply": reply, "parse_mode": mode})

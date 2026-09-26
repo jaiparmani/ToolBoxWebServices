@@ -270,25 +270,20 @@ else:
     DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'ToolBox <noreply@toolbox.local>')
 
 # ── Telegram bot (telegrambot app) ───────────────────────────────────────────
-# The bot runs as a webhook inside this web app, so it's up whenever the backend
-# is up — no separate long-polling process to keep alive (which is why the old
-# standalone script kept going down on PythonAnywhere). Set these in the
-# environment (PythonAnywhere: in ~/.bashrc *and* in the WSGI file); never
-# commit the token.
+# The Telegram webhook itself now lives in telegram-router (a separate
+# Cloudflare Worker that classifies each message and routes it to ToolBox,
+# brain-chat, or life-rpg) — this app no longer registers or receives it
+# directly. Set these in the environment (PythonAnywhere: in ~/.bashrc *and*
+# in the WSGI file); never commit them.
 #
-#   TELEGRAM_BOT_TOKEN        BotFather token for the bot
-#   TELEGRAM_WEBHOOK_SECRET   any long random string; it's the secret in the
-#                             webhook URL path and the setWebhook secret_token
-#   TELEGRAM_WEBHOOK_BASE_URL public https origin, e.g.
-#                             https://toolbox.pythonanywhere.com (used by the
-#                             set_telegram_webhook command)
-#
-# After setting them, register the webhook once:  python manage.py set_telegram_webhook
+#   TELEGRAM_BOT_TOKEN     BotFather token — still used to push proactive
+#                          notifications (e.g. pinging the other party of a
+#                          split), which has nothing to do with the router.
+#   TELEGRAM_ROUTER_TOKEN  shared secret the router authenticates with when it
+#                          calls POST /api/telegram/relay/ — any long random
+#                          string, matching telegram-router's TOOLBOX_RELAY_TOKEN.
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
-TELEGRAM_WEBHOOK_SECRET = os.environ.get('TELEGRAM_WEBHOOK_SECRET', '')
-TELEGRAM_WEBHOOK_BASE_URL = os.environ.get(
-    'TELEGRAM_WEBHOOK_BASE_URL', 'https://toolbox.pythonanywhere.com'
-)
+TELEGRAM_ROUTER_TOKEN = os.environ.get('TELEGRAM_ROUTER_TOKEN', '')
 
 # ── WhatsApp bot (whatsappbot app) ──────────────────────────────────────────
 # Same webhook-inside-the-web-app shape as the Telegram bot. Meta's Cloud API
