@@ -11,6 +11,7 @@ import logging
 from django.contrib.auth import get_user_model
 from django.core.management.base import BaseCommand
 
+from brainstore.client import BrainError, BrainNotConfigured, ingest as brain_ingest
 from expenses.models import PushSubscription, notify
 from expenses.services import (
     ExpenseParseError, ExpenseParseNotPossible, ExpenseParseRateLimited,
@@ -44,6 +45,12 @@ class Command(BaseCommand):
                 notify(user, 'Your weekly money brief', brief,
                        kind='insight', link='/expense-tracker')
                 sent += 1
+                try:
+                    brain_ingest(brief, source='toolbox', hint=f'{user.email} — weekly spending brief')
+                except (BrainNotConfigured, BrainError) as exc:
+                    # A memory write is a bonus on top of the notification
+                    # that already went out — it must never cost the run.
+                    logger.warning('send_weekly_brief: user %s brain ingest failed: %s', user.id, exc)
             except (ExpenseParseNotPossible, ExpenseParseRateLimited, ExpenseParseError) as exc:
                 logger.warning('send_weekly_brief: user %s LLM error: %s', user.id, exc)
                 errored += 1

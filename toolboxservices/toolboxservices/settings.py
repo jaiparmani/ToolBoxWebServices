@@ -243,6 +243,21 @@ LLM_GATEWAY_TOKEN = os.environ.get('LLM_GATEWAY_TOKEN', '')
 # which is the point of having one place: change the model there, not per app.
 OPENROUTER_MODEL = os.environ.get('OPENROUTER_MODEL', 'openrouter/free')
 
+# ── Brain (shared memory-store service) ───────────────────────────────────────
+# The same memory store brain-chat and life-rpg already read and write —
+# unrelated to the "brain-chat" app named in the Telegram settings above.
+# ToolBox writes to it (currently just the weekly spending brief, see
+# expenses/management/commands/send_weekly_brief.py) so a conversation in
+# brain-chat can know what you actually spent.
+#
+# BRAIN_API_TOKEN is brain's own single static token — the same value
+# brain-chat and life-rpg already hold as their own BRAIN_API_TOKEN secret;
+# brain has no per-client token issuance the way llm-gateway does.
+#   export BRAIN_API_URL="https://brain.brain-store.workers.dev"
+#   export BRAIN_API_TOKEN="..."
+BRAIN_API_URL = os.environ.get('BRAIN_API_URL', '')
+BRAIN_API_TOKEN = os.environ.get('BRAIN_API_TOKEN', '')
+
 # ── Password-reset email (Gmail SMTP) ────────────────────────────────────────
 # Where the reset link points (the frontend origin, no trailing slash). MUST be
 # set to the deployed frontend in production, or links point at localhost.
