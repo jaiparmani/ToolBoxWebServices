@@ -1244,6 +1244,51 @@ def generate_weekly_brief(user):
     )
 
 
+def run_weekly_brief_batch():
+    """Send the weekly brief to every eligible user. Returns {sent, skipped, errored}.
+
+    The one place this loop lives — manage.py send_weekly_brief and
+    POST /api/expenses/weekly-brief/run/ both just call this, so there is
+    nothing to keep in sync between "run it from a console" and "run it from
+    an HTTP trigger" (see the latter for why a console alone isn't enough on
+    PythonAnywhere: a plain console doesn't inherit the WSGI file's env).
+    """
+    from django.contrib.auth import get_user_model
+
+    from brainstore.client import BrainError, BrainNotConfigured, ingest as brain_ingest
+
+    from .models import Expense, PushSubscription, notify
+
+    User = get_user_model()
+    eligible_ids = PushSubscription.objects.values_list('user_id', flat=True).distinct()
+    users = User.objects.filter(is_active=True, id__in=eligible_ids)
+
+    sent, skipped, errored = 0, 0, 0
+    for user in users:
+        expense_count = Expense.objects.filter(user=user).count()
+        if expense_count <= 10:
+            skipped += 1
+            continue
+        try:
+            brief = generate_weekly_brief(user)
+            notify(user, 'Your weekly money brief', brief, kind='insight', link='/expense-tracker')
+            sent += 1
+            try:
+                brain_ingest(brief, source='toolbox', hint=f'{user.email} — weekly spending brief')
+            except (BrainNotConfigured, BrainError) as exc:
+                # A memory write is a bonus on top of the notification that
+                # already went out — it must never cost the run.
+                logger.warning('weekly_brief: user %s brain ingest failed: %s', user.id, exc)
+        except (ExpenseParseNotPossible, ExpenseParseRateLimited, ExpenseParseError) as exc:
+            logger.warning('weekly_brief: user %s LLM error: %s', user.id, exc)
+            errored += 1
+        except Exception as exc:
+            logger.error('weekly_brief: user %s unexpected error: %s', user.id, exc, exc_info=True)
+            errored += 1
+
+    return {'sent': sent, 'skipped': skipped, 'errored': errored}
+
+
 # --------------------------------------------------------------------------
 # Spending personality
 # --------------------------------------------------------------------------

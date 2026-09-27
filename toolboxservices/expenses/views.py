@@ -1,5 +1,5 @@
 from rest_framework import viewsets, status, filters, serializers
-from rest_framework.decorators import action, api_view, permission_classes
+from rest_framework.decorators import action, api_view, authentication_classes, permission_classes
 from rest_framework.response import Response
 from rest_framework.permissions import AllowAny
 from rest_framework.exceptions import PermissionDenied
@@ -11,6 +11,7 @@ from django.core.exceptions import ObjectDoesNotExist
 from datetime import datetime, timedelta, date
 from decimal import Decimal, InvalidOperation
 import calendar
+import hmac
 import django_filters
 
 from .models import Expense, ExpenseCategory, ExpenseSplit, ExpenseTag, Person, SplitGroup, RecurringRule, Notification, SharedBill, notify
@@ -2523,3 +2524,27 @@ class CopilotViewSet(viewsets.ViewSet):
 
         all_ok = all(r['ok'] for r in results)
         return Response({'ok': all_ok, 'sent_to': len(subs), 'results': results})
+
+
+@api_view(["POST"])
+@authentication_classes([])  # ApiKeyAuthentication also claims any "Bearer …" header
+@permission_classes([AllowAny])  # gated by JOB_TRIGGER_TOKEN below instead
+def run_weekly_brief(request):
+    """POST /api/expenses/weekly-brief/run/ — trigger the weekly brief batch over HTTP.
+
+    Exists because a plain PythonAnywhere console (or Scheduled Task) doesn't
+    inherit the WSGI file's environment, so LLM_GATEWAY_URL/TOKEN can be
+    invisible to `manage.py send_weekly_brief` even though the live app has
+    them. Same loop either way — see services.run_weekly_brief_batch, the one
+    place this actually happens.
+    """
+    from django.conf import settings as django_settings
+
+    expected = (getattr(django_settings, 'JOB_TRIGGER_TOKEN', '') or '').strip()
+    header = request.META.get('HTTP_AUTHORIZATION', '')
+    given = header[len('Bearer '):] if header.startswith('Bearer ') else ''
+    if not expected or not hmac.compare_digest(given, expected):
+        return Response({'error': 'unauthorized'}, status=status.HTTP_403_FORBIDDEN)
+
+    from .services import run_weekly_brief_batch
+    return Response(run_weekly_brief_batch())

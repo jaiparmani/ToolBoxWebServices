@@ -4,62 +4,24 @@
 
 A user is eligible when they have more than 10 expenses and at least one active
 PushSubscription. Errors for individual users are logged and do not stop the run.
+
+The actual loop is expenses.services.run_weekly_brief_batch — shared with
+POST /api/expenses/weekly-brief/run/, which exists because a plain console on
+PythonAnywhere doesn't inherit the WSGI file's environment, so this command
+can silently fail to find LLM_GATEWAY_URL/TOKEN when run from one.
 """
 
-import logging
-
-from django.contrib.auth import get_user_model
 from django.core.management.base import BaseCommand
 
-from brainstore.client import BrainError, BrainNotConfigured, ingest as brain_ingest
-from expenses.models import PushSubscription, notify
-from expenses.services import (
-    ExpenseParseError, ExpenseParseNotPossible, ExpenseParseRateLimited,
-    generate_weekly_brief,
-)
-from expenses.models import Expense
-
-logger = logging.getLogger(__name__)
+from expenses.services import run_weekly_brief_batch
 
 
 class Command(BaseCommand):
     help = 'Send weekly AI brief to all users'
 
     def handle(self, *args, **options):
-        User = get_user_model()
-
-        # Users who have enough history and at least one push subscription
-        eligible_ids = (
-            PushSubscription.objects.values_list('user_id', flat=True).distinct()
-        )
-        users = User.objects.filter(is_active=True, id__in=eligible_ids)
-
-        sent, skipped, errored = 0, 0, 0
-        for user in users:
-            expense_count = Expense.objects.filter(user=user).count()
-            if expense_count <= 10:
-                skipped += 1
-                continue
-            try:
-                brief = generate_weekly_brief(user)
-                notify(user, 'Your weekly money brief', brief,
-                       kind='insight', link='/expense-tracker')
-                sent += 1
-                try:
-                    brain_ingest(brief, source='toolbox', hint=f'{user.email} — weekly spending brief')
-                except (BrainNotConfigured, BrainError) as exc:
-                    # A memory write is a bonus on top of the notification
-                    # that already went out — it must never cost the run.
-                    logger.warning('send_weekly_brief: user %s brain ingest failed: %s', user.id, exc)
-            except (ExpenseParseNotPossible, ExpenseParseRateLimited, ExpenseParseError) as exc:
-                logger.warning('send_weekly_brief: user %s LLM error: %s', user.id, exc)
-                errored += 1
-            except Exception as exc:
-                logger.error('send_weekly_brief: user %s unexpected error: %s', user.id, exc,
-                             exc_info=True)
-                errored += 1
-
+        result = run_weekly_brief_batch()
         self.stdout.write(self.style.SUCCESS(
-            f'Weekly brief: {sent} sent, {skipped} skipped (too few expenses), '
-            f'{errored} error(s).'
+            f"Weekly brief: {result['sent']} sent, {result['skipped']} skipped (too few expenses), "
+            f"{result['errored']} error(s)."
         ))

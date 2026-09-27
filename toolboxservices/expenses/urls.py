@@ -3,7 +3,7 @@ from rest_framework.routers import DefaultRouter
 from .views import (
     ExpenseViewSet, ExpenseCategoryViewSet, ExpenseTagViewSet,
     PersonViewSet, SplitViewSet, SplitGroupViewSet, RecurringRuleViewSet, MoneyViewSet,
-    CopilotViewSet,
+    CopilotViewSet, run_weekly_brief,
 )
 
 # Create a router for API endpoints
@@ -24,6 +24,9 @@ router.register(r'copilot', CopilotViewSet, basename='copilot')
 urlpatterns = [
      # Include router URLs for REST API endpoints
      path('', include(router.urls)),
+
+     # On-demand job trigger — gated by JOB_TRIGGER_TOKEN, not a user token.
+     path('weekly-brief/run/', run_weekly_brief, name='weekly-brief-run'),
 
      # Additional custom endpoints can be added here if needed
      # For example:

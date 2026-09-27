@@ -8,8 +8,10 @@ nothing at all.
 """
 from datetime import date, timedelta
 from decimal import Decimal
+from unittest.mock import patch
 
 from django.contrib.auth.models import User
+from django.test import override_settings
 from django.urls import reverse
 from rest_framework.authtoken.models import Token
 from rest_framework.test import APITestCase
@@ -1071,3 +1073,30 @@ class TagBreakdownTests(APITestCase):
         data = self.summary(self.ashok, tags=str(outing.id))
         self.assertEqual(Decimal(str(data['tag_breakdown']['Outing2'])), Decimal('1000.00'))
         self.assertEqual(Decimal(str(data['category_breakdown'][self.category.name])), Decimal('1000.00'))
+
+
+@override_settings(JOB_TRIGGER_TOKEN='test-trigger-token')
+class WeeklyBriefTriggerTests(APITestCase):
+    """POST /api/expenses/weekly-brief/run/ — no user token, a shared job secret instead."""
+
+    def _post(self, token='test-trigger-token'):
+        headers = {'HTTP_AUTHORIZATION': f'Bearer {token}'} if token is not None else {}
+        return self.client.post('/api/expenses/weekly-brief/run/', **headers)
+
+    def test_wrong_token_is_forbidden(self):
+        self.assertEqual(self._post(token='nope').status_code, 403)
+
+    def test_missing_token_is_forbidden(self):
+        self.assertEqual(self._post(token=None).status_code, 403)
+
+    @override_settings(JOB_TRIGGER_TOKEN='')
+    def test_disabled_when_no_token_is_configured(self):
+        self.assertEqual(self._post(token='anything').status_code, 403)
+
+    @patch('expenses.services.run_weekly_brief_batch')
+    def test_right_token_runs_the_batch_and_reports_the_summary(self, mock_batch):
+        mock_batch.return_value = {'sent': 2, 'skipped': 1, 'errored': 0}
+        response = self._post()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {'sent': 2, 'skipped': 1, 'errored': 0})
+        mock_batch.assert_called_once()
