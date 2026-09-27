@@ -258,15 +258,6 @@ OPENROUTER_MODEL = os.environ.get('OPENROUTER_MODEL', 'openrouter/free')
 BRAIN_API_URL = os.environ.get('BRAIN_API_URL', '')
 BRAIN_API_TOKEN = os.environ.get('BRAIN_API_TOKEN', '')
 
-# ── On-demand job triggers ─────────────────────────────────────────────────
-# Gates POST /api/expenses/weekly-brief/run/ — lets the weekly brief batch
-# (expenses.services.run_weekly_brief_batch) be triggered over HTTP instead
-# of only from a PythonAnywhere console or Scheduled Task, either of which
-# needs this same env duplicated outside the WSGI file to even see
-# LLM_GATEWAY_URL/TOKEN. Any long random string.
-#   export JOB_TRIGGER_TOKEN="..."
-JOB_TRIGGER_TOKEN = os.environ.get('JOB_TRIGGER_TOKEN', '')
-
 # ── Password-reset email (Gmail SMTP) ────────────────────────────────────────
 # Where the reset link points (the frontend origin, no trailing slash). MUST be
 # set to the deployed frontend in production, or links point at localhost.

@@ -11,7 +11,6 @@ from django.core.exceptions import ObjectDoesNotExist
 from datetime import datetime, timedelta, date
 from decimal import Decimal, InvalidOperation
 import calendar
-import hmac
 import django_filters
 
 from .models import Expense, ExpenseCategory, ExpenseSplit, ExpenseTag, Person, SplitGroup, RecurringRule, Notification, SharedBill, notify
@@ -2527,8 +2526,8 @@ class CopilotViewSet(viewsets.ViewSet):
 
 
 @api_view(["POST"])
-@authentication_classes([])  # ApiKeyAuthentication also claims any "Bearer …" header
-@permission_classes([AllowAny])  # gated by JOB_TRIGGER_TOKEN below instead
+@authentication_classes([])
+@permission_classes([AllowAny])
 def run_weekly_brief(request):
     """POST /api/expenses/weekly-brief/run/ — trigger the weekly brief batch over HTTP.
 
@@ -2537,14 +2536,10 @@ def run_weekly_brief(request):
     invisible to `manage.py send_weekly_brief` even though the live app has
     them. Same loop either way — see services.run_weekly_brief_batch, the one
     place this actually happens.
+
+    Deliberately open, no token: fires every eligible user's own weekly
+    brief (LLM call, push notification, brain write) on every request, with
+    no rate limit of its own.
     """
-    from django.conf import settings as django_settings
-
-    expected = (getattr(django_settings, 'JOB_TRIGGER_TOKEN', '') or '').strip()
-    header = request.META.get('HTTP_AUTHORIZATION', '')
-    given = header[len('Bearer '):] if header.startswith('Bearer ') else ''
-    if not expected or not hmac.compare_digest(given, expected):
-        return Response({'error': 'unauthorized'}, status=status.HTTP_403_FORBIDDEN)
-
     from .services import run_weekly_brief_batch
     return Response(run_weekly_brief_batch())
