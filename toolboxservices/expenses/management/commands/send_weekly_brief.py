@@ -23,5 +23,7 @@ class Command(BaseCommand):
         result = run_weekly_brief_batch()
         self.stdout.write(self.style.SUCCESS(
             f"Weekly brief: {result['sent']} sent, {result['skipped']} skipped (too few expenses), "
-            f"{result['errored']} error(s)."
+            f"{result['errored']} error(s). Brain: {result['brain_ingested']} ingested, "
+            f"{result['brain_errored']} failed"
+            + (f" ({result['last_brain_error']})" if result['last_brain_error'] else '') + '.'
         ))

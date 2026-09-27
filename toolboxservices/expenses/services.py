@@ -1245,7 +1245,14 @@ def generate_weekly_brief(user):
 
 
 def run_weekly_brief_batch():
-    """Send the weekly brief to every eligible user. Returns {sent, skipped, errored}.
+    """Send the weekly brief to every eligible user.
+
+    Returns {sent, skipped, errored, brain_ingested, brain_errored,
+    last_brain_error}. The brain fields exist because a memory-write
+    failure is deliberately swallowed (a bonus on top of a notification
+    that already went out must never cost the run) — without them in the
+    response, the only way to see a brain problem is PythonAnywhere's own
+    log, which isn't always at hand.
 
     The one place this loop lives — manage.py send_weekly_brief and
     POST /api/expenses/weekly-brief/run/ both just call this, so there is
@@ -1264,6 +1271,8 @@ def run_weekly_brief_batch():
     users = User.objects.filter(is_active=True, id__in=eligible_ids)
 
     sent, skipped, errored = 0, 0, 0
+    brain_ingested, brain_errored = 0, 0
+    last_brain_error = None
     for user in users:
         expense_count = Expense.objects.filter(user=user).count()
         if expense_count <= 10:
@@ -1275,9 +1284,12 @@ def run_weekly_brief_batch():
             sent += 1
             try:
                 brain_ingest(brief, source='toolbox', hint=f'{user.email} — weekly spending brief')
+                brain_ingested += 1
             except (BrainNotConfigured, BrainError) as exc:
                 # A memory write is a bonus on top of the notification that
                 # already went out — it must never cost the run.
+                brain_errored += 1
+                last_brain_error = str(exc)
                 logger.warning('weekly_brief: user %s brain ingest failed: %s', user.id, exc)
         except (ExpenseParseNotPossible, ExpenseParseRateLimited, ExpenseParseError) as exc:
             logger.warning('weekly_brief: user %s LLM error: %s', user.id, exc)
@@ -1286,7 +1298,11 @@ def run_weekly_brief_batch():
             logger.error('weekly_brief: user %s unexpected error: %s', user.id, exc, exc_info=True)
             errored += 1
 
-    return {'sent': sent, 'skipped': skipped, 'errored': errored}
+    return {
+        'sent': sent, 'skipped': skipped, 'errored': errored,
+        'brain_ingested': brain_ingested, 'brain_errored': brain_errored,
+        'last_brain_error': last_brain_error,
+    }
 
 
 # --------------------------------------------------------------------------
