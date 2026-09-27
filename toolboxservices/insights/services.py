@@ -264,6 +264,7 @@ def build_expense_context(user, days=30):
     from decimal import Decimal
 
     from expenses.models import Expense
+    from expenses.net_spending import expense_share_fields
 
     period_end = timezone.now().date()
     period_start = period_end - timedelta(days=days - 1)
@@ -271,7 +272,8 @@ def build_expense_context(user, days=30):
     entries = list(
         Expense.objects
         .filter(user=user, date__gte=period_start, date__lte=period_end)
-        .select_related('category')
+        .select_related('category', 'shared_bill')
+        .prefetch_related('shared_bill__splits')
         .order_by('date', 'created_at')
     )
     if not entries:
@@ -279,8 +281,19 @@ def build_expense_context(user, days=30):
             f"No transactions recorded between {period_start} and {period_end}."
         )
 
+    # A split bill's linked Expense carries the full amount (see
+    # net_spending.py); what participants owe back is lending, not spending,
+    # so the review reads only the net share - never the whole split.
+    def net_amount(e):
+        if e.transaction_type != 'expense':
+            return e.amount
+        share, _owed = expense_share_fields(e)
+        return Decimal(str(share))
+
+    net_amounts = {e.id: net_amount(e) for e in entries}
+
     def total(rows):
-        return _f(sum((e.amount for e in rows), Decimal('0')))
+        return _f(sum((net_amounts[e.id] for e in rows), Decimal('0')))
 
     by_type = {}
     for ttype, label in Expense.TRANSACTION_TYPE_CHOICES:
@@ -294,7 +307,7 @@ def build_expense_context(user, days=30):
     for entry in spend:
         name = entry.category.name if entry.category else 'Uncategorised'
         bucket = categories.setdefault(name, {"total": Decimal('0'), "count": 0})
-        bucket["total"] += entry.amount
+        bucket["total"] += net_amounts[entry.id]
         bucket["count"] += 1
     by_category = sorted(
         ({"category": k, "total": _f(v["total"]), "count": v["count"]}
@@ -310,9 +323,9 @@ def build_expense_context(user, days=30):
     daily = {}
     for entry in spend:
         key = entry.date.isoformat()
-        daily[key] = daily.get(key, Decimal('0')) + entry.amount
+        daily[key] = daily.get(key, Decimal('0')) + net_amounts[entry.id]
 
-    largest = sorted(spend, key=lambda e: e.amount, reverse=True)[:5]
+    largest = sorted(spend, key=lambda e: net_amounts[e.id], reverse=True)[:5]
 
     return {
         "period_start": period_start,
@@ -332,7 +345,7 @@ def build_expense_context(user, days=30):
             "prior_days_spend": total(earlier),
             "daily_spend": [{"date": d, "total": _f(v)} for d, v in sorted(daily.items())],
             "largest_transactions": [
-                {"date": e.date.isoformat(), "amount": _f(e.amount),
+                {"date": e.date.isoformat(), "amount": _f(net_amounts[e.id]),
                  "description": e.description[:80],
                  "category": e.category.name if e.category else None}
                 for e in largest
