@@ -1031,6 +1031,16 @@ class ExpenseViewSet(viewsets.ModelViewSet):
 
         # A category name is friendlier for the model than an id; the filter wants the id.
         applied = dict(filters)
+
+        # SEARCH_SYSTEM_PROMPT deliberately tells the model to return no
+        # transaction_type at all for a general question ("asks about
+        # everything") — but get_queryset() has no such default, so "how
+        # much did I spend this month" would silently pull in debt/credit
+        # rows (lending, not spending) alongside real expenses. This is
+        # "ask", named and documented as a spending question; only an
+        # explicit transaction_type (the model asking about income/debt/
+        # credit on purpose) overrides the default.
+        applied.setdefault('transaction_type', 'expense')
         category_name = applied.pop('category', None)
         queryset = self.get_queryset()
         if category_name:

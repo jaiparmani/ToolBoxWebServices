@@ -1084,3 +1084,40 @@ class WeeklyBriefTriggerTests(APITestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {'sent': 2, 'skipped': 1, 'errored': 0})
         mock_batch.assert_called_once()
+
+
+class AskDefaultsToExpenseOnlyTests(APITestCase):
+    """SEARCH_SYSTEM_PROMPT tells the model to return no transaction_type at
+    all for a general question — /ask must not then silently include
+    lending-adjacent rows (debt/credit) alongside real spending."""
+
+    def setUp(self):
+        self.user = User.objects.create_user('jai', password='x')
+        self.client.credentials(
+            HTTP_AUTHORIZATION=f'Token {Token.objects.get_or_create(user=self.user)[0].key}')
+        self.category = ExpenseCategory.objects.create(name='General', transaction_type='expense')
+        Expense.objects.create(
+            user=self.user, amount='500', transaction_type='expense',
+            category=self.category, description='groceries', date=date.today())
+        Expense.objects.create(
+            user=self.user, amount='2000', transaction_type='debt',
+            category=self.category, description='borrowed from raj', date=date.today())
+
+    @patch('expenses.views.parse_search_query')
+    def test_a_general_question_only_counts_the_expense(self, mock_parse):
+        # The empty-filters case SEARCH_SYSTEM_PROMPT asks for when a question
+        # "asks about everything" — e.g. "how much did I spend this month".
+        mock_parse.return_value = {'filters': {}, 'interpretation': 'everything'}
+        response = self.client.post('/api/expenses/expenses/ask/', {'question': 'how much did I spend'}, format='json')
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data['total'], 500)
+        self.assertEqual(response.data['count'], 1)
+        self.assertTrue(all(r['transaction_type'] == 'expense' for r in response.data['results']))
+
+    @patch('expenses.views.parse_search_query')
+    def test_an_explicit_transaction_type_is_not_overridden(self, mock_parse):
+        mock_parse.return_value = {'filters': {'transaction_type': 'debt'}, 'interpretation': 'debt'}
+        response = self.client.post('/api/expenses/expenses/ask/', {'question': 'how much do I owe'}, format='json')
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data['total'], 2000)
+        self.assertEqual(response.data['count'], 1)
