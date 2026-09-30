@@ -85,6 +85,14 @@ class Expense(models.Model):
     SENTIMENT_CHOICES = [('good', 'Felt good'), ('neutral', 'Neutral'), ('regret', 'Regret')]
     sentiment = models.CharField(max_length=10, choices=SENTIMENT_CHOICES, null=True, blank=True)
 
+    # Set when this row was created straight off a forwarded bank/UPI/card
+    # alert (expenses.assistant's `bank_message` intent) with a category the
+    # model only *suggested* from the amount + past merchant patterns. It
+    # already counts in every total — nothing about it is provisional — but
+    # the UI flags it until the user has looked at the suggested category and
+    # confirmed or changed it. A normal manual/typed expense never sets this.
+    pending_confirmation = models.BooleanField(default=False)
+
     # Shared spending: set when the expense was split within a group, so the
     # group can be totalled without duplicating any of the split rows.
     group = models.ForeignKey('SplitGroup', on_delete=models.SET_NULL, null=True, blank=True,

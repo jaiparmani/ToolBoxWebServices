@@ -99,7 +99,7 @@ class ExpenseListSerializer(SplitShareMixin, serializers.ModelSerializer):
         fields = ['id', 'amount', 'amount_display', 'transaction_type', 'category',
                  'description', 'date', 'tags', 'is_recent', 'balance_effect',
                  'your_share', 'owed_to_you', 'paid_by_person', 'paid_by_person_name',
-                 'sentiment', 'created_at', 'updated_at']
+                 'sentiment', 'pending_confirmation', 'created_at', 'updated_at']
         read_only_fields = ['id', 'created_at', 'updated_at']
 
 
@@ -197,7 +197,7 @@ class ExpenseSerializer(SplitShareMixin, serializers.ModelSerializer):
                  'payment_method', 'is_recurring', 'recurring_interval',
                  'is_recent', 'is_debt_related', 'balance_effect',
                  'your_share', 'owed_to_you', 'paid_by_person', 'paid_by_person_name',
-                 'sentiment', 'created_at', 'updated_at']
+                 'sentiment', 'pending_confirmation', 'created_at', 'updated_at']
         read_only_fields = ['id', 'user', 'created_at', 'updated_at']
 
     def validate(self, data):

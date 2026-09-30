@@ -35,7 +35,7 @@ from llm.client import call_json, LLMError
 
 # ── Router ───────────────────────────────────────────────────────────────────
 
-INTENTS = ('add_expense', 'add_batch', 'add_split', 'search',
+INTENTS = ('add_expense', 'add_batch', 'add_split', 'bank_message', 'search',
            'explain_spending', 'explain_health', 'auto_tag', 'chat')
 
 ROUTER_PROMPT = (
@@ -43,11 +43,19 @@ ROUTER_PROMPT = (
     "and choose exactly one intent, then write one short friendly sentence.\n"
     "\n"
     "Intents:\n"
-    "  add_expense      - a single transaction to record: \"20 aamras\", \"spent 200 on "
-    "chai\", \"got 5000 salary\", \"lent 300 to raj\". A leading number is a strong signal.\n"
+    "  add_expense      - a single transaction the user typed/composed themselves: "
+    "\"20 aamras\", \"spent 200 on chai\", \"got 5000 salary\", \"lent 300 to raj\". A "
+    "leading number is a strong signal.\n"
     "  add_batch        - MANY transactions in one message, e.g. a pasted list or "
     "\"20 vada pav, 100 chai, 250 lunch\".\n"
     "  add_split        - a shared bill to split: \"split 1200 dinner with raj and mira\".\n"
+    "  bank_message      - a bank/UPI/card alert copied or forwarded verbatim from an "
+    "SMS or push notification, not something the user composed. Recognise it by phrasing "
+    "like \"Rs.500.00 debited from A/c XX1234\", \"INR 1,200.00 spent on HDFC Bank Card "
+    "ending 4321\", \"You've received UPI money\", a transaction/reference ID, \"Avl Bal\", "
+    "\"info:\" tags, or a bank/wallet/UPI app name. Use this whenever the text reads like "
+    "an automated alert, even if it also mentions an amount - the giveaway is the robotic "
+    "phrasing and reference numbers, not the amount alone.\n"
     "  search           - a question about their recorded transactions: \"find everything "
     "over 500 last week\", \"how much on food this month\", \"show my income\".\n"
     "  explain_spending - asking for an opinion/review of their spending: \"did I overspend "
@@ -147,6 +155,16 @@ def run(user, message):
             return {'type': 'batch_added', 'reply': reply,
                     'expenses': [ExpenseSerializer(e).data for e in created],
                     'count': len(created)}
+
+        if intent == 'bank_message':
+            from .views import ExpenseViewSet
+            known_merchants = ExpenseViewSet._known_merchants(user)
+            p = parse_expense_text(message, known_tags=known_tag_names(user),
+                                    known_merchants=known_merchants)
+            draft = _draft_from_parsed(p)
+            expense = _create_expense(user, draft, pending=True)
+            return {'type': 'expense_pending', 'reply': reply,
+                    'expense': ExpenseSerializer(expense).data}
 
         if intent == 'add_split':
             p = parse_split_text(message, known_people=_known_people(user), known_tags=known_tag_names(user))
@@ -273,7 +291,7 @@ def _run_auto_tag(user, message, reply):
 
 # ── Commit (writes) ──────────────────────────────────────────────────────────
 
-def _create_expense(user, draft, on_date=None):
+def _create_expense(user, draft, on_date=None, pending=False):
     # A date reaches here by two routes: straight off the parser as a date, or
     # on a draft that went to the client for confirmation and came back as an
     # ISO string. Accept either, and only then fall back to today.
@@ -288,6 +306,7 @@ def _create_expense(user, draft, on_date=None):
         category=resolve_category(draft),
         description=draft.get('description', ''),
         date=when or timezone.now().date(),
+        pending_confirmation=pending,
     )
     expense.tags.set(resolve_tags(user, draft.get('tags')))
     return expense

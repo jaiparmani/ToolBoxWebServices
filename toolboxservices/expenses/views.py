@@ -111,7 +111,7 @@ class ExpenseFilter(django_filters.FilterSet):
 
     class Meta:
         model = Expense
-        fields = ['date', 'category', 'transaction_type', 'is_recurring']
+        fields = ['date', 'category', 'transaction_type', 'is_recurring', 'pending_confirmation']
 
     def filter_by_tags(self, queryset, name, value):
         """Filter by tag names or IDs"""
