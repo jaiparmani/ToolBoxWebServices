@@ -501,6 +501,35 @@ class ExpenseViewSet(viewsets.ModelViewSet):
         return list(seen.values())
 
     @staticmethod
+    def _known_message_patterns(user):
+        """This user's past bank/UPI/card alerts, verbatim, paired with the
+        category each landed under.
+
+        `_known_merchants` hints from the *parsed* description, which a model
+        can phrase slightly differently for the same merchant run to run. The
+        raw alert text is far more stable — the same sender resends almost the
+        identical template every time — so keeping it alongside the expense
+        (`Expense.source_message`) and feeding it back in gives the parser a
+        much closer match to key off for a repeat transaction.
+        """
+        rows = (
+            Expense.objects
+            .filter(user=user)
+            .exclude(source_message='')
+            .select_related('category')
+            .order_by('-date', '-id')
+            .values_list('source_message', 'category__name')[:200]
+        )
+        seen = {}
+        for msg, cat in rows:
+            key = msg[:40].lower()
+            if key and cat and key not in seen:
+                seen[key] = (msg[:120], cat)
+            if len(seen) >= 20:
+                break
+        return list(seen.values())
+
+    @staticmethod
     def _resolve_tags(user, names):
         from .resolvers import resolve_tags
         return resolve_tags(user, names)

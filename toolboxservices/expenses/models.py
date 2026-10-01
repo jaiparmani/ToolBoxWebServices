@@ -93,6 +93,13 @@ class Expense(models.Model):
     # confirmed or changed it. A normal manual/typed expense never sets this.
     pending_confirmation = models.BooleanField(default=False)
 
+    # The verbatim bank/UPI/card alert this row was created from (bank_message
+    # intent only — empty for every other expense). Kept so a near-identical
+    # alert next time can be matched against this one and reuse its category,
+    # not just against the parsed `description`, which can vary message to
+    # message even for the same merchant.
+    source_message = models.TextField(blank=True, default='')
+
     # Shared spending: set when the expense was split within a group, so the
     # group can be totalled without duplicating any of the split rows.
     group = models.ForeignKey('SplitGroup', on_delete=models.SET_NULL, null=True, blank=True,

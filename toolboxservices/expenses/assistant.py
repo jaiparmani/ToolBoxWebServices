@@ -158,11 +158,18 @@ def run(user, message):
 
         if intent == 'bank_message':
             from .views import ExpenseViewSet
-            known_merchants = ExpenseViewSet._known_merchants(user)
+            # Both signals: the broad (description -> category) history every
+            # parse already gets, plus this user's past raw alerts verbatim -
+            # a near-identical message next time (same merchant, same SMS
+            # template) matches on the second far more reliably than on the
+            # parsed description, which a model can phrase differently run to
+            # run even for the same transaction.
+            known_merchants = (ExpenseViewSet._known_merchants(user)
+                                + ExpenseViewSet._known_message_patterns(user))
             p = parse_expense_text(message, known_tags=known_tag_names(user),
                                     known_merchants=known_merchants)
             draft = _draft_from_parsed(p)
-            expense = _create_expense(user, draft, pending=True)
+            expense = _create_expense(user, draft, pending=True, source_message=message)
             return {'type': 'expense_pending', 'reply': reply,
                     'expense': ExpenseSerializer(expense).data}
 
@@ -291,7 +298,7 @@ def _run_auto_tag(user, message, reply):
 
 # ── Commit (writes) ──────────────────────────────────────────────────────────
 
-def _create_expense(user, draft, on_date=None, pending=False):
+def _create_expense(user, draft, on_date=None, pending=False, source_message=''):
     # A date reaches here by two routes: straight off the parser as a date, or
     # on a draft that went to the client for confirmation and came back as an
     # ISO string. Accept either, and only then fall back to today.
@@ -307,6 +314,7 @@ def _create_expense(user, draft, on_date=None, pending=False):
         description=draft.get('description', ''),
         date=when or timezone.now().date(),
         pending_confirmation=pending,
+        source_message=(source_message or '')[:4000],
     )
     expense.tags.set(resolve_tags(user, draft.get('tags')))
     return expense
