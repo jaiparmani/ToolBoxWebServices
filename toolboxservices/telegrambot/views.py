@@ -215,6 +215,8 @@ def _handle_message(chat_id, username, text):
         return (*handlers.handle_split(user, args), None)
     if command == "/import":
         return (*handlers.handle_import(link), None)
+    if command in ("/pending", "/messages"):
+        return handlers.handle_pending(link)
     if command.startswith("/"):
         return "Unknown command. Send /help.", None, None
 

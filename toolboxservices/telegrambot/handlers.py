@@ -35,6 +35,9 @@ WELCOME = (
     "<b>Lending &amp; splits</b>\n"
     "  /lending who owes me the most?\n"
     "  /lending how much do I owe raj?\n\n"
+    "<b>Messages awaiting confirmation</b>\n"
+    "  /pending       - resend every bank alert still waiting on a Confirm/\n"
+    "                   Edit/Discard, in case you missed one\n\n"
     "<b>Other</b>\n"
     "  /help          - show this again\n\n"
     "You can also just ask a question in plain text — if it looks like a "
@@ -419,6 +422,37 @@ def notify_new_pending_expense(user, expense):
                                      "📩 New message logged — please confirm:")
     telegram_api.send_message(link.chat_id, text, parse_mode="HTML",
                                reply_markup=telegram_api.inline_keyboard(buttons))
+
+
+def handle_pending(link):
+    """/pending — resend every still-pending (bank_message) expense as its
+    own Confirm/Edit/Discard card, oldest first.
+
+    For whatever notify_new_pending_expense's one-shot push missed: the chat
+    was muted, the card scrolled off, or it landed before Telegram was linked.
+    Each is sent as a direct push exactly like a fresh one would be (true
+    inline buttons are independently live per message — see module docstring
+    — so resending changes nothing about any of them); the command's own
+    reply is just a short count, returned normally through the relay.
+    """
+    from . import telegram_api
+    from expenses.models import Expense
+    from expenses.serializers import ExpenseSerializer
+
+    pending = list(Expense.objects.filter(
+        user=link.user, pending_confirmation=True).order_by("created_at"))
+    if not pending:
+        return "Nothing pending — you're all caught up.", None, None
+
+    for expense in pending:
+        text, buttons = _confirm_prompt(ExpenseSerializer(expense).data,
+                                         "📩 Pending — please confirm:")
+        telegram_api.send_message(link.chat_id, text, parse_mode="HTML",
+                                   reply_markup=telegram_api.inline_keyboard(buttons))
+
+    count = len(pending)
+    noun = "expense" if count == 1 else "expenses"
+    return f"{count} pending {noun} — reviewed above.", None, None
 
 
 def handle_toolbox_callback(link, action, expense_id):
