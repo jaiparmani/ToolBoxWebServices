@@ -77,9 +77,17 @@ def confirm_edit_discard_keyboard():
     telegram-router -> /api/telegram/relay/ path like anything else the user
     types, with no need for the router to understand Telegram callback
     queries.
+
+    The labels spell out "...this expense" rather than a bare "Confirm" /
+    "Edit" / "Discard": the same bot also fronts brain-chat and life-rpg
+    behind telegram-router's classifier (see settings.py's Telegram section),
+    and a bare generic word is exactly the kind of message that classifier
+    can hand to one of those instead of to ToolBox. Keep labels unambiguous
+    even if that makes them longer.
     """
     return {
-        "keyboard": [["✅ Confirm", "✏️ Edit"], ["🗑 Discard"]],
+        "keyboard": [["✅ Confirm this expense", "✏️ Edit this expense"],
+                     ["🗑 Discard this expense"]],
         "resize_keyboard": True,
         "one_time_keyboard": True,
     }
@@ -88,7 +96,7 @@ def confirm_edit_discard_keyboard():
 def cancel_keyboard():
     """Shown while waiting for the free-text correction after Edit is tapped."""
     return {
-        "keyboard": [["✕ Cancel"]],
+        "keyboard": [["✕ Cancel the edit"]],
         "resize_keyboard": True,
         "one_time_keyboard": True,
     }

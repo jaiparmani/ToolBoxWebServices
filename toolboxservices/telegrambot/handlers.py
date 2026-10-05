@@ -370,10 +370,18 @@ def _call_expense_detail_action(method, user, pk, payload=None):
     return True, getattr(response, "data", None)
 
 
-_CONFIRM_REPLIES = {"confirm", "✅ confirm", "yes"}
-_EDIT_REPLIES = {"edit", "✏️ edit"}
-_DISCARD_REPLIES = {"discard", "🗑 discard", "🗑️ discard", "no"}
-_CANCEL_REPLIES = {"cancel", "✕ cancel"}
+_CONFIRM_REPLIES = {"confirm", "confirm this expense", "✅ confirm", "✅ confirm this expense"}
+_EDIT_REPLIES = {"edit", "edit this expense", "✏️ edit", "✏️ edit this expense"}
+_DISCARD_REPLIES = {
+    "discard", "discard this expense", "🗑 discard", "🗑 discard this expense",
+    "🗑️ discard", "🗑️ discard this expense",
+}
+_CANCEL_REPLIES = {"cancel", "cancel the edit", "✕ cancel", "✕ cancel the edit"}
+# Deliberately no bare "yes"/"no" (or other one-word phrases that read as
+# generic chat) in any of the above: the same bot also fronts brain-chat and
+# life-rpg behind telegram-router's classifier, and a message that reads as
+# plain conversation is exactly what that classifier can hand to one of those
+# instead of to ToolBox — see confirm_edit_discard_keyboard's docstring.
 
 
 def classify_keyboard_reply(text):
