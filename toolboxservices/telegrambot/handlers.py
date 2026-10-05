@@ -323,3 +323,78 @@ def handle_import(link):
     link.awaiting_import = True
     link.save(update_fields=["awaiting_import"])
     return "Go ahead - paste the log and I'll pull the transactions out.", None
+
+
+# ── Confirm/Discard form for a pending (bank_message) expense ─────────────────
+
+def _call_expense_detail_action(method, user, pk, payload=None):
+    """Invoke ExpenseViewSet's detail partial_update/destroy as `user`.
+
+    Mirrors _call_expense_action, but for a specific expense id rather than a
+    collection-level action — used to confirm or discard the expense a
+    Confirm/Discard keyboard reply refers to.
+    """
+    from expenses.views import ExpenseViewSet
+
+    factory = APIRequestFactory()
+    if method == "patch":
+        request = factory.patch(f"/api/expenses/expenses/{pk}/", payload, format="json")
+        view = ExpenseViewSet.as_view({"patch": "partial_update"})
+    else:
+        request = factory.delete(f"/api/expenses/expenses/{pk}/")
+        view = ExpenseViewSet.as_view({"delete": "destroy"})
+    force_authenticate(request, user=user)
+    try:
+        response = view(request, pk=pk)
+    except Exception as exc:
+        logger.exception("Telegram: confirmation %s failed", method)
+        return False, f"Something went wrong handling that: {exc}"
+
+    if response.status_code >= 400:
+        data = response.data
+        message = "Error."
+        if isinstance(data, dict):
+            message = data.get("error") or data.get("detail") or message
+        return False, str(message)
+    return True, getattr(response, "data", None)
+
+
+_CONFIRM_REPLIES = {"confirm", "✅ confirm", "yes"}
+_DISCARD_REPLIES = {"discard", "🗑 discard", "🗑️ discard", "no"}
+
+
+def looks_like_confirmation_reply(text):
+    """True for a tap on the Confirm/Discard keyboard (or its plain text)."""
+    t = (text or "").strip().lower()
+    return t in _CONFIRM_REPLIES or t in _DISCARD_REPLIES
+
+
+def handle_confirmation(user, link, text):
+    """Resolve the pending expense `link.awaiting_confirmation_id` points at,
+    per a Confirm/Discard keyboard reply. Always clears the pending id, even
+    on failure, so a stale prompt can't wedge the chat.
+    """
+    from expenses.models import Expense
+
+    expense_id = link.awaiting_confirmation_id
+    link.awaiting_confirmation_id = None
+    link.save(update_fields=["awaiting_confirmation_id"])
+
+    t = (text or "").strip().lower()
+    confirming = t in _CONFIRM_REPLIES
+
+    if not Expense.objects.filter(pk=expense_id, user=user, pending_confirmation=True).exists():
+        return "That one's already been handled.", None
+
+    if confirming:
+        ok, data = _call_expense_detail_action(
+            "patch", user, expense_id, {"pending_confirmation": False}
+        )
+        if not ok:
+            return f"Couldn't confirm that: {data}", None
+        return "Confirmed " + _describe(data), "HTML"
+
+    ok, data = _call_expense_detail_action("delete", user, expense_id)
+    if not ok:
+        return f"Couldn't discard that: {data}", None
+    return "Discarded.", None

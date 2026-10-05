@@ -56,7 +56,7 @@ def call(method, payload=None, timeout=TIMEOUT):
     return data
 
 
-def send_message(chat_id, text, parse_mode=None, disable_preview=True):
+def send_message(chat_id, text, parse_mode=None, disable_preview=True, reply_markup=None):
     payload = {
         "chat_id": chat_id,
         "text": text,
@@ -64,14 +64,36 @@ def send_message(chat_id, text, parse_mode=None, disable_preview=True):
     }
     if parse_mode:
         payload["parse_mode"] = parse_mode
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
     return call("sendMessage", payload)
+
+
+def confirm_discard_keyboard():
+    """A one-time reply keyboard offering Confirm / Discard.
+
+    A reply keyboard (not an inline one) so tapping it just sends its label
+    as a normal text message — which flows straight through the existing
+    telegram-router -> /api/telegram/relay/ path like anything else the user
+    types, with no need for the router to understand Telegram callback
+    queries.
+    """
+    return {
+        "keyboard": [["✅ Confirm", "🗑 Discard"]],
+        "resize_keyboard": True,
+        "one_time_keyboard": True,
+    }
+
+
+def remove_keyboard():
+    return {"remove_keyboard": True}
 
 
 def send_chat_action(chat_id, action="typing"):
     return call("sendChatAction", {"chat_id": chat_id, "action": action})
 
 
-def notify_user(user, text, parse_mode=None):
+def notify_user(user, text, parse_mode=None, reply_markup=None):
     """Push a message to a user's linked Telegram chat, if they have one.
 
     Used to reach a person outside the request/response loop — e.g. telling the
@@ -83,16 +105,18 @@ def notify_user(user, text, parse_mode=None):
     it).
     """
     if user is None or not is_configured():
-        return
+        return None
     try:
         if not getattr(user.profile, 'telegram_notifications_enabled', True):
-            return
+            return None
     except Exception:
         pass  # no profile yet — default to notifying, same as the field's default
     try:
         from .models import TelegramLink
         link = TelegramLink.objects.filter(user=user).first()
         if link:
-            send_message(link.chat_id, text, parse_mode=parse_mode)
+            send_message(link.chat_id, text, parse_mode=parse_mode, reply_markup=reply_markup)
+            return link
     except Exception:  # pragma: no cover - best-effort side channel
         logger.exception("notify_user failed")
+    return None

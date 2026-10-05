@@ -170,6 +170,7 @@ def run(user, message):
                                     known_merchants=known_merchants)
             draft = _draft_from_parsed(p)
             expense = _create_expense(user, draft, pending=True, source_message=message)
+            _notify_pending_confirmation(user, expense)
             return {'type': 'expense_pending', 'reply': reply,
                     'expense': ExpenseSerializer(expense).data}
 
@@ -297,6 +298,35 @@ def _run_auto_tag(user, message, reply):
 
 
 # ── Commit (writes) ──────────────────────────────────────────────────────────
+
+def _notify_pending_confirmation(user, expense):
+    """Ping the user's Telegram with a Confirm/Discard form for a new pending
+    expense, so a forwarded bank alert doesn't just sit in Messages until they
+    happen to open the app.
+
+    A no-op without Telegram linked or notifications off (see
+    telegram_api.notify_user) — this must never block the Messages response.
+    """
+    try:
+        from telegrambot.telegram_api import notify_user, confirm_discard_keyboard
+        from telegrambot.models import TelegramLink
+    except Exception:
+        return
+    category = expense.category.name if expense.category else 'Uncategorised'
+    amount = f'{expense.amount:,.2f}'.rstrip('0').rstrip('.')
+    text = (
+        f"📩 New message logged — please confirm:\n\n"
+        f"₹{amount} {expense.description}\n"
+        f"Suggested category: {category}\n\n"
+        f"Tap below, or review it in Money OS → Messages."
+    )
+    try:
+        link = notify_user(user, text, reply_markup=confirm_discard_keyboard())
+        if link:
+            TelegramLink.objects.filter(pk=link.pk).update(awaiting_confirmation_id=expense.id)
+    except Exception:  # pragma: no cover - best-effort side channel
+        pass
+
 
 def _create_expense(user, draft, on_date=None, pending=False, source_message=''):
     # A date reaches here by two routes: straight off the parser as a date, or

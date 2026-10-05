@@ -26,6 +26,13 @@ class TelegramLink(models.Model):
     # the link because the webhook is stateless between requests.
     awaiting_import = models.BooleanField(default=False)
 
+    # Set when we've sent a "Confirm / Discard" keyboard for a pending
+    # (bank_message) expense and are waiting on the tap. Lets the next plain
+    # text from this chat be read as an answer to that prompt rather than a
+    # new expense to log — the webhook is stateless, so this is the only
+    # place that state can live between requests.
+    awaiting_confirmation_id = models.PositiveIntegerField(null=True, blank=True)
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

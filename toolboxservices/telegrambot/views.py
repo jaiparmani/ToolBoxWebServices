@@ -164,6 +164,17 @@ def _handle_message(chat_id, username, text):
 
     user = link.user
 
+    # A tap on a Confirm/Discard keyboard (see expenses.assistant's
+    # bank_message notification) — resolve it and reply directly so the
+    # keyboard can be removed, rather than through the relay's plain
+    # {reply, parse_mode} contract which has no room for reply_markup.
+    if link.awaiting_confirmation_id and not command and handlers.looks_like_confirmation_reply(text):
+        reply, mode = handlers.handle_confirmation(user, link, text)
+        from . import telegram_api
+        telegram_api.send_message(chat_id, reply, parse_mode=mode,
+                                   reply_markup=telegram_api.remove_keyboard())
+        return None, None
+
     if command in ("/start", "/help"):
         return handlers.WELCOME, None
     if command == "/link":
