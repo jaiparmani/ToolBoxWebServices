@@ -416,30 +416,61 @@ def _send_confirmation_prompt(link, expense_data, heading):
     link.save(update_fields=["awaiting_confirmation_id", "awaiting_edit_id"])
 
 
-def notify_new_pending_expense(user, expense):
-    """Ping `user`'s Telegram with a Confirm/Edit/Discard form for a freshly
-    created pending (bank_message) expense, and remember which expense the
-    next reply is about.
+def _advance_to_next_pending(link, exclude_id=None):
+    """If another pending expense is waiting, send its Confirm/Edit/Discard
+    form next.
 
-    A no-op without Telegram linked, the bot unconfigured, or notifications
-    off — those checks live in telegram_api.notify_user, reused here so they
-    aren't duplicated; this just also needs the link back to arm the pending
-    state, which notify_user returns for exactly this purpose.
+    A Telegram reply keyboard is one-per-chat, not one-per-message — sending
+    a second one doesn't add a second set of buttons, it silently replaces
+    the first's with no way back to them. So only one pending expense is ever
+    "live" via Telegram at a time; the rest queue (see notify_new_pending_
+    expense) and are picked up here, one at a time, as each live one
+    resolves. Any of them is always reachable the slow way too, via Money OS
+    → Messages, regardless of Telegram queue order.
+    """
+    from expenses.models import Expense
+    from expenses.serializers import ExpenseSerializer
+
+    qs = Expense.objects.filter(user=link.user, pending_confirmation=True)
+    if exclude_id is not None:
+        qs = qs.exclude(pk=exclude_id)
+    nxt = qs.order_by("created_at").first()
+    if nxt:
+        _send_confirmation_prompt(link, ExpenseSerializer(nxt).data,
+                                   "📩 Next up — please confirm:")
+
+
+def notify_new_pending_expense(user, expense):
+    """Ping `user`'s Telegram about a freshly created pending (bank_message)
+    expense: a full Confirm/Edit/Discard form if nothing else is already
+    awaiting a reply in this chat, otherwise a plain heads-up — see
+    _advance_to_next_pending for why only one can be interactive at once.
     """
     from . import telegram_api
     from .models import TelegramLink
     from expenses.serializers import ExpenseSerializer
 
+    if not telegram_api.is_configured():
+        return
+    try:
+        if not getattr(user.profile, "telegram_notifications_enabled", True):
+            return
+    except Exception:
+        pass  # no profile yet — default to notifying, same as the field's default
+    link = TelegramLink.objects.filter(user=user).first()
+    if not link:
+        return
+
     data = ExpenseSerializer(expense).data
-    heading = "📩 New message logged — please confirm:"
-    link = telegram_api.notify_user(
-        user, _prompt_text(data, heading), parse_mode="HTML",
-        reply_markup=telegram_api.confirm_edit_discard_keyboard(),
-    )
-    if link:
-        TelegramLink.objects.filter(pk=link.pk).update(
-            awaiting_confirmation_id=expense.id, awaiting_edit_id=None,
+    if link.awaiting_confirmation_id or link.awaiting_edit_id:
+        telegram_api.send_message(
+            link.chat_id,
+            f"📩 Also logged: {_describe(data)} — I'll ask about this one "
+            f"once you're done with the message above.",
+            parse_mode="HTML",
         )
+        return
+    _send_confirmation_prompt(link, data, "📩 New message logged — please confirm:")
 
 
 def handle_confirmation_tap(link, action):
@@ -459,6 +490,7 @@ def handle_confirmation_tap(link, action):
     if expense is None:
         telegram_api.send_message(link.chat_id, "That one's already been handled.",
                                    reply_markup=telegram_api.remove_keyboard())
+        _advance_to_next_pending(link)
         return
 
     if action == "edit":
@@ -488,6 +520,7 @@ def handle_confirmation_tap(link, action):
 
     telegram_api.send_message(link.chat_id, text, parse_mode="HTML" if ok else None,
                                reply_markup=telegram_api.remove_keyboard())
+    _advance_to_next_pending(link, exclude_id=expense_id)
 
 
 def handle_edit_text(link, text):
@@ -514,6 +547,7 @@ def handle_edit_text(link, text):
             link.save(update_fields=["awaiting_edit_id"])
             telegram_api.send_message(link.chat_id, "That one's already been handled.",
                                        reply_markup=telegram_api.remove_keyboard())
+            _advance_to_next_pending(link)
             return
         _send_confirmation_prompt(link, ExpenseSerializer(expense).data,
                                    "📩 Unchanged — please confirm:")
@@ -527,6 +561,7 @@ def handle_edit_text(link, text):
         link.save(update_fields=["awaiting_edit_id"])
         telegram_api.send_message(link.chat_id, "That one's already been handled.",
                                    reply_markup=telegram_api.remove_keyboard())
+        _advance_to_next_pending(link)
         return
     except ExpenseParseRateLimited:
         telegram_api.send_message(
