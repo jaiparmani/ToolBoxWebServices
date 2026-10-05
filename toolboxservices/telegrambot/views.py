@@ -4,11 +4,24 @@ telegram-router (a separate Cloudflare Worker) now owns the one webhook the
 shared bot can have: it classifies each inbound message and, for anything
 meant for ToolBox, POSTs it to /api/telegram/relay/ below. This app never
 parses a raw Telegram update or calls Telegram back directly for that reply —
-it just turns {chat_id, username, text} into {reply, parse_mode} and lets the
-router deliver it. Proactive, unrelated notifications (telegram_api.py's
-send_message/notify_user — e.g. pinging the other party of a split) still go
+it just turns {chat_id, username, text} into {reply, parse_mode, buttons} and
+lets the router deliver it (buttons is optional — a list of
+{"text", "callback_data"} dicts the router renders as a row of inline
+buttons; see telegram-router's dispatch.ts/router.ts). Proactive, unrelated
+notifications (telegram_api.py's send_message/notify_user — e.g. pinging the
+other party of a split, or the pending-expense confirm form) still go
 straight to Telegram from here, since those have nothing to do with replying
 to an inbound message.
+
+A tap on one of this app's own inline buttons (the pending-expense
+Confirm/Edit/Discard form) is *not* a Telegram callback_query reaching us
+directly — the router owns the one webhook a bot may have, so it receives the
+callback_query, resolves it, and forwards the tap to us through this exact
+same relay as a synthetic message whose text is the literal callback_data,
+e.g. "tb:confirm:123" (see telegram-router's TOOLBOX_CALLBACK). _handle_message
+special-cases that shape up front, deterministically — bypassing the
+classifier entirely — since a tap always names its own expense id and must
+never be confused with anything a person actually typed.
 
 Security: the relay is gated by a shared secret (TELEGRAM_ROUTER_TOKEN),
 compared in constant time so it can't be recovered by timing. The view always
@@ -18,6 +31,7 @@ router doesn't compound into a second reply; only a bad token gets a 403.
 
 import hmac
 import logging
+import re
 
 from django.conf import settings
 from django.http import HttpResponseForbidden, JsonResponse
@@ -136,19 +150,34 @@ def _split_command(text):
     return command, rest.strip()
 
 
-def _handle_message(chat_id, username, text):
-    """Turn one inbound message into (reply, parse_mode). Either may be None.
+# `tb:<action>:<expenseId>` — telegram-router's literal forward of a tap on
+# this app's own pending-expense inline buttons (see module docstring and
+# telegram-router's TOOLBOX_CALLBACK). Never typed by a person.
+_TB_CALLBACK_RE = re.compile(r"^tb:(confirm|edit|discard|cancel_edit):(\d+)$")
 
-    This is exactly today's command dispatch, unchanged — only the outer
-    layer moved: it used to unwrap a raw Telegram update and call
+
+def _handle_message(chat_id, username, text):
+    """Turn one inbound message into (reply, parse_mode, buttons). Any may be
+    None/empty; `buttons` is a list of {"text", "callback_data"} dicts for the
+    router to render as inline buttons, or None for a plain reply.
+
+    This is exactly today's command dispatch, unchanged in spirit — only the
+    outer layer moved: it used to unwrap a raw Telegram update and call
     send_message/send_chat_action itself; now telegram-router does both of
     those, and this just answers the question "what should I say back".
     """
+    tb_match = _TB_CALLBACK_RE.match(text.strip())
+    if tb_match:
+        link = _link_for_chat(chat_id)
+        if link is None:  # the link was removed between the prompt and the tap
+            return None, None, None
+        return handlers.handle_toolbox_callback(link, tb_match.group(1), int(tb_match.group(2)))
+
     command, args = _split_command(text)
 
     # Linking is available before an account exists.
     if command in ("/link", "/start") and args:
-        return _try_link(chat_id, username, args), None
+        return _try_link(chat_id, username, args), None, None
 
     link = _link_for_chat(chat_id)
     if link is None:
@@ -160,66 +189,60 @@ def _handle_message(chat_id, username, text):
             "Open Money OS → Settings → Connect Telegram and paste this ID.\n\n"
             "(Or send /link <your ToolBox API token>.)"
         )
-        return help_text, None
+        return help_text, None, None
 
     user = link.user
 
-    # A tap on the Confirm/Edit/Discard keyboard, or (after Edit) the
-    # free-text correction that follows it — see expenses.assistant's
-    # bank_message notification and telegrambot.handlers' module docstring
-    # for why these reply straight to Telegram instead of through the
-    # relay's plain {reply, parse_mode} contract.
-    if not command and link.awaiting_confirmation_id:
-        action = handlers.classify_keyboard_reply(text)
-        if action:
-            handlers.handle_confirmation_tap(link, action)
-            return None, None
-    elif not command and link.awaiting_edit_id:
-        handlers.handle_edit_text(link, text)
-        return None, None
+    # The free-text correction after "✏️ Edit" was tapped — the tap itself is
+    # handled above (_TB_CALLBACK_RE); this is the plain message that follows
+    # it, so it goes through the classifier like any other text (fine: a
+    # money-shaped correction reads unambiguously as ToolBox's).
+    if not command and link.awaiting_edit_id:
+        return handlers.handle_edit_text(link, text)
 
     if command in ("/start", "/help"):
-        return handlers.WELCOME, None
+        return handlers.WELCOME, None, None
     if command == "/link":
         # Already linked, no token given.
-        return "You're already linked. Just send me an expense.", None
+        return "You're already linked. Just send me an expense.", None, None
     if command == "/ask":
-        return handlers.handle_ask(user, args)
+        return (*handlers.handle_ask(user, args), None)
     if command in ("/review", "/insight", "/spending"):
-        return handlers.handle_review(user)
+        return (*handlers.handle_review(user), None)
     if command == "/lending":
-        return handlers.handle_lending(user, args)
+        return (*handlers.handle_lending(user, args), None)
     if command == "/split":
-        return handlers.handle_split(user, args)
+        return (*handlers.handle_split(user, args), None)
     if command == "/import":
-        return handlers.handle_import(link)
+        return (*handlers.handle_import(link), None)
     if command.startswith("/"):
-        return "Unknown command. Send /help.", None
+        return "Unknown command. Send /help.", None, None
 
     # Plain text that reads as a spending question is answered, not logged — so a
     # user doesn't have to remember /ask. A leading number or a paste is still a
     # transaction to log (see looks_like_analysis_question).
     if not link.awaiting_import and handlers.looks_like_analysis_question(text):
-        return handlers.handle_ask(user, text)
+        return (*handlers.handle_ask(user, text), None)
 
     # "split 1200 dinner with raj and mira" → a split, without the slash command.
     if not link.awaiting_import and handlers.looks_like_split(text):
-        return handlers.handle_split(user, text)
+        return (*handlers.handle_split(user, text), None)
 
     # Plain text → log it.
-    return handlers.handle_expense(user, text, link)
+    return (*handlers.handle_expense(user, text, link), None)
 
 
 @api_view(["POST"])
 @authentication_classes([])  # this app's ApiKeyAuthentication also claims "Bearer …"
 @permission_classes([AllowAny])  # gated by _relay_auth_ok's shared secret instead
 def relay(request):
-    """POST {chat_id, username, text} -> {reply, parse_mode}.
+    """POST {chat_id, username, text} -> {reply, parse_mode, buttons}.
 
     Called by telegram-router once it has decided a message belongs to
-    ToolBox. It, not this view, talks to Telegram — this always answers 200
-    with whatever there is (or isn't) to say, so a retry from the router can
-    never turn into a second reply landing in the chat.
+    ToolBox (or forwarded a tap on one of this app's own inline buttons — see
+    module docstring). It, not this view, talks to Telegram — this always
+    answers 200 with whatever there is (or isn't) to say, so a retry from the
+    router can never turn into a second reply landing in the chat.
     """
     if not _relay_auth_ok(request):
         return HttpResponseForbidden("bad token")
@@ -231,9 +254,12 @@ def relay(request):
         return JsonResponse({"reply": None, "parse_mode": None})
 
     try:
-        reply, mode = _handle_message(chat_id, username, text)
+        reply, mode, buttons = _handle_message(chat_id, username, text)
     except Exception:  # never 500 back to the router — it would retry forever
         logger.exception("Telegram relay failed to handle message")
-        reply, mode = "Something went wrong handling that. Try again shortly.", None
+        reply, mode, buttons = "Something went wrong handling that. Try again shortly.", None, None
 
-    return JsonResponse({"reply": reply, "parse_mode": mode})
+    payload = {"reply": reply, "parse_mode": mode}
+    if buttons:
+        payload["buttons"] = buttons
+    return JsonResponse(payload)

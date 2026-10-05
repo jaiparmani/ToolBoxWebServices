@@ -327,17 +327,22 @@ def handle_import(link):
 
 # ── Confirm/Edit/Discard form for a pending (bank_message) expense ────────────
 #
-# Two pieces of state on TelegramLink, never both set at once:
-#   awaiting_confirmation_id — a Confirm/Edit/Discard keyboard is up for this
-#                              expense id, waiting on the tap.
-#   awaiting_edit_id         — "✏️ Edit" was tapped; the next plain text is a
-#                              corrected one-line version of this expense id.
+# Real Telegram inline buttons (attached to one specific message, each
+# carrying the expense id in its own callback_data as "tb:<action>:<id>") —
+# not the reply-keyboard-plus-typed-label approach this used to be. Two wins
+# that made this worth routing through telegram-router:
+#   - every pending expense gets its own permanently-live card, independently
+#     tappable in any order — no "only the latest one is interactive" limit,
+#     since inline buttons aren't a single chat-wide widget the way a reply
+#     keyboard is.
+#   - a tap is a callback_query, which the router resolves to ToolBox
+#     *before* it ever reaches the classifier (see telegram-router's
+#     TOOLBOX_CALLBACK) — it can never be misrouted to brain-chat/life-rpg the
+#     way a typed word like "Edit" or "yes" could be.
 #
-# All of it replies by calling telegram_api.send_message directly rather than
-# through the (reply, parse_mode) tuple _handle_message normally returns,
-# because only a direct call can carry reply_markup (showing/removing the
-# keyboard) — the relay's plain JSON contract to telegram-router has no room
-# for it.
+# Only one piece of state is still needed on TelegramLink: awaiting_edit_id,
+# since after "✏️ Edit" the correction itself is free text (no id attached),
+# not another tap.
 
 def _call_expense_detail_action(method, user, pk, payload=None):
     """Invoke ExpenseViewSet's detail partial_update/destroy as `user`.
@@ -370,81 +375,30 @@ def _call_expense_detail_action(method, user, pk, payload=None):
     return True, getattr(response, "data", None)
 
 
-_CONFIRM_REPLIES = {"confirm", "confirm this expense", "✅ confirm", "✅ confirm this expense"}
-_EDIT_REPLIES = {"edit", "edit this expense", "✏️ edit", "✏️ edit this expense"}
-_DISCARD_REPLIES = {
-    "discard", "discard this expense", "🗑 discard", "🗑 discard this expense",
-    "🗑️ discard", "🗑️ discard this expense",
-}
-_CANCEL_REPLIES = {"cancel", "cancel the edit", "✕ cancel", "✕ cancel the edit"}
-# Deliberately no bare "yes"/"no" (or other one-word phrases that read as
-# generic chat) in any of the above: the same bot also fronts brain-chat and
-# life-rpg behind telegram-router's classifier, and a message that reads as
-# plain conversation is exactly what that classifier can hand to one of those
-# instead of to ToolBox — see confirm_edit_discard_keyboard's docstring.
+def _confirm_buttons(expense_id):
+    return [
+        {"text": "✅ Confirm", "callback_data": f"tb:confirm:{expense_id}"},
+        {"text": "✏️ Edit", "callback_data": f"tb:edit:{expense_id}"},
+        {"text": "🗑 Discard", "callback_data": f"tb:discard:{expense_id}"},
+    ]
 
 
-def classify_keyboard_reply(text):
-    """'confirm' | 'edit' | 'discard' for a tap on that keyboard, else None."""
-    t = (text or "").strip().lower()
-    if t in _CONFIRM_REPLIES:
-        return "confirm"
-    if t in _EDIT_REPLIES:
-        return "edit"
-    if t in _DISCARD_REPLIES:
-        return "discard"
-    return None
-
-
-def _prompt_text(expense_data, heading):
-    return (
+def _confirm_prompt(expense_data, heading):
+    """(text, buttons) for a pending expense's Confirm/Edit/Discard card."""
+    text = (
         f"{heading}\n\n{_describe(expense_data)}\n\n"
         f"Tap below, or review it in Money OS → Messages."
     )
-
-
-def _send_confirmation_prompt(link, expense_data, heading):
-    """Send the Confirm/Edit/Discard form and (re)arm awaiting_confirmation_id."""
-    from . import telegram_api
-
-    telegram_api.send_message(
-        link.chat_id, _prompt_text(expense_data, heading), parse_mode="HTML",
-        reply_markup=telegram_api.confirm_edit_discard_keyboard(),
-    )
-    link.awaiting_confirmation_id = expense_data["id"]
-    link.awaiting_edit_id = None
-    link.save(update_fields=["awaiting_confirmation_id", "awaiting_edit_id"])
-
-
-def _advance_to_next_pending(link, exclude_id=None):
-    """If another pending expense is waiting, send its Confirm/Edit/Discard
-    form next.
-
-    A Telegram reply keyboard is one-per-chat, not one-per-message — sending
-    a second one doesn't add a second set of buttons, it silently replaces
-    the first's with no way back to them. So only one pending expense is ever
-    "live" via Telegram at a time; the rest queue (see notify_new_pending_
-    expense) and are picked up here, one at a time, as each live one
-    resolves. Any of them is always reachable the slow way too, via Money OS
-    → Messages, regardless of Telegram queue order.
-    """
-    from expenses.models import Expense
-    from expenses.serializers import ExpenseSerializer
-
-    qs = Expense.objects.filter(user=link.user, pending_confirmation=True)
-    if exclude_id is not None:
-        qs = qs.exclude(pk=exclude_id)
-    nxt = qs.order_by("created_at").first()
-    if nxt:
-        _send_confirmation_prompt(link, ExpenseSerializer(nxt).data,
-                                   "📩 Next up — please confirm:")
+    return text, _confirm_buttons(expense_data["id"])
 
 
 def notify_new_pending_expense(user, expense):
-    """Ping `user`'s Telegram about a freshly created pending (bank_message)
-    expense: a full Confirm/Edit/Discard form if nothing else is already
-    awaiting a reply in this chat, otherwise a plain heads-up — see
-    _advance_to_next_pending for why only one can be interactive at once.
+    """Ping `user`'s Telegram with a Confirm/Edit/Discard card for a freshly
+    created pending (bank_message) expense — a direct push (see module
+    docstring on telegrambot.views), since this isn't a reply to anything.
+
+    A no-op without Telegram linked, the bot unconfigured, or notifications
+    off.
     """
     from . import telegram_api
     from .models import TelegramLink
@@ -461,74 +415,75 @@ def notify_new_pending_expense(user, expense):
     if not link:
         return
 
-    data = ExpenseSerializer(expense).data
-    if link.awaiting_confirmation_id or link.awaiting_edit_id:
-        telegram_api.send_message(
-            link.chat_id,
-            f"📩 Also logged: {_describe(data)} — I'll ask about this one "
-            f"once you're done with the message above.",
-            parse_mode="HTML",
-        )
-        return
-    _send_confirmation_prompt(link, data, "📩 New message logged — please confirm:")
+    text, buttons = _confirm_prompt(ExpenseSerializer(expense).data,
+                                     "📩 New message logged — please confirm:")
+    telegram_api.send_message(link.chat_id, text, parse_mode="HTML",
+                               reply_markup=telegram_api.inline_keyboard(buttons))
 
 
-def handle_confirmation_tap(link, action):
-    """Handle a Confirm/Edit/Discard keyboard tap. Replies directly to Telegram
-    (see module docstring) — callers should treat this as fire-and-forget.
+def handle_toolbox_callback(link, action, expense_id):
+    """Handle a tap on a pending-expense inline button.
+
+    Called only for telegram-router's literal `tb:<action>:<id>` forward (see
+    telegrambot.views' _TB_CALLBACK_RE and module docstring) — never text a
+    person typed — so this is reached deterministically, with the target
+    expense always named by the tap itself. Returns (reply, parse_mode,
+    buttons) for _handle_message/relay to pass straight through; the router
+    has already cleared the tapped message's own buttons by the time this
+    runs, so nothing here needs to undo them.
     """
-    from . import telegram_api
     from expenses.models import Expense
 
     user = link.user
-    expense_id = link.awaiting_confirmation_id
-    link.awaiting_confirmation_id = None
-    link.save(update_fields=["awaiting_confirmation_id"])
-
     expense = Expense.objects.filter(
         pk=expense_id, user=user, pending_confirmation=True).first()
+
+    if action == "cancel_edit":
+        link.awaiting_edit_id = None
+        link.save(update_fields=["awaiting_edit_id"])
+        if expense is None:
+            return "That one's already been handled.", None, None
+        from expenses.serializers import ExpenseSerializer
+        text, buttons = _confirm_prompt(ExpenseSerializer(expense).data,
+                                         "📩 Unchanged — please confirm:")
+        return text, "HTML", buttons
+
     if expense is None:
-        telegram_api.send_message(link.chat_id, "That one's already been handled.",
-                                   reply_markup=telegram_api.remove_keyboard())
-        _advance_to_next_pending(link)
-        return
+        return "That one's already been handled.", None, None
 
     if action == "edit":
         link.awaiting_edit_id = expense_id
         link.save(update_fields=["awaiting_edit_id"])
         from expenses.serializers import ExpenseSerializer
         current = _describe(ExpenseSerializer(expense).data)
-        telegram_api.send_message(
-            link.chat_id,
+        text = (
             f"Current: {current}\n\n"
             f"Send the corrected version, same as logging one — e.g. "
             f"\"450 swiggy dinner food\" — and I'll update the amount, "
-            f"description and category.",
-            parse_mode="HTML",
-            reply_markup=telegram_api.cancel_keyboard(),
+            f"description and category."
         )
-        return
+        buttons = [{"text": "✕ Cancel", "callback_data": f"tb:cancel_edit:{expense_id}"}]
+        return text, "HTML", buttons
 
     if action == "confirm":
         ok, data = _call_expense_detail_action(
             "patch", user, expense_id, {"pending_confirmation": False}
         )
         text = ("Confirmed " + _describe(data)) if ok else f"Couldn't confirm that: {data}"
-    else:  # discard
-        ok, data = _call_expense_detail_action("delete", user, expense_id)
-        text = "Discarded." if ok else f"Couldn't discard that: {data}"
+        return text, ("HTML" if ok else None), None
 
-    telegram_api.send_message(link.chat_id, text, parse_mode="HTML" if ok else None,
-                               reply_markup=telegram_api.remove_keyboard())
-    _advance_to_next_pending(link, exclude_id=expense_id)
+    # discard
+    ok, data = _call_expense_detail_action("delete", user, expense_id)
+    text = "Discarded." if ok else f"Couldn't discard that: {data}"
+    return text, None, None
 
 
 def handle_edit_text(link, text):
     """Handle the free-text reply after "✏️ Edit" was tapped: either "cancel"
-    (back out, unchanged) or a corrected one-line version to apply. Replies
-    directly to Telegram (see module docstring) — fire-and-forget.
+    (back out, unchanged — the inline "✕ Cancel" button covers the same case
+    via handle_toolbox_callback, but a typed one is accepted too) or a
+    corrected one-line version to apply. Returns (reply, parse_mode, buttons).
     """
-    from . import telegram_api
     from expenses.models import Expense
     from expenses.serializers import ExpenseSerializer
     from expenses.services import (
@@ -539,19 +494,16 @@ def handle_edit_text(link, text):
     expense_id = link.awaiting_edit_id
     t = (text or "").strip().lower()
 
-    if t in _CANCEL_REPLIES:
+    if t in ("cancel", "cancel the edit"):
+        link.awaiting_edit_id = None
+        link.save(update_fields=["awaiting_edit_id"])
         expense = Expense.objects.filter(pk=expense_id, user=user,
                                           pending_confirmation=True).first()
         if expense is None:
-            link.awaiting_edit_id = None
-            link.save(update_fields=["awaiting_edit_id"])
-            telegram_api.send_message(link.chat_id, "That one's already been handled.",
-                                       reply_markup=telegram_api.remove_keyboard())
-            _advance_to_next_pending(link)
-            return
-        _send_confirmation_prompt(link, ExpenseSerializer(expense).data,
-                                   "📩 Unchanged — please confirm:")
-        return
+            return "That one's already been handled.", None, None
+        text_out, buttons = _confirm_prompt(ExpenseSerializer(expense).data,
+                                             "📩 Unchanged — please confirm:")
+        return text_out, "HTML", buttons
 
     from expenses.assistant import edit_pending_expense
     try:
@@ -559,24 +511,17 @@ def handle_edit_text(link, text):
     except Expense.DoesNotExist:
         link.awaiting_edit_id = None
         link.save(update_fields=["awaiting_edit_id"])
-        telegram_api.send_message(link.chat_id, "That one's already been handled.",
-                                   reply_markup=telegram_api.remove_keyboard())
-        _advance_to_next_pending(link)
-        return
+        return "That one's already been handled.", None, None
     except ExpenseParseRateLimited:
-        telegram_api.send_message(
-            link.chat_id,
-            "The AI is out of quota right now — try again shortly, or send \"cancel\".",
-            reply_markup=telegram_api.cancel_keyboard(),
-        )
-        return
+        return ("The AI is out of quota right now — try again shortly, or "
+                "send \"cancel\".", None, None)
     except (ExpenseParseError, ExpenseParseNotPossible):
-        telegram_api.send_message(
-            link.chat_id,
-            "Couldn't make sense of that — try again, e.g. \"450 swiggy dinner "
-            "food\", or send \"cancel\".",
-            reply_markup=telegram_api.cancel_keyboard(),
-        )
-        return
+        return ("Couldn't make sense of that — try again, e.g. \"450 swiggy "
+                "dinner food\", or send \"cancel\".", None, None)
+
+    link.awaiting_edit_id = None
+    link.save(update_fields=["awaiting_edit_id"])
+    text_out, buttons = _confirm_prompt(data, "✏️ Updated — please confirm:")
+    return text_out, "HTML", buttons
 
     _send_confirmation_prompt(link, data, "✏️ Updated — please confirm:")

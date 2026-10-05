@@ -26,17 +26,15 @@ class TelegramLink(models.Model):
     # the link because the webhook is stateless between requests.
     awaiting_import = models.BooleanField(default=False)
 
-    # Set when we've sent a "Confirm / Edit / Discard" keyboard for a pending
-    # (bank_message) expense and are waiting on the tap. Lets the next plain
-    # text from this chat be read as an answer to that prompt rather than a
-    # new expense to log — the webhook is stateless, so this is the only
-    # place that state can live between requests.
-    awaiting_confirmation_id = models.PositiveIntegerField(null=True, blank=True)
-
-    # Set instead of (never alongside) awaiting_confirmation_id once "✏️ Edit"
-    # is tapped: the next plain text is read as a corrected one-line version
-    # of this expense ("450 swiggy dinner food"), same shape as logging a
-    # fresh one, applied to this row instead of creating a new one.
+    # Set once "✏️ Edit" is tapped on a pending (bank_message) expense's
+    # Confirm/Edit/Discard card: the next plain text from this chat is read as
+    # a corrected one-line version of this expense ("450 swiggy dinner food"),
+    # same shape as logging a fresh one, applied to this row instead of
+    # creating a new one. The card itself needs no state here — each one is a
+    # real Telegram inline button carrying its own expense id in its
+    # callback_data, independently tappable — only this follow-up free-text
+    # step needs remembering which expense it's for, and the webhook is
+    # stateless between requests.
     awaiting_edit_id = models.PositiveIntegerField(null=True, blank=True)
 
     created_at = models.DateTimeField(auto_now_add=True)

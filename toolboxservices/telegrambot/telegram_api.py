@@ -69,41 +69,20 @@ def send_message(chat_id, text, parse_mode=None, disable_preview=True, reply_mar
     return call("sendMessage", payload)
 
 
-def confirm_edit_discard_keyboard():
-    """A one-time reply keyboard offering Confirm / Edit / Discard.
+def inline_keyboard(buttons):
+    """`buttons`: a list of {"text", "callback_data"} dicts, rendered as one
+    row of real Telegram inline buttons (attached to this specific message,
+    independently tappable regardless of whatever else is sent after it —
+    unlike a reply keyboard, which is one-per-chat).
 
-    A reply keyboard (not an inline one) so tapping it just sends its label
-    as a normal text message — which flows straight through the existing
-    telegram-router -> /api/telegram/relay/ path like anything else the user
-    types, with no need for the router to understand Telegram callback
-    queries.
-
-    The labels spell out "...this expense" rather than a bare "Confirm" /
-    "Edit" / "Discard": the same bot also fronts brain-chat and life-rpg
-    behind telegram-router's classifier (see settings.py's Telegram section),
-    and a bare generic word is exactly the kind of message that classifier
-    can hand to one of those instead of to ToolBox. Keep labels unambiguous
-    even if that makes them longer.
+    A tap reaches Telegram as a callback_query, which telegram-router (the
+    Cloudflare Worker owning the bot's one webhook) resolves to ToolBox
+    deterministically and forwards here as a synthetic relay message — see
+    telegrambot.views' module docstring and _TB_CALLBACK_RE, and
+    telegram-router's TOOLBOX_CALLBACK. It never reaches the brain-chat/
+    life-rpg classifier the way a typed reply-keyboard label could.
     """
-    return {
-        "keyboard": [["✅ Confirm this expense", "✏️ Edit this expense"],
-                     ["🗑 Discard this expense"]],
-        "resize_keyboard": True,
-        "one_time_keyboard": True,
-    }
-
-
-def cancel_keyboard():
-    """Shown while waiting for the free-text correction after Edit is tapped."""
-    return {
-        "keyboard": [["✕ Cancel the edit"]],
-        "resize_keyboard": True,
-        "one_time_keyboard": True,
-    }
-
-
-def remove_keyboard():
-    return {"remove_keyboard": True}
+    return {"inline_keyboard": [buttons]}
 
 
 def send_chat_action(chat_id, action="typing"):
