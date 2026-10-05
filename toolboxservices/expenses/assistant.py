@@ -300,32 +300,53 @@ def _run_auto_tag(user, message, reply):
 # ── Commit (writes) ──────────────────────────────────────────────────────────
 
 def _notify_pending_confirmation(user, expense):
-    """Ping the user's Telegram with a Confirm/Discard form for a new pending
-    expense, so a forwarded bank alert doesn't just sit in Messages until they
-    happen to open the app.
+    """Ping the user's Telegram with a Confirm/Edit/Discard form for a new
+    pending expense, so a forwarded bank alert doesn't just sit in Messages
+    until they happen to open the app.
 
-    A no-op without Telegram linked or notifications off (see
-    telegram_api.notify_user) — this must never block the Messages response.
+    Delegates everything — composing the message, the keyboard, and
+    remembering which expense the next reply is about — to telegrambot, which
+    already owns that state. A no-op without Telegram linked, the bot
+    unconfigured, or notifications off; this must never block the Messages
+    response.
     """
     try:
-        from telegrambot.telegram_api import notify_user, confirm_discard_keyboard
-        from telegrambot.models import TelegramLink
-    except Exception:
-        return
-    category = expense.category.name if expense.category else 'Uncategorised'
-    amount = f'{expense.amount:,.2f}'.rstrip('0').rstrip('.')
-    text = (
-        f"📩 New message logged — please confirm:\n\n"
-        f"₹{amount} {expense.description}\n"
-        f"Suggested category: {category}\n\n"
-        f"Tap below, or review it in Money OS → Messages."
-    )
-    try:
-        link = notify_user(user, text, reply_markup=confirm_discard_keyboard())
-        if link:
-            TelegramLink.objects.filter(pk=link.pk).update(awaiting_confirmation_id=expense.id)
+        from telegrambot.handlers import notify_new_pending_expense
+        notify_new_pending_expense(user, expense)
     except Exception:  # pragma: no cover - best-effort side channel
         pass
+
+
+def edit_pending_expense(user, expense_id, text):
+    """Re-parse a corrected one-line version of a pending expense and apply it
+    to the same row, instead of creating a new one.
+
+    Used by the Telegram Edit flow: after "✏️ Edit", the user's next message
+    is read exactly like logging a fresh expense ("450 swiggy dinner food")
+    and the result is written onto the existing pending row. Raises
+    ExpenseParseError/ExpenseParseNotPossible same as the other parse-backed
+    intents on unparseable text, and Expense.DoesNotExist if the row isn't
+    there (or isn't pending anymore) for this user.
+    """
+    from .serializers import ExpenseSerializer
+    from .views import _coerce_date_value
+
+    expense = Expense.objects.get(pk=expense_id, user=user, pending_confirmation=True)
+    p = parse_expense_text(text, known_tags=known_tag_names(user))
+    draft = _draft_from_parsed(p)
+
+    expense.amount = Decimal(str(draft['amount']))
+    expense.transaction_type = draft.get('transaction_type', expense.transaction_type)
+    expense.description = draft.get('description', expense.description)
+    expense.category = resolve_category(draft)
+    when = draft.get('date')
+    if isinstance(when, str):
+        when = _coerce_date_value(when)
+    if when:
+        expense.date = when
+    expense.save()
+    expense.tags.set(resolve_tags(user, draft.get('tags')))
+    return ExpenseSerializer(expense).data
 
 
 def _create_expense(user, draft, on_date=None, pending=False, source_message=''):

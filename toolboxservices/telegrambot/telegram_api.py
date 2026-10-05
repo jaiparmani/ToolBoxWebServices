@@ -69,8 +69,8 @@ def send_message(chat_id, text, parse_mode=None, disable_preview=True, reply_mar
     return call("sendMessage", payload)
 
 
-def confirm_discard_keyboard():
-    """A one-time reply keyboard offering Confirm / Discard.
+def confirm_edit_discard_keyboard():
+    """A one-time reply keyboard offering Confirm / Edit / Discard.
 
     A reply keyboard (not an inline one) so tapping it just sends its label
     as a normal text message — which flows straight through the existing
@@ -79,7 +79,16 @@ def confirm_discard_keyboard():
     queries.
     """
     return {
-        "keyboard": [["✅ Confirm", "🗑 Discard"]],
+        "keyboard": [["✅ Confirm", "✏️ Edit"], ["🗑 Discard"]],
+        "resize_keyboard": True,
+        "one_time_keyboard": True,
+    }
+
+
+def cancel_keyboard():
+    """Shown while waiting for the free-text correction after Edit is tapped."""
+    return {
+        "keyboard": [["✕ Cancel"]],
         "resize_keyboard": True,
         "one_time_keyboard": True,
     }
