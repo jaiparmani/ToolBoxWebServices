@@ -387,12 +387,21 @@ def _confirm_buttons(expense_id):
 
 
 def _confirm_prompt(expense_data, heading):
-    """(text, buttons) for a pending expense's Confirm/Edit/Discard card."""
-    text = (
-        f"{heading}\n\n{_describe(expense_data)}\n\n"
-        f"Tap below, or review it in Money OS → Messages."
-    )
-    return text, _confirm_buttons(expense_data["id"])
+    """(text, buttons) for a pending expense's Confirm/Edit/Discard card.
+
+    Includes the verbatim bank/UPI alert (source_message) the row was parsed
+    from, same as the "from: ..." line on the Messages page in the app — so
+    the suggested amount/category can be checked against the original
+    without switching to Money OS.
+    """
+    lines = [heading, "", _describe(expense_data)]
+    source = (expense_data.get("source_message") or "").strip()
+    if source:
+        if len(source) > 300:
+            source = source[:300] + "…"
+        lines += ["", f'<i>from: "{html.escape(source)}"</i>']
+    lines += ["", "Tap below, or review it in Money OS → Messages."]
+    return "\n".join(lines), _confirm_buttons(expense_data["id"])
 
 
 def notify_new_pending_expense(user, expense):
